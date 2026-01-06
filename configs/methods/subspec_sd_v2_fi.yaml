@@ -1,15 +1,14 @@
-# SubSpec SD (v1) example
-method: subspec_sd_fi
+# SubSpec SD (v2) example
+method: subspec_sd_v2_fi
 
-llm_path: meta-llama/Llama-3.2-1B-Instruct
+llm_path: meta-llama/Llama-3.1-8B-Instruct
 
 recipe:
-  class_path: specdecodes.helpers.recipes.subspec.hqq_4bit_attn_4bit_mlp:Recipe
+  class_path: specdecodes.helpers.recipes.subspec.hqq_4bit_attn_4bit_mlp_postspec:Recipe
 
 max_length: 4096
 cache_implementation: static
 # warmup_iter: 1
-# Required for flashinfer to work correctly
 # compile_mode: max-autotune-no-cudagraphs
 
 warmup_iter: 0
@@ -22,5 +21,5 @@ generator_kwargs:
 
 draft_params:
   temperature: 0.2
-  max_depth: 32
+  max_depth: 16
   topk_len: 6

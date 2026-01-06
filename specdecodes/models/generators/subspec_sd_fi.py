@@ -6,95 +6,59 @@ import nvtx
 
 from .classic_sd import ClassicSDGeneratorBase
 from ..utils.mixin import SDProfilingMixin
-from ..utils.utils import DraftParams, invert_mask
-from ..utils.flashinfer.cache_manager import (
-    KvCachePool,
-    KvCacheBatchPosition,
-    RequestKvCache,
-    getKvCacheBatchPosition,
-    FlashInferCache
-)
+from ..utils.utils import invert_mask
 from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
-from ..utils.flashinfer.prefill import flashinfer_chunked_prefill
 
 class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
-    def __init__(self, generator_kwargs, *model_args, **kwargs):
-        super().__init__(generator_kwargs, *model_args, **kwargs)
-
-    def init_cuda_graph_runner(self,device,kvCachePool=None):
-        """
-        Initialize the draft model CUDA-graph runner (FlashInfer path only).
-        """
+    def init_cuda_graph_runner(self,device):
         if hasattr(self.draft_model, 'init_cuda_graph_runner') and callable(self.draft_model.init_cuda_graph_runner):
             self.draft_model.init_cuda_graph_runner(device=device)
-
-    def _tree_decoding(self, tree, request_kv_cache, position_offset, cache_position, device):
+       
+    def _tree_decoding(self, tree, past_key_values, position_offset, cache_position, device):
         # Preparing target_model's tree decoding data, also updates each node's index (node.ind).
-        with nvtx.annotate("attn_mask/build"):
+        with nvtx.annotate("create attn mask"):
             node_data = tree.get_tree_data()
             tree_input_ids = node_data['token_ids']
             tree_position_ids = node_data['depths'] + position_offset
             tree_mask_partial = tree.create_attention_mask(position_offset)
         
         # Move to device
-        with nvtx.annotate("attn_mask/to_device"):
-            tree_input_ids = tree_input_ids.to(device, non_blocking=True)
-            tree_position_ids = tree_position_ids.to(device, non_blocking=True)
+        with nvtx.annotate("mask to GPU"):
+            tree_input_ids = tree_input_ids.to(device)
+            tree_position_ids = tree_position_ids.to(device)
             tree_mask_partial = tree_mask_partial.to(device)
         
-        # Assign to tree mask
-        with nvtx.annotate("attn_mask/prepare"):
+        # Assing to tree mask
+        with nvtx.annotate("get mask"):
             tree_mask = self._get_tree_mask(tree_mask_partial)
-               
-        # Target model forward
-        # NOTE: Some squeeze/unsqueeze is legacy for shape alignment.
-        with nvtx.annotate("target_forward", color="red"):
-            num_tokens = self.draft_params.max_verify_tokens
-            kvCachePool = request_kv_cache.kvCachePool
             
-            request_kv_cache.increment(num_tokens)
+        # llm forward
+        #TODO: Remove unnecessary squeeze(0) and unsqueeze(0) operations
+        with nvtx.annotate("llm forward", color="red"):
+            
+            # mode: str,
+            # num_tokens: int,   
+            # seq_len: int,
 
-            batch_position = getKvCacheBatchPosition(
-                request_kv_caches=[request_kv_cache],
-                mode='tree',  # Set to False if you're doing incremental decoding
-                device=device,
-                treeTokens=num_tokens,
-            )
-            # batch_position.print_info() 
+            num_tokens = self.draft_params.max_verify_tokens
+            seq_len = past_key_values.get_seq_length() 
+
             self.flashinferWrapper.prepareAttention(
                 'tree',
-                batch_position,
-                kvCachePool.page_len,
-                "NONE", # POS_ENCODING_MODE.NONE,
-                kvCachePool.cache_data[0].dtype,
+                num_tokens = num_tokens,
+                seq_len = seq_len + num_tokens,
                 attention_mask=tree_mask,
             )
-            # Check if the current instance has the attribute 'graph'
-            if hasattr(self, 'graph'):
-                outputs = self.tree_decoding_step(
-                    input_ids=tree_input_ids.unsqueeze(0),
-                    position_ids=tree_position_ids.unsqueeze(0),
-                    batch_position=batch_position,
-                )
-            else:
-                outputs = self.target_model(
-                    input_ids=tree_input_ids.unsqueeze(0),
-                    past_key_values=None,
-                    position_ids=tree_position_ids.unsqueeze(0),
-                    output_hidden_states=True,
-                    use_cache=False,
-                    kvCachePool=kvCachePool,
-                    batch_position=batch_position,
-                    mode='tree', 
-                    flashinferWrapper = self.flashinferWrapper,
-                )
+            outputs = self.target_model(
+                input_ids=tree_input_ids.unsqueeze(0),
+                past_key_values=past_key_values.cache,
+                position_ids=tree_position_ids.unsqueeze(0),
+                # output_hidden_states=True,
+                cache_position=cache_position,
+                mode='tree', 
+                flashinferWrapper = self.flashinferWrapper,
+            )
         return outputs
-    def _speculate(self, input_ids, request_kv_cache):
-        return self.draft_model.speculate(
-            input_ids,
-            request_kv_cache=request_kv_cache,
-            flashinferWrapper=self.flashinferWrapper,
-        )
     
     def _generate(
         self,
@@ -104,17 +68,24 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
         do_sample: bool,
         **model_kwargs,
     ):
-        """Generate a token sequence with speculative decoding (FlashInfer-backed).
+        """
+        Generate sequence of tokens with speculative decoding.
 
-        Stages:
-        - Prefill: run the target model on the prompt, then sample the next token.
-        - Decode loop:
-            1) Draft proposes candidate tokens (tree form).
-            2) Target scores candidates in one forward.
-            3) Verify and accept a prefix, then update KV/state.
+        This method consists of two main stages: prefill and decode.
+
+        Prefill Stage:
+        - Perform the model's initial forward pass.
+        - Sample a token and append it to the input_ids.
+
+        Decode Stage (with speculative decoding):
+        - Iterate through the following steps:
+            1. Perform SSM speculative sampling, returns sampled tokens in tree form.
+            2. Decode the sampled tokens in parallel with the language model (LLM), generating probabilities for each token.
+            3. Verify the sampled tokens by accepting or rejecting them, corresponding to the probabilities.
+            4. Update the key-value cache and input_ids accordingly.
 
         Args:
-            input_ids (torch.LongTensor): The input token IDs.
+            input_ids (torch.LongTensor): The input token IDs. 
             stopping_criteria (StoppingCriteria): The criteria to stop the generation.
             logits_processor (LogitsProcessor): The processor to modify the logits.
             do_sample (bool): Whether to sample tokens during generation. If False, the generation will be deterministic.
@@ -141,56 +112,96 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             
         if model_kwargs.get("past_key_values") is not None:
             past_key_values = model_kwargs["past_key_values"]
-            max_cache_len = getattr(past_key_values, "max_cache_len", None)
+            max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
+            print("max_cache_len", max_cache_len)
+
+            if not hasattr(self, 'flashinferWrapper'):
+                self.flashinferWrapper = FlashinferAttentionWrapper(
+                    self.target_model.config.num_attention_heads, self.target_model.config.num_key_value_heads, self.target_model.config.hidden_size,max_cache_len
+                )
+
+            if not hasattr(self.draft_model, 'flashinferWrapper'):
+                self.draft_model.flashinferWrapper = FlashinferAttentionWrapper(
+                    self.target_model.config.num_attention_heads, self.target_model.config.num_key_value_heads, self.target_model.config.hidden_size,max_cache_len
+            )
+            
+            self.draft_model.set_past_key_values(past_key_values)
         else:
             raise ValueError("past_key_values is not provided")
 
-        stream_callback = model_kwargs.get("stream_callback", None)
-
-        # * prefill stage
-        with nvtx.annotate("prefill_chunked", color="orange"):
-            self._init_tree_mask(self.draft_params.max_verify_tokens, max_cache_len, device=input_ids.device)
-            if not hasattr(self, 'flashinferWrapper'):
-                self.flashinferWrapper = FlashinferAttentionWrapper(
-                    self.target_model.config.num_attention_heads, self.target_model.config.num_key_value_heads, self.target_model.config.hidden_size,past_key_values.page_len
+# * prefill stage
+        with nvtx.annotate("chunked prefill", color="orange"):
+            # max cache len need to set to none to use dymanic masking for flashinfer
+            self._init_tree_mask(
+                self.draft_params.max_verify_tokens, max_cache_len=None, device=input_ids.device
+            )
+            current_kv_len = past_key_values.get_seq_length()
+            prefill_tokens = input_ids[:, current_kv_len:]
+            prefill_length = prefill_tokens.size(1)
+            chunk_size = prefill_length if self.prefill_chunk_size is None else min(prefill_length, self.prefill_chunk_size)
+            next_token_logits = None
+            for start in range(0, prefill_length, chunk_size):
+                chunk = prefill_tokens[:, start:start + chunk_size]
+                current_kv_len = past_key_values.get_seq_length()
+                cache_position = torch.arange(
+                    current_kv_len, current_kv_len + chunk.size(1),
+                    dtype=torch.long, device=input_ids.device
                 )
-            self.kvCachePool = past_key_values
-            request_kv_cache = RequestKvCache(
-                kvCachePool=self.kvCachePool,
-                page_len=self.kvCachePool.page_len,
-                seq_init_len=0
-            )
-            outputs = flashinfer_chunked_prefill(
-                target_model=self.target_model,
-                flashinfer_wrapper=self.flashinferWrapper,
-                input_ids=input_ids,
-                kv_cache_pool=self.kvCachePool,
-                request_kv_cache=request_kv_cache,
-                prefill_chunk_size=self.prefill_chunk_size,
-            )
-            next_token_logits = outputs.logits
-            del outputs
-            
-        with nvtx.annotate("sample"):
+                self.flashinferWrapper.prepareAttention(
+                    'prefill',
+                    num_tokens = chunk.size(1),
+                    seq_len = current_kv_len + chunk.size(1),
+                )
+
+                # last iteration
+                if start + chunk_size < prefill_length:
+                    self.target_model.model(
+                        chunk,
+                        past_key_values=past_key_values.cache,
+                        position_ids=cache_position.unsqueeze(0),
+                        cache_position=cache_position,
+
+                        mode='prefill',
+                        flashinferWrapper = self.flashinferWrapper,
+                    )
+                else:
+                    outputs = self.target_model.prefill_forward(
+                        chunk,
+                        past_key_values=past_key_values.cache,
+                        position_ids=cache_position.unsqueeze(0),
+                        cache_position=cache_position,
+                        logits_to_keep=1,
+
+                        mode='prefill',
+                        flashinferWrapper = self.flashinferWrapper,
+                    )
+                    next_token_logits = outputs.logits
+                    del outputs
+                
+                past_key_values.seq_len += chunk.size(1)
+
+
+        with nvtx.annotate("sample tokens"):
             sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
-            
-        with nvtx.annotate("state_update"):
+        with nvtx.annotate("update data"):
             input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
             cache_position = torch.arange(org_input_len, org_input_len+self.draft_params.max_verify_tokens, dtype=torch.long, device=input_ids.device)
-            self._maybe_stream(stream_callback, sampled_tokens)
 
-        with nvtx.annotate("decode_loop"):
+        with nvtx.annotate("decoding"):
             finished = False
             while not finished:
                 # * speculate
                 with nvtx.annotate("speculate", color="cyan"):
                     last_token_id = sampled_tokens[:, -1:].clone(memory_format=torch.contiguous_format)
-                    tree = self._speculate(last_token_id, request_kv_cache)
+                    tree = self._speculate(last_token_id)
+                    # tree.print(tokenizer=self.tokenizer)
 
                 # * tree decoding
-                with nvtx.annotate("target_decode", color="orange"):
-                    prev_kv_len = request_kv_cache.get_seq_length() + 1
-                    outputs = self._tree_decoding(tree, request_kv_cache, position_offset=input_ids.shape[1]-1, cache_position=cache_position, device=input_ids.device)
+                with nvtx.annotate("tree_decoding", color="orange"):
+                    prev_kv_len = past_key_values.get_seq_length()
+                    if self.cache_implementation == 'dynamic':
+                        past_key_values.crop(prev_kv_len)
+                    outputs = self._tree_decoding(tree, past_key_values, position_offset=input_ids.shape[1]-1, cache_position=cache_position, device=input_ids.device)
                     next_token_logits = outputs.logits
                     del outputs
 
@@ -203,21 +214,26 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                                                             do_sample
                                                         )
                     sampled_tokens = sampled_tokens.to(input_ids.device)
+                    # print(f"Current sampled ({sampled_tokens.shape[1]}):", self.tokenizer.batch_decode(sampled_tokens.squeeze(0), skip_special_tokens=False))
                     del next_token_logits
+                
+                with nvtx.annotate("reorder kv"):
+                    past_key_values.reorder_cache_with_offset(hidden_indices, offset=prev_kv_len, new_chunk_len=self.draft_params.max_verify_tokens, dim=2)
+                    past_key_values.seq_len += hidden_indices.shape[0]
                     
-                with nvtx.annotate("kv_reorder"):
-                    num_new_tokens = self.draft_params.max_verify_tokens
-                    request_kv_cache.reorder_cache_with_offset(hidden_indices, offset=prev_kv_len, num_new_tokens=num_new_tokens)
-
                 # * update input_ids and cache_position
-                with nvtx.annotate("state_update"):
+                with nvtx.annotate("update data"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
                     cache_position += sampled_tokens.shape[1]
                 
                 # * check stopping criteria
-                with nvtx.annotate("stop_check"):
-                    finished = stopping_criteria(input_ids, None).item()
-        request_kv_cache.release()     
+                with nvtx.annotate("stopping criteria"):
+                    for k in range(sampled_tokens.shape[1]):    
+                        finished = stopping_criteria(sampled_tokens[:, k:k+1], None).item()
+                        if finished:
+                            input_ids = input_ids[:, :-(sampled_tokens.shape[1]-k-1)] if (sampled_tokens.shape[1]-k-1)>0 else input_ids
+                            break
+                
         return input_ids
     
 class SubSpecSDGenerator(SDProfilingMixin, SubSpecSDGeneratorBase):

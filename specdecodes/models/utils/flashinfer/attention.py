@@ -61,10 +61,7 @@ class FiLlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         
         flashinferWrapper = kwargs["flashinferWrapper"]
-        kvCachePool       = kwargs.get("kvCachePool", None)
         mode              = kwargs.get("mode", "prefill")
-        batch_position    = kwargs.get("batch_position", None)
-     
         rotaryParams = AttentionRotaryParams(pos_encoding_mode=POS_ENCODING_MODE.NONE)
     
         input_shape = hidden_states.shape[:-1]
@@ -77,23 +74,28 @@ class FiLlamaAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        query = query_states.transpose(1, 2).contiguous()
-        key = key_states.transpose(1, 2).contiguous()
-        value = value_states.transpose(1, 2).contiguous()
+        # if past_key_value is not None:
+        #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        q, k, v = flashinferWrapper.reshape_qkv_for_attention(
-            query, key, value, batch_position
-        )
+        v_data = past_key_value.value_cache[self.layer_idx]
+        k_data = past_key_value.key_cache[self.layer_idx]
+        kv_data = (k_data, v_data)
+
+        query_states = query_states.transpose(1, 2).contiguous()
+        key_states = key_states.transpose(1, 2).contiguous()
+        value_states = value_states.transpose(1, 2).contiguous()
+       
+        query_states, key_states, value_states = flashinferWrapper.reshape_qkv_for_attention(query_states, key_states, value_states)
         
         attn_output = flashinferWrapper.computeAttention(
-            q,
-            k,
-            v,
-            kvCachePool.cache_data[self.layer_idx] ,
+            query_states,
+            key_states,
+            value_states,
+            kv_data,
             mode,
-            batch_position,
             rotaryParams,
-            self.layer_idx
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -142,11 +144,9 @@ class FiQwen3Attention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    
         flashinferWrapper = kwargs["flashinferWrapper"]
-        kvCachePool       = kwargs.get("kvCachePool", None)
         mode              = kwargs.get("mode", "prefill")
-        batch_position    = kwargs.get("batch_position", None)
-     
         rotaryParams = AttentionRotaryParams(pos_encoding_mode=POS_ENCODING_MODE.NONE)
     
         input_shape = hidden_states.shape[:-1]
@@ -159,26 +159,31 @@ class FiQwen3Attention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        query = query_states.transpose(1, 2).contiguous()
-        key = key_states.transpose(1, 2).contiguous()
-        value = value_states.transpose(1, 2).contiguous()
+        # if past_key_value is not None:
+        #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        q, k, v = flashinferWrapper.reshape_qkv_for_attention(
-            query, key, value, batch_position
-        )
+        v_data = past_key_value.value_cache[self.layer_idx]
+        k_data = past_key_value.key_cache[self.layer_idx]
+        kv_data = (k_data, v_data)
+
+        query_states = query_states.transpose(1, 2).contiguous()
+        key_states = key_states.transpose(1, 2).contiguous()
+        value_states = value_states.transpose(1, 2).contiguous()
+       
+        query_states, key_states, value_states = flashinferWrapper.reshape_qkv_for_attention(query_states, key_states, value_states)
         
         attn_output = flashinferWrapper.computeAttention(
-            q,
-            k,
-            v,
-            kvCachePool.cache_data[self.layer_idx] ,
+            query_states,
+            key_states,
+            value_states,
+            kv_data,
             mode,
-            batch_position,
             rotaryParams,
-            self.layer_idx
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        
+        # The second return is `attn_weights`, which for flashinfer we typically skip/None
         return attn_output, None

@@ -6,38 +6,38 @@ from .registry import ModelRegistry
 
 # --- Custom Loader Hooks ---
 
-def flashinfer_load_kv_cache(builder, target_model, draft_model):
-    try:
-        from specdecodes.models.utils.flashinfer.cache_manager import FlashInferCache
-    except ModuleNotFoundError as e:
-        raise ImportError(
-            f"Method '{builder.config.method}' requires the optional dependency 'flashinfer'.\n"
-            "Hint: install it (and its deps), e.g. `pip install flashinfer-python`, then retry."
-        ) from e
+# def flashinfer_load_kv_cache(builder, target_model, draft_model):
+#     try:
+#         from specdecodes.models.utils.flashinfer.cache_manager import FlashInferCache
+#     except ModuleNotFoundError as e:
+#         raise ImportError(
+#             f"Method '{builder.config.method}' requires the optional dependency 'flashinfer'.\n"
+#             "Hint: install it (and its deps), e.g. `pip install flashinfer-python`, then retry."
+#         ) from e
 
-    if builder.max_length is None:
-        raise ValueError("max_length should be set for FlashInfer cache.")
+#     if builder.max_length is None:
+#         raise ValueError("max_length should be set for FlashInfer cache.")
 
-    # Shared logic for max_cache_len calculation
-    max_verify_tokens = 0
-    if builder.draft_params:
-        if hasattr(builder.draft_params, "max_verify_tokens"):
-            max_verify_tokens = builder.draft_params.max_verify_tokens
-        elif hasattr(builder.draft_params, "max_sample_tokens"):
-            max_verify_tokens = builder.draft_params.max_sample_tokens
-        elif hasattr(builder.draft_params, "num_nodes"):
-            max_verify_tokens = builder.draft_params.num_nodes + 1
+#     # Shared logic for max_cache_len calculation
+#     max_verify_tokens = 0
+#     if builder.draft_params:
+#         if hasattr(builder.draft_params, "max_verify_tokens"):
+#             max_verify_tokens = builder.draft_params.max_verify_tokens
+#         elif hasattr(builder.draft_params, "max_sample_tokens"):
+#             max_verify_tokens = builder.draft_params.max_sample_tokens
+#         elif hasattr(builder.draft_params, "num_nodes"):
+#             max_verify_tokens = builder.draft_params.num_nodes + 1
 
-    max_cache_len = builder.max_length + max_verify_tokens
+#     max_cache_len = builder.max_length + max_verify_tokens
 
-    past_key_values = FlashInferCache(
-        target_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len
-    ).kvCachePool
-    draft_past_key_values = FlashInferCache(
-        draft_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len
-    ).kvCachePool
+#     past_key_values = FlashInferCache(
+#         target_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len
+#     ).kvCachePool
+#     draft_past_key_values = FlashInferCache(
+#         draft_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len
+#     ).kvCachePool
 
-    return past_key_values, draft_past_key_values
+#     return past_key_values, draft_past_key_values
 
 def flashinfer_load_draft_model(builder, target_model, tokenizer, draft_model_path):
     try:
@@ -169,18 +169,39 @@ def register_presets():
     except ImportError:
         pass
 
+    # SubSpec SD V2 FlashInfer
+    try:
+        from specdecodes.models.generators.subspec_sd_v2_fi import SubSpecSDGenerator as SubSpecSDGeneratorV2Fi
+        from specdecodes.models.draft_models.subspec_sd_fi import SubSpecSDDraftModel
+        from specdecodes.helpers.recipes.subspec.hqq_4bit_attn_4bit_mlp_postspec import (
+            Recipe as SubSpecRecipeV2,
+        )
+        
+        ModelRegistry.register(
+            name="subspec_sd_v2_fi",
+            generator_cls=SubSpecSDGeneratorV2Fi,
+            draft_model_cls=SubSpecSDDraftModel,
+            default_config={
+                "recipe": SubSpecRecipeV2(),
+                "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
+            },
+            load_draft_model_fn=flashinfer_load_draft_model,
+        )
+    except ImportError:
+        pass
+
     # Classic SD FlashInfer (lazy import)
     ModelRegistry.register(
         name="classic_sd_fi",
         generator_cls="specdecodes.models.generators.classic_sd_fi:ClassicSDGenerator",
-        draft_model_cls="specdecodes.models.draft_models.classic_sd_fi:ClassicSDDraftModel",
+        draft_model_cls="specdecodes.models.draft_models.classic_sd:ClassicSDDraftModel",
         default_config={
             "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
             "draft_model_path": "meta-llama/Llama-3.2-1B-Instruct",
             "recipe": None,
         },
         load_draft_model_fn=flashinfer_load_draft_model,
-        load_kv_cache_fn=flashinfer_load_kv_cache,
+        # load_kv_cache_fn=flashinfer_load_kv_cache,
     )
 
     # SubSpec SD FlashInfer (lazy import)
@@ -196,7 +217,7 @@ def register_presets():
                 "recipe": SubSpecRecipeV1(),
             },
             load_draft_model_fn=flashinfer_load_draft_model,
-            load_kv_cache_fn=flashinfer_load_kv_cache,
+            # load_kv_cache_fn=flashinfer_load_kv_cache,
         )
     except ImportError:
         # If the base SubSpec recipe isn't importable, don't register this method.
