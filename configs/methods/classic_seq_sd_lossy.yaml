@@ -1,0 +1,30 @@
+# Classic seq-SD with lossy verification
+method: classic_seq_sd_lossy
+
+llm_path: meta-llama/Llama-3.1-8B-Instruct
+draft_model_path: meta-llama/Llama-3.2-1B-Instruct
+
+recipe: null
+
+max_length: 4096
+cache_implementation: static
+warmup_iter: 1
+compile_mode: max-autotune
+
+# Target sampling settings (defaults)
+do_sample: false
+temperature: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 4096
+  verify_method: lossy
+  verify_kwargs:
+    threshold: 0.9
+    window_size: 6
+
+draft_params:
+  temperature: 1.0
+  max_depth: 16
+  topk_len: 1
