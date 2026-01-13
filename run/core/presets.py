@@ -300,6 +300,24 @@ def register_presets():
         )
     except ImportError:
         pass
+    
+    # Classic SD Seq Lossy
+    try:
+        from specdecodes.models.generators.classic_seq_sd import ClassicSDGenerator as ClassicSDGeneratorSeq
+        from specdecodes.models.draft_models.classic_seq_sd import ClassicSDDraftModel as ClassicSDDraftModelSeq
+        
+        ModelRegistry.register(
+            name="classic_seq_sd_lossy",
+            generator_cls=ClassicSDGeneratorSeq,
+            draft_model_cls=ClassicSDDraftModelSeq,
+            default_config={
+                "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
+                "draft_model_path": "meta-llama/Llama-3.2-1B-Instruct",
+                "recipe": None,
+            }
+        )
+    except ImportError:
+        pass
 
     # SubSpec SD Seq
     try:
@@ -339,6 +357,48 @@ def register_presets():
                 "recipe": SubSpecRecipeNoOffload(),
             },
             needs_draft_kv_cache=False,
+        )
+    except ImportError:
+        pass
+    
+    # SubSpec SD Seq No Offload
+    try: 
+        from specdecodes.models.generators.subspec_seq_sd import SubSpecSDGenerator
+        from specdecodes.models.draft_models.subspec_seq_sd import SubSpecSDDraftModel
+        from specdecodes.helpers.recipes.subspec.hqq_4bit_no_offload import (
+            Recipe as SubSpecRecipeNoOffload
+        )
+        
+        ModelRegistry.register(
+            name="subspec_seq_sd_no_offload",
+            generator_cls=SubSpecSDGenerator,
+            draft_model_cls=SubSpecSDDraftModel,
+            default_config={
+                "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
+                "recipe": SubSpecRecipeNoOffload(),
+            },
+            needs_draft_kv_cache=False
+        )
+    except ImportError:
+        pass
+    
+    # SubSpec SD Seq no offload lossy
+    try:
+        from specdecodes.models.generators.subspec_seq_sd import SubSpecSDGenerator as SubSpecSDGeneratorSeq
+        from specdecodes.models.draft_models.subspec_seq_sd import SubSpecSDDraftModel as SubSpecSDDraftModelSeq
+        from specdecodes.helpers.recipes.subspec.hqq_4bit_no_offload import (
+            Recipe as SubSpecRecipeNoOffload,
+        )
+        
+        ModelRegistry.register(
+            name="subspec_seq_sd_no_offload_lossy",
+            generator_cls=SubSpecSDGeneratorSeq,
+            draft_model_cls=SubSpecSDDraftModelSeq,
+            default_config={
+                "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
+                "recipe": SubSpecRecipeNoOffload()
+            },
+            needs_draft_kv_cache=False
         )
     except ImportError:
         pass
