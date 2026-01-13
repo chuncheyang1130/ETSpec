@@ -6,6 +6,8 @@ import nvtx
 from .base import GeneratorBase
 from ..utils.mixin import SDProfilingMixin
 
+from ..utils.seq_verify import verify_seq
+
 class ClassicSDGeneratorBase(GeneratorBase):
     def __init__(self, generator_kwargs, *model_args, **kwargs):
         super().__init__(*model_args, **kwargs)
@@ -26,18 +28,22 @@ class ClassicSDGeneratorBase(GeneratorBase):
         return outputs
     
     def _verify(self, draft_ids, root_ind, logits, logits_processor, do_sample, skip_nodes: int = 0):
-        global_ids = self._sample_token(logits, logits_processor, do_sample, return_probs=False)  # [1, T]
-        g0 = global_ids[0] # [T]
-        d = draft_ids[0][root_ind:root_ind + g0.size(0)] # [T]
-
-        valid = (d[1:] == g0[:-1]) & (g0[:-1] != self.draft_model.eos_token_id)
-        accept_len = int(torch.cumprod(valid.to(torch.int64), dim=0).sum().item())
-        cmp_len = g0.size(0) - 1
-        total_len = cmp_len if accept_len == cmp_len else accept_len + 1
-
-        sampled_tokens = g0[:accept_len + 1]
-
-        return sampled_tokens.unsqueeze(0), None, (total_len, accept_len)
+        verify_method = str(self.generator_kwargs.get("verify_method", "exact") or "exact").strip().lower()
+        verify_kwargs = dict(self.generator_kwargs.get("verify_kwargs") or {})
+        
+        return verify_seq(
+            draft_ids=draft_ids,
+            root_ind=root_ind,
+            logits=logits,
+            sample_token_fn=self._sample_token,
+            tokenizer=self.tokenizer,
+            eos_token_id=self.draft_model.eos_token_id,
+            logits_processor=logits_processor,
+            do_sample=do_sample,
+            skip_nodes=skip_nodes,
+            verify_method=verify_method,
+            verify_kwargs=verify_kwargs,
+        )
     
     def _generate(
         self,
