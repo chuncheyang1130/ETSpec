@@ -94,7 +94,15 @@ def _load_yaml_config(path: str) -> Dict[str, Any]:
     return dict(data)
 
 
+def _clean_path(path: str) -> str:
+    """Strip trailing whitespace and invisible Unicode characters from a path."""
+    invisible_chars = '\u200e\u200f\u202a\u202b\u202c\u202d\u202e\ufeff'
+    return path.rstrip().rstrip(invisible_chars)
+
+
 def _resolve_existing_path(path: str) -> str:
+    # Strip any trailing whitespace and invisible Unicode characters
+    path = _clean_path(path)
     resolved = os.path.abspath(os.path.expanduser(path))
     if not os.path.exists(resolved):
         raise FileNotFoundError(resolved)
@@ -147,7 +155,7 @@ def _build_base_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        type=str,
+        type=_clean_path,
         required=True,
         help="Path to a YAML config file. Required. Values override method defaults; CLI args override YAML.",
     )
