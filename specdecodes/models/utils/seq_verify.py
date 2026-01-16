@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from typing import Any, Optional, Tuple
-from .lossy_seq_verify import lossy_seq_verify
+from .lossy_seq_verify import lossy_edit_distance_verify
 
 def verify_seq(
     *,
@@ -44,8 +44,8 @@ def verify_seq(
         threshold = float(vk.get("threshold", 0.9))
         window_size = int(vk.get("window_size", 6))
         
-        accept_len = lossy_seq_verify(
-            draft_ids=draft_ids,
+        accept_len = lossy_edit_distance_verify(
+            draft_ids=d[1:],
             target_ids=global_ids,
             tokenizer=tokenizer,
             confidence=confidence,
