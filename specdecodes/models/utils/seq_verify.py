@@ -45,7 +45,7 @@ def verify_seq(
         window_size = int(vk.get("window_size", 6))
         
         accept_len = lossy_edit_distance_verify(
-            draft_ids=draft_ids,
+            draft_ids=d[1:],
             target_ids=global_ids,
             tokenizer=tokenizer,
             confidence=confidence,

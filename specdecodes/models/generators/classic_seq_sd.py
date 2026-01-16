@@ -11,6 +11,7 @@ from ..utils.seq_verify import verify_seq
 class ClassicSDGeneratorBase(GeneratorBase):
     def __init__(self, generator_kwargs, *model_args, **kwargs):
         super().__init__(*model_args, **kwargs)
+        self.generator_kwargs = generator_kwargs or {}
         self.prefill_chunk_size = generator_kwargs.get("prefill_chunk_size", None)
         
     def _speculate(self, input_ids, *model_args, **kwargs):
@@ -32,7 +33,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
         verify_kwargs = dict(self.generator_kwargs.get("verify_kwargs") or {})
         
         return verify_seq(
-            draft_ids=draft_ids,
+            draft_ids=draft_ids[0],
             root_ind=root_ind,
             logits=logits,
             sample_token_fn=self._sample_token,
