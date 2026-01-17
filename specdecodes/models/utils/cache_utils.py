@@ -137,10 +137,10 @@ class TreeStaticCache(StaticCache):
     
     def reset(self):
         """Resets the cache values while preserving the objects"""
-        for layer_idx in range(len(self.layers)):
+        for layer_idx in range(len(self.key_cache)):
             # In-place ops prevent breaking the static address
-            self.layers[layer_idx].keys.zero_()
-            self.layers[layer_idx].values.zero_()
+            self.key_cache[layer_idx].zero_()
+            self.value_cache[layer_idx].zero_()
 
     def crop(self, start: int, end: Optional[int] = None, dim: int = 2) -> None:
         """
@@ -157,10 +157,8 @@ class TreeStaticCache(StaticCache):
 
         # Group (k, v) pairs by device.
         device_groups = {}
-        # for k, v in zip(self.key_cache, self.value_cache):
-        #     device_groups.setdefault(k.device, []).append((k, v))
-        for layer in self.layers:
-            device_groups.setdefault(layer.keys.device, []).append((layer.keys, layer.values))
+        for k, v in zip(self.key_cache, self.value_cache):
+            device_groups.setdefault(k.device, []).append((k, v))
         for dev, kv_list in device_groups.items():
             # For non‑MPS devices, use index_fill_ along dim 2.
             if dev.type != 'mps':
@@ -196,10 +194,8 @@ class TreeStaticCache(StaticCache):
         slice_len = beam_idx.size(0)
         # Group cache indices by device.
         dev_groups = {}
-        # for i, (k, _) in enumerate(zip(self.key_cache, self.value_cache)):
-        #     dev_groups.setdefault(k.device, []).append(i)
-        for i in range(len(self.layers)):
-            dev_groups.setdefault(self.layers[i].keys.device, []).append(i)
+        for i, (k, _) in enumerate(zip(self.key_cache, self.value_cache)):
+            dev_groups.setdefault(k.device, []).append(i)
         
         # Process each device group.
         for dev, indices in dev_groups.items():
@@ -209,13 +205,13 @@ class TreeStaticCache(StaticCache):
             reorder_dest = offset + torch.arange(slice_len, device=dev)
             
             # Stack the caches for this device.
-            k_cat = torch.stack([self.layers[i].keys for i in indices], dim=0)
-            v_cat = torch.stack([self.layers[i].values for i in indices], dim=0)
+            k_cat = torch.stack([self.key_cache[i] for i in indices], dim=0)
+            v_cat = torch.stack([self.value_cache[i] for i in indices], dim=0)
             # Batched update along dimension `dim`
             k_cat.index_copy_(dim+1, reorder_dest, k_cat.index_select(dim+1, reorder_src))
             v_cat.index_copy_(dim+1, reorder_dest, v_cat.index_select(dim+1, reorder_src))
             
             # Scatter the updated results back.
             for j, i in enumerate(indices):
-                self.layers[i].keys.copy_(k_cat[j])
-                self.layers[i].values.copy_(v_cat[j])
+                self.key_cache[i].copy_(k_cat[j])
+                self.value_cache[i].copy_(v_cat[j])
