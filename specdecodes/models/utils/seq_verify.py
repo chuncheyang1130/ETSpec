@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from typing import Any, Optional, Tuple
 from .lossy_seq_verify import lossy_edit_distance_verify
+from .fly_seq_verify import fly_verify, fly_verify_sequence
 
 def verify_seq(
     *,
@@ -55,6 +56,69 @@ def verify_seq(
         )
 
         sampled_tokens = torch.cat([draft_ids[1:1+accept_len], global_ids[accept_len:accept_len + 1]])
+        
+    elif method == "fly":
+        # ---- FLy verifier (Training-Free Loosely Speculative Decoding) ----
+        # Implements the exact FLy algorithm from the paper
+        # Reference: FLy-paper.txt, Section 2.2
+        
+        # Extract parameters with defaults from paper (Table 4)
+        entropy_threshold = float(vk.get("entropy_threshold", 0.3))  # θ = 0.3 (default from paper)
+        window_size = int(vk.get("window_size", 6))  # W = 6 (default from paper)
+        
+        # Note: draft_ids includes root token at root_ind, we need tokens from root_ind+1 onwards
+        # d[1:] corresponds to draft tokens (K tokens), global_ids[:-1] corresponds to target tokens for comparison (K tokens)
+        # logits[:, :-1, :] has logits for K positions (positions 0 to K-1), matching the K draft/target tokens
+        draft_tokens = d[1:]  # Draft tokens excluding root: [K]
+        target_tokens_for_comparison = global_ids[:-1]  # Target tokens excluding bonus: [K]
+        logits_for_verification = logits[:, :-1, :]  # Logits for the K comparison positions: [1, K, |V|]
+        
+        # FLy verification
+        accept_len = fly_verify(
+            draft_ids=draft_tokens,
+            target_ids=target_tokens_for_comparison,
+            logits=logits_for_verification,
+            eos_token_id=eos_token_id if eos_token_id is not None else -1,
+            entropy_threshold=entropy_threshold,
+            window_size=window_size,
+        )
+        
+        # Construct sampled tokens: accepted draft tokens + bonus token
+        if accept_len > 0:
+            sampled_tokens = torch.cat([draft_tokens[:accept_len], global_ids[accept_len:accept_len + 1]])
+        else:
+            # No tokens accepted, only bonus token
+            sampled_tokens = global_ids[0:1]
+        
+    elif method == "fly_sequence":
+        # ---- FLy sequence verifier (variant that accepts token sequences) ----
+        # Treats a sequence of tokens as a single unit for verification
+        
+        entropy_threshold = float(vk.get("entropy_threshold", 0.3))
+        window_size = int(vk.get("window_size", 6))
+        max_defer_sequence_length = int(vk.get("max_defer_sequence_length", 1))
+        
+        draft_tokens = d[1:]  # Draft tokens excluding root: [K]
+        target_tokens_for_comparison = global_ids[:-1]  # Target tokens excluding bonus: [K]
+        logits_for_verification = logits[:, :-1, :]  # Logits for the K comparison positions: [1, K, |V|]
+        
+        # FLy sequence verification
+        accept_len = fly_verify_sequence(
+            draft_ids=draft_tokens,
+            target_ids=target_tokens_for_comparison,
+            logits=logits_for_verification,
+            eos_token_id=eos_token_id if eos_token_id is not None else -1,
+            entropy_threshold=entropy_threshold,
+            window_size=window_size,
+            max_defer_sequence_length=max_defer_sequence_length,
+        )
+        
+        # Construct sampled tokens: accepted draft tokens + bonus token
+        if accept_len > 0:
+            sampled_tokens = torch.cat([draft_tokens[:accept_len], global_ids[accept_len:accept_len + 1]])
+        else:
+            # No tokens accepted, only bonus token
+            sampled_tokens = global_ids[0:1]
         
     else:
         raise ValueError(f"Unsupported verify_method: {verify_method}")

@@ -347,9 +347,9 @@ def _build_full_parser(base_parser: argparse.ArgumentParser, default_config: Dic
     full_parser.add_argument(
         "--verify-method",
         type=str,
-        choices=["exact", "lossy"],
+        choices=["exact", "lossy", "fly", "fly_sequence"],
         default=default_verify_method,
-        help="Verification method for tree-based SD: exact or lossy",
+        help="Verification method: exact, lossy, fly, or fly_sequence (FLy: Training-Free Loosely Speculative Decoding)",
     )
 
     full_parser.add_argument(
@@ -374,7 +374,19 @@ def _build_full_parser(base_parser: argparse.ArgumentParser, default_config: Dic
         "-w",
         type=int,
         default=None,
-        help="Lossy verify: require this many future locally-correct nodes (lookahead)",
+        help="Lossy/Fly verify: deferred window size W (default: 6)",
+    )
+    full_parser.add_argument(
+        "--entropy-threshold",
+        type=float,
+        default=None,
+        help="FLy verify: entropy gate threshold θ (default: 0.3, overrides --threshold if set)",
+    )
+    full_parser.add_argument(
+        "--max-defer-sequence-length",
+        type=int,
+        default=None,
+        help="FLy sequence verify: maximum length of sequence that can be deferred and accepted (default: 1)",
     )
 
     return full_parser
@@ -437,7 +449,8 @@ def _apply_generator_kwargs_overrides(config: AppConfig, config_args: argparse.N
         ).strip().lower()
     if getattr(config_args, "window_size", None) is not None:
         config.generator_kwargs["verify_kwargs"]["window_size"] = int(config_args.window_size)
-
+    if getattr(config_args, "max_defer_sequence_length", None) is not None:
+        config.generator_kwargs["verify_kwargs"]["max_defer_sequence_length"] = int(config_args.max_defer_sequence_length)
 
 def _apply_draft_params_overrides(config: AppConfig, config_args: argparse.Namespace) -> None:
     return
