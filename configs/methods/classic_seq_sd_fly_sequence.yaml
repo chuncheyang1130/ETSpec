@@ -1,0 +1,34 @@
+# Classic seq-SD with FLy sequence verification (variant that accepts token sequences)
+# This variant treats a sequence of tokens as a single unit for verification
+method: classic_seq_sd
+
+llm_path: meta-llama/Llama-3.1-8B-Instruct
+draft_model_path: meta-llama/Llama-3.2-1B-Instruct
+
+recipe: null
+
+max_length: 4096
+cache_implementation: static
+warmup_iter: 1
+compile_mode: max-autotune
+
+# Target sampling settings (defaults)
+do_sample: false
+temperature: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 4096
+  verify_method: fly_sequence
+  verify_kwargs:
+    # FLy sequence algorithm parameters
+    entropy_threshold: 0.04  # θ: Entropy gate threshold (default from paper)
+    window_size: 6          # W: Deferred window size (default from paper)
+    max_defer_sequence_length: 20  # Maximum length of sequence that can be deferred and accepted
+
+draft_params:
+  temperature: 1.0
+  max_depth: 16
+  topk_len: 1
+
