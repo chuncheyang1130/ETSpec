@@ -23,7 +23,7 @@ generator_kwargs:
   verify_method: fly
   verify_kwargs:
     # FLy algorithm parameters (from paper Table 4)
-    entropy_threshold: 0.03  # θ: Entropy gate threshold (default from paper)
+    threshold: 0.03  # θ: Entropy gate threshold (default from paper)
     window_size: 6          # W: Deferred window size (default from paper)
 
 draft_params:

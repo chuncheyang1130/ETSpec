@@ -23,9 +23,9 @@ generator_kwargs:
   verify_method: fly_sequence
   verify_kwargs:
     # FLy sequence algorithm parameters
-    entropy_threshold: 0.04  # θ: Entropy gate threshold (default from paper)
+    threshold: 0.04         # θ: Entropy gate threshold (default from paper)
     window_size: 6          # W: Deferred window size (default from paper)
-    max_defer_sequence_length: 20  # Maximum length of sequence that can be deferred and accepted
+    max_tolerance_seq_length: 20  # Maximum length of lossy tolerance sequence
 
 draft_params:
   temperature: 1.0

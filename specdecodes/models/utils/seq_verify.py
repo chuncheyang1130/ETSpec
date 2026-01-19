@@ -1,8 +1,10 @@
 import torch
 import numpy as np
 from typing import Any, Optional, Tuple
-from .lossy_seq_verify import lossy_edit_distance_verify
-from .fly_seq_verify import fly_verify, fly_verify_sequence
+from .lossy_seq_verify import edit_distance_verify, fly_verify, fly_verify_sequence, fly_verify_sequence_v2
+# from .fly_seq_verify import fly_verify, fly_verify_sequence
+
+import logging
 
 def verify_seq(
     *,
@@ -11,7 +13,7 @@ def verify_seq(
     logits: torch.Tensor,
     sample_token_fn,
     tokenizer,
-    eos_token_id: Optional[int],
+    eos_token_id: int,
     logits_processor,
     do_sample: bool,
     skip_nodes: int = 0,
@@ -22,108 +24,93 @@ def verify_seq(
     method = str(verify_method or "exact").strip().lower()
     vk: dict[str, Any] = dict(verify_kwargs or {})
     
-    global_ids = sample_token_fn(logits, logits_processor, do_sample, return_probs=False)[0]  # [T]
-    d = draft_ids[root_ind:root_ind + global_ids.size(0)] # [T]
+    target_ids = sample_token_fn(logits, logits_processor, do_sample, return_probs=False)[0]  # [T]
+    draft_ids = draft_ids[root_ind:root_ind + target_ids.size(0)] # [T]
     
     if method == "exact":
         # ---- Exact verifier (existing behavior) ----
-        valid = (d[1:] == global_ids[:-1]) & (global_ids[:-1] != eos_token_id)
+        valid = (draft_ids[1:] == target_ids[:-1]) & (target_ids[:-1] != eos_token_id)
         accept_len = int(torch.cumprod(valid.to(torch.int64), dim=0).sum().item())
-        sampled_tokens = global_ids[:accept_len + 1]
+        sampled_tokens = target_ids[:accept_len + 1]
         
-    elif method == "lossy":
-        vocab_size = logits.size(-1)
-        # calculate entropy for each position to see whether target is confident on the prediction
-        probs = torch.softmax(logits, dim=-1)   # p -> [1, T]
-        log_probs = torch.log_softmax(logits, dim=-1)   # log(p) -> [1, T]
-        entropy = -(probs * log_probs).sum(dim=-1)
+        cmp_len = target_ids.size(0) - 1
+        total_len = cmp_len if accept_len == cmp_len else accept_len + 1    
         
-        # create a metric: confidence, which indicates the confidence of target model's token prediction
-        max_entropy = np.log(vocab_size)     # By math, when all token has equal prob -> 1 / |V|, entropy = -sigma{ 1/|V| * log(1/|V|) } = sigma{ 1/|V| * log|V| } = log|V|
-        confidence = 1 - entropy / max_entropy
-        
-        threshold = float(vk.get("threshold", 0.9))
-        window_size = int(vk.get("window_size", 6))
-        
-        accept_len = lossy_edit_distance_verify(
-            draft_ids=d[1:],
-            target_ids=global_ids,
-            tokenizer=tokenizer,
-            confidence=confidence,
+        return sampled_tokens.unsqueeze(0), None, (total_len, int(accept_len))
+    
+    # ---- Lossy Verifier ----
+    threshold = float(vk.get("threshold", 0.9))
+    window_size = int(vk.get("window_size", 6))
+    
+    # calculate entropy for each position to see whether target is confident on the prediction
+    vocab_size = logits.size(-1)
+    probs = torch.softmax(logits, dim=-1)   # p -> [1, T]
+    log_probs = torch.log_softmax(logits, dim=-1)   # log(p) -> [1, T]
+    entropy = -(probs * log_probs).sum(dim=-1).squeeze(0)   # entropy -> [T]
+
+    max_entropy = np.log(vocab_size)     # By math, when all token has equal prob -> 1 / |V|, entropy = -sigma{ 1/|V| * log(1/|V|) } = sigma{ 1/|V| * log|V| } = log|V|
+    normalized_entropy = entropy / max_entropy  # normalized entropy -> [T], in range [0, 1]
+
+    if method == "edit_distance":
+        accept_len = edit_distance_verify(
+            draft_ids=draft_ids[1:],
+            target_ids=target_ids[:-1],
+            entropy=normalized_entropy[:-1],
             eos_token_id=eos_token_id,
             threshold=threshold,
             window_size=window_size
         )
-
-        sampled_tokens = torch.cat([draft_ids[1:1+accept_len], global_ids[accept_len:accept_len + 1]])
-        
     elif method == "fly":
         # ---- FLy verifier (Training-Free Loosely Speculative Decoding) ----
         # Implements the exact FLy algorithm from the paper
         # Reference: FLy-paper.txt, Section 2.2
-        
-        # Extract parameters with defaults from paper (Table 4)
-        entropy_threshold = float(vk.get("entropy_threshold", 0.3))  # θ = 0.3 (default from paper)
-        window_size = int(vk.get("window_size", 6))  # W = 6 (default from paper)
-        
-        # Note: draft_ids includes root token at root_ind, we need tokens from root_ind+1 onwards
-        # d[1:] corresponds to draft tokens (K tokens), global_ids[:-1] corresponds to target tokens for comparison (K tokens)
-        # logits[:, :-1, :] has logits for K positions (positions 0 to K-1), matching the K draft/target tokens
-        draft_tokens = d[1:]  # Draft tokens excluding root: [K]
-        target_tokens_for_comparison = global_ids[:-1]  # Target tokens excluding bonus: [K]
-        logits_for_verification = logits[:, :-1, :]  # Logits for the K comparison positions: [1, K, |V|]
-        
-        # FLy verification
         accept_len = fly_verify(
-            draft_ids=draft_tokens,
-            target_ids=target_tokens_for_comparison,
-            logits=logits_for_verification,
-            eos_token_id=eos_token_id if eos_token_id is not None else -1,
-            entropy_threshold=entropy_threshold,
+            draft_ids=draft_ids[1:],
+            target_ids=target_ids[:-1],
+            entropy=normalized_entropy[:-1],
+            eos_token_id=eos_token_id,
+            threshold=threshold,
             window_size=window_size,
         )
-        
-        # Construct sampled tokens: accepted draft tokens + bonus token
-        if accept_len > 0:
-            sampled_tokens = torch.cat([draft_tokens[:accept_len], global_ids[accept_len:accept_len + 1]])
-        else:
-            # No tokens accepted, only bonus token
-            sampled_tokens = global_ids[0:1]
-        
+
     elif method == "fly_sequence":
         # ---- FLy sequence verifier (variant that accepts token sequences) ----
         # Treats a sequence of tokens as a single unit for verification
-        
-        entropy_threshold = float(vk.get("entropy_threshold", 0.3))
-        window_size = int(vk.get("window_size", 6))
-        max_defer_sequence_length = int(vk.get("max_defer_sequence_length", 1))
-        
-        draft_tokens = d[1:]  # Draft tokens excluding root: [K]
-        target_tokens_for_comparison = global_ids[:-1]  # Target tokens excluding bonus: [K]
-        logits_for_verification = logits[:, :-1, :]  # Logits for the K comparison positions: [1, K, |V|]
+        max_tolerance_seq_length = int(vk.get("max_tolerance_seq_length", 1))
         
         # FLy sequence verification
         accept_len = fly_verify_sequence(
-            draft_ids=draft_tokens,
-            target_ids=target_tokens_for_comparison,
-            logits=logits_for_verification,
-            eos_token_id=eos_token_id if eos_token_id is not None else -1,
-            entropy_threshold=entropy_threshold,
+            draft_ids=draft_ids[1:],
+            target_ids=target_ids[:-1],
+            entropy=normalized_entropy[:-1],
+            eos_token_id=eos_token_id,
+            threshold=threshold,
             window_size=window_size,
-            max_defer_sequence_length=max_defer_sequence_length,
+            max_tolerance_seq_length=max_tolerance_seq_length,
         )
         
-        # Construct sampled tokens: accepted draft tokens + bonus token
-        if accept_len > 0:
-            sampled_tokens = torch.cat([draft_tokens[:accept_len], global_ids[accept_len:accept_len + 1]])
-        else:
-            # No tokens accepted, only bonus token
-            sampled_tokens = global_ids[0:1]
+    elif method == "fly_sequence_v2":
+        # ---- FLy sequence verifier v2 (improved variant that accepts token sequences) ----
+        # Treats a sequence of tokens as a single unit for verification
+        max_tolerance_seq_length = int(vk.get("max_tolerance_seq_length", 1))
+        
+        # FLy sequence verification v2
+        accept_len = fly_verify_sequence_v2(
+            draft_ids=draft_ids[1:],
+            target_ids=target_ids[:-1],
+            entropy=normalized_entropy[:-1],
+            eos_token_id=eos_token_id,
+            threshold=threshold,
+            window_size=window_size,
+            max_tolerance_seq_length=max_tolerance_seq_length,
+        )
         
     else:
         raise ValueError(f"Unsupported verify_method: {verify_method}")
-
-    cmp_len = global_ids.size(0) - 1
+    
+    sampled_tokens = torch.cat([draft_ids[1:1+accept_len], target_ids[accept_len:accept_len + 1]])
+    
+    cmp_len = target_ids.size(0) - 1
     total_len = cmp_len if accept_len == cmp_len else accept_len + 1
     
     return sampled_tokens.unsqueeze(0), None, (total_len, int(accept_len))
