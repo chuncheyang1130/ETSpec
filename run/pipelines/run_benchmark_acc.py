@@ -10,7 +10,7 @@ import gc
 from tqdm import tqdm
 import numpy as np
 
-from .benchmarks.utils.eval_acc import run_gsm8k_eval, run_aime_eval, run_livecodebench_eval, run_mmlu_pro_eval, run_longbench_eval
+from .benchmarks.utils.eval_acc import run_gsm8k_eval, run_aime_eval, run_livecodebench_eval, run_mmlu_pro_eval, run_longbench_eval, run_math_eval
 from .benchmarks.gsm8k import load_gsm8k_dataset_answer
 from .benchmarks.aime import load_aime_dataset_answer
 from .benchmarks.livecodebench import load_livecodebench_dataset_answer
@@ -57,7 +57,7 @@ DATASET_LOADER = {
 }
 
 BENCHMARK_EVALUATORS = {
-    "gsm8k":      run_gsm8k_eval,
+    "gsm8k":      run_math_eval,
     "aime":       run_aime_eval,
     "livecodebench": run_livecodebench_eval,
     "mmlu_pro":   run_mmlu_pro_eval,
@@ -79,7 +79,9 @@ BENCHMARK_EVALUATORS = {
     "repobench_p": run_longbench_eval,
 }
 
-def main(builder, benchmarks=None, max_samples=None):
+MATH_BENCHMARKS = ['gsm8k', 'aime', 'math500']
+
+def main(builder, benchmarks=None, max_samples=None, query_version="general"):
     torch.manual_seed(0)
     random.seed(0)
         
@@ -145,6 +147,14 @@ def main(builder, benchmarks=None, max_samples=None):
     
             random.shuffle(dataset)
             dataset = dataset[:num_samples]
+        elif bench_name in MATH_BENCHMARKS:
+            # math benchmark datasets are loaded differently
+            dataset = DATASET_LOADER[bench_name](query_version=query_version)
+            num_samples = min(len(dataset), max_samples) if max_samples is not None else len(dataset)
+            print(f"Running benchmark: {bench_name}, samples: {num_samples}")
+    
+            random.shuffle(dataset)
+            dataset = dataset[:num_samples]
         elif not bench_name == "mmlu_pro":
             dataset = DATASET_LOADER[bench_name]()
             num_samples = min(len(dataset), max_samples) if max_samples is not None else len(dataset)
@@ -163,7 +173,7 @@ def main(builder, benchmarks=None, max_samples=None):
     
         # Evaluate
         eval_start = time.perf_counter()
-        if BENCHMARK_EVALUATORS[bench_name] == run_longbench_eval:
+        if BENCHMARK_EVALUATORS[bench_name] == run_longbench_eval or BENCHMARK_EVALUATORS[bench_name] == run_math_eval:
             metrics_json = BENCHMARK_EVALUATORS[bench_name](generator, tokenizer, past_kv, draft_past_kv, args, dataset, log_dir, bench_name)
         else:
             metrics_json = BENCHMARK_EVALUATORS[bench_name](generator, tokenizer, past_kv, draft_past_kv, args, dataset, log_dir)
