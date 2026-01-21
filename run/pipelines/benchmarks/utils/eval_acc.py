@@ -28,6 +28,8 @@ from .utils import (
 from specdecodes.models.utils.wandb_logger import wandb_logger
 from run.pipelines.utils.eval_utils import reset_kv, maybe_init_cuda_graph_runner
 
+from ..math_eval.parser import extract_answer, parse_ground_truth
+
 dataset2metric = {
     "narrativeqa": qa_f1_score,
     "qasper": qa_f1_score,
@@ -153,6 +155,128 @@ def _print_summary(title, perf_stats, accuracy=None, correct_q=None, total_q=Non
     print(f"\tAvg Draft Time   : {perf_stats['avg_draft_time']:.3f} sec")
     print(f"\tAvg Target Time  : {perf_stats['avg_target_time']:.3f} sec")
     print(f"\tPeak Memory      : {perf_stats['peak_memory_gib']:.3f} GiB")
+    
+def run_math_eval(generator, tokenizer, past_key_values, draft_past_key_values, args, dataset, log_dir, bench_name):
+    """
+    Evaluate GSM8K dataset accuracy alongside performance metrics.
+
+    Args:
+        generator: the model generator instance
+        tokenizer: tokenizer with chat template functionality
+        past_key_values: primary past key values for autoregressive generation
+        draft_past_key_values: draft past key values for speculative decoding (optional)
+        args: namespace containing temperature, max_length, do_sample, warmup_iter
+        dataset: list of dicts, each with keys:
+            "question": the prompt string
+            "answer": full original answer text from GSM8K (with reasoning and final line "Answer: N")
+        log_dir: directory path for writing per-sample JSONL logs
+
+    Returns:
+        A tuple of metrics:
+        (tput_mean, tput_std, tacc_mean, tacc_std,
+         answer_accuracy, avg_draft_time, avg_target_time, peak_memory)
+    """
+    
+    warmup_prompt = "Solve this math problem. Give the reasoning steps ...\nWhat is 1 + 1?"
+    _run_warmup(
+        generator,
+        tokenizer,
+        past_key_values,
+        draft_past_key_values,
+        args,
+        warmup_prompt,
+        max_length=args.max_length,
+    )
+
+    # 2. Main evaluation loop
+    log_file = os.path.join(log_dir, "0.jsonl")
+
+    # Lists to accumulate throughput, token acceptance, draft/target times
+    perf = _init_perf()
+
+    # Counters for overall question accuracy
+    total_q = 0
+    correct_q = 0
+    
+    for idx, entry in tqdm(enumerate(dataset), total=len(dataset), desc="Evaluating GSM8K"):
+        prompt = entry["question"]
+        ground_truth_text = entry["answer"]  # includes "Answer: N"
+
+        # 2.1 Generate model output IDs (same as original)
+        tokenizer.use_default_system_prompt = True
+        input_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        ).to(generator.device)
+
+        if input_ids.shape[1] > args.max_length:
+            # Skip prompts that exceed max_length
+            continue
+
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            output_ids = generator.generate(
+                input_ids,
+                temperature=args.temperature,
+                max_length=args.max_length,
+                do_sample=args.do_sample,
+                past_key_values=past_key_values,
+                draft_past_key_values=draft_past_key_values
+            )
+
+        reset_kv(past_key_values, draft_past_key_values)
+
+        # 2.2 Extract original performance logs
+        record = {**wandb_logger.log_data}
+        record.update({
+            "query": prompt,
+            "response": tokenizer.decode(
+                output_ids[0][input_ids.shape[1]:], skip_special_tokens=True
+            ).strip(),
+            "answer": ground_truth_text.strip(),
+            "peak_memory": torch.cuda.max_memory_reserved(generator.device) / (1024 ** 3)
+        })
+
+        # 2.3 Compute per-sample correctness
+        output_str = tokenizer.decode(
+            output_ids[0][input_ids.shape[1]:], skip_special_tokens=True
+        ).strip()
+        
+        pred = extract_answer(output_str, bench_name)  # to ensure it runs without error
+        gt_cot, gt_ans = parse_ground_truth(entry, bench_name)  # to ensure it runs without error
+        
+
+        is_correct = (pred is not None and gt_ans is not None and pred == gt_ans)
+        total_q += 1
+        if is_correct:
+            correct_q += 1
+
+        # Include per-sample Accuracy flag in JSON record
+        record["Accuracy"] = int(is_correct)
+
+        # Append metrics lists
+        _accum_perf(perf, record)
+
+        # Write JSONL entry
+        with open(log_file, "a+") as f:
+            json.dump(record, f)
+            f.write("\n")
+
+        # Clean up
+        del input_ids, output_ids
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # 3. Aggregate overall metrics
+    answer_accuracy = correct_q / total_q if total_q > 0 else 0
+    perf_stats = _finalize_perf(perf, generator)
+    _print_summary(bench_name, perf_stats, accuracy=answer_accuracy, correct_q=correct_q, total_q=total_q)
+
+    # 5. Return metrics as a JSON-serializable dict for better scalability
+    return {
+        **perf_stats,
+        "accuracy": float(answer_accuracy),
+    }        
+    
 
 def run_gsm8k_eval(generator, tokenizer, past_key_values, draft_past_key_values, args, dataset, log_dir):
     """
