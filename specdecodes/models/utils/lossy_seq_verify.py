@@ -182,7 +182,7 @@ def fly_verify(
         
         # Gate = Defer: check token-level deferred window
         # Check if window extends beyond available tokens
-        if j + window_size > K:
+        if j + window_size >= K:
             # Boundary case: not enough tokens to judge, reject conservatively
             first_defer_reject = j
             break
@@ -233,7 +233,7 @@ def fly_verify_sequence(
     FLy verification variant: Accept semantically correct token sequences using entropy gate and deferred window.
     
     This variant treats a sequence of tokens [j, j+k-1] as a single unit for verification.
-    When a mismatch occurs at position j, it tries to accept a sequence of length k (1 to max_defer_sequence_length)
+    When a mismatch occurs at position j, it tries to accept a sequence of length k (1 to max_tolerance_seq_length)
     by checking the entire sequence as a whole.
     
     Args:
@@ -378,7 +378,7 @@ def fly_verify_sequence(
         # logging.info(f"Final accept_seq_length: {accept_seq_length}, seq_accepted: {seq_accepted}")
         return first_mismatch_position
 
-def fly_verify_sequence_v2(
+def custom_verify(
     *,
     draft_ids: torch.Tensor,
     target_ids: torch.Tensor,
@@ -386,42 +386,8 @@ def fly_verify_sequence_v2(
     eos_token_id: int,
     threshold: float = 0.3,
     window_size: int = 6,
-    max_tolerance_seq_length: int = 1,
-) -> int:
-    """
-    FLy verification variant: Accept semantically correct token sequences using entropy gate and deferred window.
-    
-    This variant treats a sequence of tokens [j, j+k-1] as a single unit for verification.
-    When a mismatch occurs at position j, it tries to accept a sequence of length k (1 to max_defer_sequence_length)
-    by checking the entire sequence as a whole.
-    
-    Args:
-        draft_ids: Draft token sequence [K] (excluding root token)
-        target_ids: Target token sequence [K] (excluding bonus token)
-        entropy: Normalized entropy for target tokens [K]
-        eos_token_id: End-of-sequence token ID
-        threshold: Entropy threshold for gate (default: 0.3)
-        window_size: Deferred window size W (default: 6)
-        max_tolerance_seq_length: Maximum length of sequence that can be deferred and accepted (default: 1)
-
-    Returns:
-        accept_len: Number of accepted tokens (excluding bonus token), in range [0, K]
-    
-    Algorithm:
-    1. Find mismatch positions J = {j | draft_ids[j] != target_ids[j]}
-    2. For the first mismatch j ∈ J:
-       a. Compute normalized entropy h_j = -Σ(p log p) / log|V|
-       b. Entropy gate: Gate(j) = Strict if h_j < θ, else Defer
-       c. If Strict: reject all tokens from position j, return j
-       d. If Defer: try different sequence lengths k (from max_defer_sequence_length down to 1)
-          - For candidate sequence [j, j+k-1]:
-            * Entropy check: all positions in sequence must have entropy >= θ
-            * Window check: check window [j+k, j+k+W-1] for mismatches
-          - If sequence passes: accept entire sequence [j, j+k-1]
-          - If no sequence passes: reject, return j
-    3. After accepting a sequence (if any), continue checking subsequent positions with single-token FLy logic
-    4. Return the total accept length
-    """
+    tolerance_seq_length: int = 1,
+):
     K = draft_ids.size(0)
     assert target_ids.size(0) == K, f"draft_ids and target_ids must have same length K, got {K} and {target_ids.size(0)}"
     
@@ -434,18 +400,27 @@ def fly_verify_sequence_v2(
     if not mismatch_positions:
         return K
     
-    # Check entropy of mismatch positions
-    entropy_check = entropy[:] >= threshold
+    target_confidence = entropy[:] < threshold
     
-    # Tail W tokens will be individually checked
-    tail_check = torch.arange(K, device=draft_ids.device) < (K - window_size)
-    
-    # Initial accept
-    valid = (is_match | (~is_match & entropy_check)) & tail_check
-    
-    for j in range(K-window_size, K):
-        if is_match[j]:
-            valid[j] = True
-    accept_len = int(torch.cumprod(valid.to(torch.int64), dim=0).sum().item())
-    
-    return accept_len
+    for j in mismatch_positions:
+        # target model is confident on its prediction
+        if target_confidence[j]:
+            return j
+        
+        # no reference window for tolerance sequence
+        if j + tolerance_seq_length + window_size >= K:
+            return j
+        
+        if not target_confidence[j]:
+            # edit sequence: j:j+tolerance_seq_length
+            tolerance_seq_reject = ~is_match[j:j+tolerance_seq_length] & target_confidence[j:j+tolerance_seq_length]
+            if tolerance_seq_reject.count_nonzero() > 1:
+                return j
+            
+            # check window after tolerance sequence
+            window_mismatch = ~is_match[j+tolerance_seq_length: j+tolerance_seq_length+window_size]
+            if window_mismatch.count_nonzero():
+                return j
+        
+    # accept all draft tokens
+    return K

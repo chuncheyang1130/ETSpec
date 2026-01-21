@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from typing import Any, Optional, Tuple
-from .lossy_seq_verify import edit_distance_verify, fly_verify, fly_verify_sequence, fly_verify_sequence_v2
+from .lossy_seq_verify import edit_distance_verify, fly_verify, fly_verify_sequence, custom_verify
 # from .fly_seq_verify import fly_verify, fly_verify_sequence
 
 import logging
@@ -89,20 +89,18 @@ def verify_seq(
             max_tolerance_seq_length=max_tolerance_seq_length,
         )
         
-    elif method == "fly_sequence_v2":
-        # ---- FLy sequence verifier v2 (improved variant that accepts token sequences) ----
-        # Treats a sequence of tokens as a single unit for verification
+    elif method == "custom":
         max_tolerance_seq_length = int(vk.get("max_tolerance_seq_length", 1))
         
-        # FLy sequence verification v2
-        accept_len = fly_verify_sequence_v2(
+        # custom verfication: test different seq length
+        accept_len = custom_verify(
             draft_ids=draft_ids[1:],
             target_ids=target_ids[:-1],
             entropy=normalized_entropy[:-1],
             eos_token_id=eos_token_id,
             threshold=threshold,
             window_size=window_size,
-            max_tolerance_seq_length=max_tolerance_seq_length,
+            tolerance_seq_length=max_tolerance_seq_length,
         )
         
     else:
