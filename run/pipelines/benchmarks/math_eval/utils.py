@@ -1,3 +1,7 @@
+"""
+This file is largely copied from: https://github.com/ZubinGou/math-evaluation-harness
+"""
+
 import os
 import json
 import random
