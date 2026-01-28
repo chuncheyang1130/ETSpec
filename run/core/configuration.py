@@ -23,7 +23,6 @@ class AppConfig:
     top_k: Optional[int] = None
     top_p: Optional[float] = None
     min_p: Optional[float] = None
-    repetition_penalty: Optional[float] = None
     
     # Generator-specific configurations
     generator_kwargs: Dict[str, Any] = field(default_factory=dict)

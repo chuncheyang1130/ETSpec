@@ -17,7 +17,6 @@ temperature: 0.6
 top_k: 20
 top_p: 0.95
 min_p: 0.0
-repetition_penalty: 1.2
 
 generator_profiling: true
 
