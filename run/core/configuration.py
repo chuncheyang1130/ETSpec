@@ -20,6 +20,10 @@ class AppConfig:
     max_length: int = 2048
     do_sample: bool = False
     temperature: float = 0.0
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
     
     # Generator-specific configurations
     generator_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -32,7 +36,7 @@ class AppConfig:
     # Additional configurations
     cache_implementation: str = "dynamic"
     warmup_iter: int = 0
-    compile_mode: Optional[str] = None
+    compile_mode: Optional[Union[str, Dict[str, Optional[str]]]] = None
     
     # Profiling
     generator_profiling: bool = True

@@ -115,12 +115,14 @@ class GeneratorPipelineBuilder:
         draft_model_cls = entry.get_draft_model_cls() if entry else None
         if draft_model_cls:
             # Assuming standard from_pretrained pattern
+            device_map = "cuda:0" if self.device == "auto" else self.device
+            logging.debug(f"Loading draft model on device_map: {device_map}")
             draft_model = draft_model_cls.from_pretrained(
                 draft_model_path,
                 target_model=target_model,
                 torch_dtype=self.dtype,
                 eos_token_id=tokenizer.eos_token_id,
-                device_map=self.device
+                device_map=device_map
             )
             return draft_model
         return None
@@ -260,6 +262,9 @@ class GeneratorPipelineBuilder:
     def compile_generator(self, generator):
         """
         Compile the generator's forward methods.
+        Supports compile_mode as either:
+        - string: applied to both target and draft
+        - dict with 'target' and 'draft' keys: applied separately
         """
         def _align_llama_rope_buffers_to_device(model, device: torch.device) -> None:
             llama_model = getattr(model, "model", None)
@@ -283,7 +288,16 @@ class GeneratorPipelineBuilder:
                 "Please use PyTorch 2.x or disable compile_mode."
             )
 
-        logging.info(f"Compiling generator with mode: {self.compile_mode}")
+        # Extract target and draft compile modes
+        if isinstance(self.compile_mode, dict):
+            target_compile_mode = self.compile_mode.get("target")
+            draft_compile_mode = self.compile_mode.get("draft")
+        else:
+            # Fallback for string mode (shouldn't happen after _normalize_compile_mode, but be safe)
+            target_compile_mode = self.compile_mode
+            draft_compile_mode = self.compile_mode
+
+        logging.info(f"Compiling generator - target mode: {target_compile_mode}, draft mode: {draft_compile_mode}")
         
         # FlashInfer methods generally require fullgraph=False to work.
         method_name = str(getattr(self.config, "method", ""))
@@ -292,13 +306,17 @@ class GeneratorPipelineBuilder:
         # If the target model uses offloading, torch.compile() (especially fullgraph/cudagraph-related paths)
         # is typically incompatible or provides little benefit. Skip compiling target_model in that case.
         has_offloader = bool(getattr(self.recipe, "offloader", None))
-        if has_offloader:
-            logging.info("Skipping torch.compile() for target_model because recipe.offloader is set.")
-        else:
-            generator.target_model.forward = torch.compile(generator.target_model.forward, mode=self.compile_mode, dynamic=False, fullgraph=fullgraph)
+        
+        # Compile target model if target_compile_mode is set
+        if target_compile_mode is not None:
+            if has_offloader:
+                logging.info("Skipping torch.compile() for target_model because recipe.offloader is set.")
+            else:
+                logging.info(f"Compiling target_model with mode: {target_compile_mode}")
+                generator.target_model.forward = torch.compile(generator.target_model.forward, mode=target_compile_mode, dynamic=False, fullgraph=fullgraph)
 
-        # Compile draft model if it exists
-        if getattr(generator, 'draft_model', None) is not None:
+        # Compile draft model if it exists and draft_compile_mode is set
+        if draft_compile_mode is not None and getattr(generator, 'draft_model', None) is not None:
             try:
                 draft_param_device = next(generator.draft_model.model.parameters()).device
             except StopIteration:
@@ -308,9 +326,10 @@ class GeneratorPipelineBuilder:
                 # Align HF RoPE buffers pre-compile to avoid implicit DeviceCopy ops in graphs.
                 _align_llama_rope_buffers_to_device(generator.draft_model.model, draft_param_device)
 
+            logging.info(f"Compiling draft_model with mode: {draft_compile_mode}")
             generator.draft_model.forward = torch.compile(
                 generator.draft_model.forward,
-                mode=self.compile_mode,
+                mode=draft_compile_mode,
                 dynamic=False,
                 fullgraph=fullgraph,
             )
@@ -360,7 +379,15 @@ class GeneratorPipelineBuilder:
         generator.eval()
 
         if self.compile_mode is not None:
-            self.compile_generator(generator)
+            # Check if there's any actual compile mode to apply
+            has_compile_work = False
+            if isinstance(self.compile_mode, dict):
+                has_compile_work = bool(self.compile_mode.get("target") or self.compile_mode.get("draft"))
+            else:
+                has_compile_work = True
+            
+            if has_compile_work:
+                self.compile_generator(generator)
 
         self.post_process(generator, tokenizer, past_kv, draft_past_kv)
 

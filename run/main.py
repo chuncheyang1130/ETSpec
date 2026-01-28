@@ -179,10 +179,34 @@ def _resolve_existing_path(path: str) -> str:
 
 
 def _normalize_compile_mode(value):
+    """
+    Normalize compile_mode to support both string and dict formats.
+    Returns dict with 'target' and 'draft' keys, or None.
+    """
     if value is None:
         return None
-    if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
-        return None
+    
+    # String format: normalize to dict
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"none", "null"}:
+            return None
+        return {"target": value, "draft": value}
+    
+    # Dict format: normalize each value
+    if isinstance(value, dict):
+        result = {}
+        for key in ["target", "draft"]:
+            v = value.get(key)
+            if v is None:
+                result[key] = None
+            elif isinstance(v, str):
+                normalized = v.strip().lower()
+                result[key] = None if normalized in {"none", "null"} else v
+            else:
+                result[key] = v
+        return result
+    
     return value
 
 
@@ -307,9 +331,11 @@ def _build_full_parser(base_parser: argparse.ArgumentParser, default_config: Dic
     full_parser.add_argument("--draft-model-path", type=str, default=default_config.get("draft_model_path", None))
     full_parser.add_argument("--max-length", type=int, default=default_config.get("max_length", 2048))
     full_parser.add_argument("--seed", type=int, default=default_config.get("seed", 0))
-    full_parser.add_argument("--device", type=str, default="cuda:0")
+    full_parser.add_argument("--device", type=str, default=default_config.get("device", "cuda:0"))
     full_parser.add_argument("--compile-mode", type=str, default=default_config.get("compile_mode", None))
     full_parser.add_argument("--temperature", type=float, default=default_config.get("temperature", 0.0))
+    full_parser.add_argument("--top-k", type=int, default=default_config.get("top_k", None))
+    full_parser.add_argument("--top-p", type=float, default=default_config.get("top_p", None))
     full_parser.add_argument("--do-sample", action="store_true", default=default_config.get("do_sample", False))
     full_parser.add_argument("--warmup-iter", type=int, default=default_config.get("warmup_iter", 0))
 
@@ -417,6 +443,8 @@ def _apply_cli_overrides(config: AppConfig, config_args: argparse.Namespace) -> 
     config.device = config_args.device
     config.compile_mode = _normalize_compile_mode(config_args.compile_mode)
     config.temperature = float(config_args.temperature)
+    config.top_k = config_args.top_k
+    config.top_p = config_args.top_p
     config.do_sample = bool(config_args.do_sample)
     config.warmup_iter = int(config_args.warmup_iter)
     config.cache_implementation = config_args.cache_implementation
