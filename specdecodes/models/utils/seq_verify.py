@@ -12,11 +12,11 @@ def verify_seq(
     root_ind: int,
     logits: torch.Tensor,
     sample_token_fn,
-    tokenizer,
     eos_token_id: int,
     logits_processor,
     do_sample: bool,
     skip_nodes: int = 0,
+    tokenizer=None,
     verify_method: str = "exact",
     verify_kwargs: Optional[dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
