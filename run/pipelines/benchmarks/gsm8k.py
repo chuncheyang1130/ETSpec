@@ -1,14 +1,15 @@
 # Prompt template adapted from https://github.com/openai/simple-evals/tree/main
 from datasets import load_dataset
 
-REASONING_QUERY_TEMPLATE= """
-Solve this math problem. Give the reasoning steps before giving the final answer on the last line by itself in the format of "Answer:". Do not add anything other than the integer answer after "Answer:".
-
-{Question}
+REASONING_QUERY_TEMPLATE = r"""
+Question: {Question}
+Please reason step by step, and put your final answer within \boxed{{}}.
 """.strip()
 
-GENERAL_QUERY_TEMPLATE = """
-Given the following problem, reason and give a final answer to the problem.\nProblem: {Question}\nYour response should end with \"The final answer is [answer]\" where [answer] is the response to the problem.\n
+GENERAL_QUERY_TEMPLATE = r"""
+Given the following problem, reason and give a final answer to the problem.
+Problem: {Question}
+Your response should end with \"The final answer is [answer]\" where [answer] is the response to the problem.
 """.strip()
 
 # GSM8K
