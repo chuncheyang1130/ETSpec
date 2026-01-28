@@ -13,6 +13,7 @@ import torch
 import gc
 from tqdm import tqdm
 from torch.nn.attention import SDPBackend, sdpa_kernel
+import logging
 
 from .utils import (
     qa_f1_score,
@@ -29,6 +30,7 @@ from specdecodes.models.utils.wandb_logger import wandb_logger
 from run.pipelines.utils.eval_utils import reset_kv, maybe_init_cuda_graph_runner
 
 from ..math_eval.parser import extract_answer, parse_ground_truth
+from ..math_eval.grader import math_equal
 
 dataset2metric = {
     "narrativeqa": qa_f1_score,
@@ -78,19 +80,11 @@ def _run_warmup(
         tokenizer.use_default_system_prompt = True
         warmup_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": warmup_prompt}],
-            tokenize=True, add_generation_prompt=True, return_tensors="pt"
-        ).to(generator.device)
+            tokenize=True, add_generation_prompt=True, return_tensors="pt",
+        ).to("cuda:0" if generator.device == "auto" else generator.device)
 
-        gen_kwargs = dict(
-            temperature=args.temperature,
-            do_sample=args.do_sample,
-            past_key_values=past_key_values,
-            draft_past_key_values=draft_past_key_values,
-        )
-        if max_new_tokens is not None:
-            gen_kwargs["max_new_tokens"] = max_new_tokens
-        else:
-            gen_kwargs["max_length"] = max_length if max_length is not None else args.max_length
+        gen_kwargs = _build_gen_kwargs(args, past_key_values, draft_past_key_values, 
+                                       max_length=max_length, max_new_tokens=max_new_tokens)
 
         with sdpa_kernel(backends=[SDPBackend.MATH]):
             generator.generate(warmup_ids, **gen_kwargs)
@@ -108,6 +102,39 @@ def _init_perf():
         "total_draft_time": 0.0,
         "total_target_time": 0.0,
     }
+
+
+def _build_gen_kwargs(args, past_key_values, draft_past_key_values, max_length=None, max_new_tokens=None):
+    """Build generation kwargs, including enable_thinking from generator_kwargs if present."""
+    gen_kwargs = dict(
+        temperature=args.temperature,
+        do_sample=args.do_sample,
+        past_key_values=past_key_values,
+        draft_past_key_values=draft_past_key_values,
+    )
+    
+    if max_new_tokens is not None:
+        gen_kwargs["max_new_tokens"] = max_new_tokens
+    elif max_length is not None:
+        gen_kwargs["max_length"] = max_length
+    else:
+        gen_kwargs["max_length"] = args.max_length
+    
+    # Add top_k and top_p if present
+    if hasattr(args, 'top_k') and args.top_k is not None:
+        gen_kwargs['top_k'] = args.top_k
+    if hasattr(args, 'top_p') and args.top_p is not None:
+        gen_kwargs['top_p'] = args.top_p
+    if hasattr(args, 'min_p') and args.min_p is not None:
+        gen_kwargs['min_p'] = args.min_p
+    
+    # Extract enable_thinking from generator_kwargs if present
+    if hasattr(args, 'generator_kwargs') and args.generator_kwargs:
+        enable_thinking = args.generator_kwargs.get('enable_thinking')
+        if enable_thinking is not None:
+            gen_kwargs['enable_thinking'] = enable_thinking
+    
+    return gen_kwargs
 
 
 def _accum_perf(perf, record):
@@ -198,7 +225,7 @@ def run_math_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
     total_q = 0
     correct_q = 0
     
-    for idx, entry in tqdm(enumerate(dataset), total=len(dataset), desc="Evaluating GSM8K"):
+    for idx, entry in tqdm(enumerate(dataset), total=len(dataset), desc=f"Evaluating {bench_name}"):
         prompt = entry["question"]
         ground_truth_text = entry["answer"]  # includes "Answer: N"
 
@@ -207,36 +234,19 @@ def run_math_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=True, add_generation_prompt=True, return_tensors="pt"
-        ).to(generator.device)
+        ).to("cuda:0" if generator.device == "auto" else generator.device)
 
         if input_ids.shape[1] > args.max_length:
             # Skip prompts that exceed max_length
             continue
 
+        gen_kwargs = _build_gen_kwargs(args, past_key_values, draft_past_key_values)
         with sdpa_kernel(backends=[SDPBackend.MATH]):
-            output_ids = generator.generate(
-                input_ids,
-                temperature=args.temperature,
-                max_length=args.max_length,
-                do_sample=args.do_sample,
-                past_key_values=past_key_values,
-                draft_past_key_values=draft_past_key_values
-            )
+            output_ids = generator.generate(input_ids, **gen_kwargs)
 
         reset_kv(past_key_values, draft_past_key_values)
 
-        # 2.2 Extract original performance logs
-        record = {**wandb_logger.log_data}
-        record.update({
-            "query": prompt,
-            "response": tokenizer.decode(
-                output_ids[0][input_ids.shape[1]:], skip_special_tokens=True
-            ).strip(),
-            "answer": ground_truth_text.strip(),
-            "peak_memory": torch.cuda.max_memory_reserved(generator.device) / (1024 ** 3)
-        })
-
-        # 2.3 Compute per-sample correctness
+        # 2.2 Compute per-sample correctness
         output_str = tokenizer.decode(
             output_ids[0][input_ids.shape[1]:], skip_special_tokens=True
         ).strip()
@@ -244,8 +254,18 @@ def run_math_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
         pred = extract_answer(output_str, bench_name)  # to ensure it runs without error
         gt_cot, gt_ans = parse_ground_truth(entry, bench_name)  # to ensure it runs without error
         
+        # 2.3 Extract original performance logs
+        record = {**wandb_logger.log_data}
+        record.update({
+            "query": prompt,
+            "response": output_str,
+            "prediction": pred,
+            "answer": gt_ans,
+            "peak_memory": torch.cuda.max_memory_reserved(generator.device) / (1024 ** 3)
+        })
+        
 
-        is_correct = (pred is not None and gt_ans is not None and pred == gt_ans)
+        is_correct = (pred is not None and gt_ans is not None and math_equal(pred, gt_ans))
         total_q += 1
         if is_correct:
             correct_q += 1
@@ -338,15 +358,9 @@ def run_gsm8k_eval(generator, tokenizer, past_key_values, draft_past_key_values,
             # Skip prompts that exceed max_length
             continue
 
+        gen_kwargs = _build_gen_kwargs(args, past_key_values, draft_past_key_values)
         with sdpa_kernel(backends=[SDPBackend.MATH]):
-            output_ids = generator.generate(
-                input_ids,
-                temperature=args.temperature,
-                max_length=args.max_length,
-                do_sample=args.do_sample,
-                past_key_values=past_key_values,
-                draft_past_key_values=draft_past_key_values
-            )
+            output_ids = generator.generate(input_ids, **gen_kwargs)
 
         reset_kv(past_key_values, draft_past_key_values)
 
@@ -461,15 +475,9 @@ def run_aime_eval(generator, tokenizer,
         if input_ids.shape[1] > args.max_length:
             continue
 
+        gen_kwargs = _build_gen_kwargs(args, past_key_values, draft_past_key_values)
         with sdpa_kernel(backends=[SDPBackend.MATH]):
-            output_ids = generator.generate(
-                input_ids,
-                temperature=args.temperature,
-                max_length=args.max_length,
-                do_sample=args.do_sample,
-                past_key_values=past_key_values,
-                draft_past_key_values=draft_past_key_values
-            )
+            output_ids = generator.generate(input_ids, **gen_kwargs)
         reset_kv(past_key_values, draft_past_key_values)
 
         response = tokenizer.decode(
@@ -558,13 +566,9 @@ def run_mmlu_pro_eval(generator, tokenizer,
         if input_ids.shape[1] > args.max_length:
             continue
 
+        gen_kwargs = _build_gen_kwargs(args, past_key_values, draft_past_key_values)
         with sdpa_kernel(backends=[SDPBackend.MATH]):
-            output_ids = generator.generate(
-                input_ids, temperature=args.temperature,
-                max_length=args.max_length, do_sample=args.do_sample,
-                past_key_values=past_key_values,
-                draft_past_key_values=draft_past_key_values
-            )
+            output_ids = generator.generate(input_ids, **gen_kwargs)
         reset_kv(past_key_values, draft_past_key_values)
 
         resp = tokenizer.decode(
@@ -745,15 +749,9 @@ def run_livecodebench_eval(
         graded_list = []
         responses = []
         for s in range(n_samples):
+            gen_kwargs = _build_gen_kwargs(args, past_key_values, draft_past_key_values)
             with sdpa_kernel(backends=[SDPBackend.MATH]):
-                output_ids = generator.generate(
-                    input_ids,
-                    temperature=args.temperature,
-                    max_length=args.max_length,
-                    do_sample=args.do_sample,
-                    past_key_values=past_key_values,
-                    draft_past_key_values=draft_past_key_values
-                )
+                output_ids = generator.generate(input_ids, **gen_kwargs)
 
             reset_kv(past_key_values, draft_past_key_values)
 
@@ -836,15 +834,9 @@ def run_longbench_eval(generator, tokenizer, past_key_values, draft_past_key_val
             tokenize=True, add_generation_prompt=True, return_tensors="pt"
         ).to(generator.device)
 
+        gen_kwargs = _build_gen_kwargs(args, past_key_values, draft_past_key_values, max_new_tokens=max_new_tokens)
         with sdpa_kernel(backends=[SDPBackend.MATH]):
-            output_ids = generator.generate(
-                input_ids,
-                temperature=args.temperature,
-                max_new_tokens=max_new_tokens,
-                do_sample=args.do_sample,
-                past_key_values=past_key_values,
-                draft_past_key_values=draft_past_key_values,
-            )
+            output_ids = generator.generate(input_ids, **gen_kwargs)
 
         reset_kv(past_key_values, draft_past_key_values)
 
