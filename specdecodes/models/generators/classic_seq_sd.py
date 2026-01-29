@@ -90,7 +90,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
             
         if model_kwargs.get("past_key_values") is not None:
             past_key_values = model_kwargs["past_key_values"]
-            max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
+            # max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
 
             if model_kwargs.get("draft_past_key_values") is not None:
                 draft_past_key_values = model_kwargs["draft_past_key_values"]
