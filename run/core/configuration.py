@@ -33,7 +33,7 @@ class AppConfig:
     cpu_offload_gb: Optional[int] = None
     
     # Additional configurations
-    cache_implementation: str = "dynamic"
+    cache_implementation: Union[str, Dict[str, Optional[str]]] = "dynamic"
     warmup_iter: int = 0
     compile_mode: Optional[Union[str, Dict[str, Optional[str]]]] = None
     

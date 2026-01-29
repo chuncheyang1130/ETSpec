@@ -127,11 +127,26 @@ class GeneratorPipelineBuilder:
             return draft_model
         return None
     
-    def load_kv_cache(self, target_model, draft_model):    
+    def load_kv_cache(self, target_model, draft_model):
+        """
+        Load KV cache for target and draft models.
+        Supports cache_implementation as either:
+        - string: applied to both target and draft
+        - dict with 'target' and 'draft' keys: applied separately
+        """
         entry = ModelRegistry.get(self.config.method)
+        
+        # Extract target and draft cache implementation
+        if isinstance(self.cache_implementation, dict):
+            target_cache_impl = self.cache_implementation.get("target", "dynamic")
+            draft_cache_impl = self.cache_implementation.get("draft", "dynamic")
+        else:
+            target_cache_impl = self.cache_implementation
+            draft_cache_impl = self.cache_implementation
+        
         # If there is no draft model, we never allocate a draft KV cache.
         if draft_model is None:
-            if self.cache_implementation == "static":
+            if target_cache_impl == "static":
                 if self.max_length is None:
                     raise ValueError("max_length should be set for static cache.")
                 past_key_values = create_kv_cache(
@@ -152,7 +167,7 @@ class GeneratorPipelineBuilder:
             past_key_values, draft_past_key_values = entry.load_kv_cache_fn(self, target_model, draft_model)
             return past_key_values, draft_past_key_values if needs_draft_kv_cache else None
                     
-        if self.cache_implementation == "static":
+        if target_cache_impl == "static":
             if self.max_length is not None:
                 if draft_model is not None:
                     # Additional speculative tokens may cause KV-cache to exceed `max_length`.
@@ -196,7 +211,7 @@ class GeneratorPipelineBuilder:
             else:
                 raise ValueError("max_length should be set for static cache.")
             
-            # Create static kv-cache
+            # Create static kv-cache for target model
             past_key_values = create_kv_cache(
                 "static",
                 max_cache_len=max_cache_len,
@@ -205,23 +220,77 @@ class GeneratorPipelineBuilder:
                 device=self.device,
                 dtype=target_model.model.dtype,
             )
-            # if generator.draft_model is not None:
+            # Create draft kv-cache based on draft_cache_impl
             if needs_draft_kv_cache:
-                draft_past_key_values = create_kv_cache(
-                    "static",
-                    max_cache_len=max_cache_len,
-                    max_batch_size=1,
-                    config=draft_model.model.config,
-                    device=self.device,
-                    dtype=draft_model.model.dtype,
-                )
+                if draft_cache_impl == "static":
+                    draft_past_key_values = create_kv_cache(
+                        "static",
+                        max_cache_len=max_cache_len,
+                        max_batch_size=1,
+                        config=draft_model.model.config,
+                        device=self.device,
+                        dtype=draft_model.model.dtype,
+                    )
+                else:
+                    draft_past_key_values = create_kv_cache("dynamic")
             else:
                 draft_past_key_values = None
         else:
-            # Create dynamic kv-cache
+            # Create dynamic kv-cache for target model
             past_key_values = create_kv_cache("dynamic")
+            # Create draft kv-cache based on draft_cache_impl
             if needs_draft_kv_cache:
-                draft_past_key_values = create_kv_cache("dynamic")
+                if draft_cache_impl == "static":
+                    if self.max_length is not None:
+                        if draft_model is not None:
+                            def _infer_max_verify_tokens(draft_params: Any) -> int:
+                                if not draft_params:
+                                    return 0
+
+                                # Support DraftParams dataclass, SimpleNamespace, or raw dict.
+                                if isinstance(draft_params, dict):
+                                    if "max_verify_tokens" in draft_params and draft_params["max_verify_tokens"] is not None:
+                                        return int(draft_params["max_verify_tokens"])
+                                    if "max_sample_tokens" in draft_params and draft_params["max_sample_tokens"] is not None:
+                                        return int(draft_params["max_sample_tokens"])
+                                    if "num_nodes" in draft_params and draft_params["num_nodes"] is not None:
+                                        return int(draft_params["num_nodes"]) + 1
+                                    if "max_depth" in draft_params and "topk_len" in draft_params:
+                                        try:
+                                            return int(draft_params["max_depth"]) * int(draft_params["topk_len"]) + 1
+                                        except Exception:
+                                            return 0
+                                    return 0
+
+                                if hasattr(draft_params, "max_verify_tokens") and getattr(draft_params, "max_verify_tokens") is not None:
+                                    return int(getattr(draft_params, "max_verify_tokens"))
+                                if hasattr(draft_params, "max_sample_tokens") and getattr(draft_params, "max_sample_tokens") is not None:
+                                    return int(getattr(draft_params, "max_sample_tokens"))
+                                if hasattr(draft_params, "num_nodes") and getattr(draft_params, "num_nodes") is not None:
+                                    return int(getattr(draft_params, "num_nodes")) + 1
+                                if hasattr(draft_params, "max_depth") and hasattr(draft_params, "topk_len"):
+                                    try:
+                                        return int(getattr(draft_params, "max_depth")) * int(getattr(draft_params, "topk_len")) + 1
+                                    except Exception:
+                                        return 0
+                                return 0
+
+                            max_verify_tokens = _infer_max_verify_tokens(getattr(self, "draft_params", None))
+                            max_cache_len = int(self.max_length) + int(max_verify_tokens)
+                        else:
+                            max_cache_len = self.max_length
+                    else:
+                        raise ValueError("max_length should be set for static draft cache.")
+                    draft_past_key_values = create_kv_cache(
+                        "static",
+                        max_cache_len=max_cache_len,
+                        max_batch_size=1,
+                        config=draft_model.model.config,
+                        device=self.device,
+                        dtype=draft_model.model.dtype,
+                    )
+                else:
+                    draft_past_key_values = create_kv_cache("dynamic")
             else:
                 draft_past_key_values = None
         

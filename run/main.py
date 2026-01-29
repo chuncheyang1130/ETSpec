@@ -210,6 +210,40 @@ def _normalize_compile_mode(value):
     return value
 
 
+def _normalize_cache_implementation(value):
+    """
+    Normalize cache_implementation to support both string and dict formats.
+    Returns dict with 'target' and 'draft' keys, or a string.
+    """
+    if value is None:
+        return "dynamic"
+    
+    # String format: normalize to dict
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"none", "null"}:
+            return "dynamic"
+        # Return as dict with same value for both target and draft
+        return {"target": value, "draft": value}
+    
+    # Dict format: normalize each value
+    if isinstance(value, dict):
+        result = {}
+        for key in ["target", "draft"]:
+            v = value.get(key)
+            if v is None:
+                result[key] = "dynamic"
+            elif isinstance(v, str):
+                normalized = v.strip().lower()
+                result[key] = "dynamic" if normalized in {"none", "null"} else v
+            else:
+                result[key] = v
+        return result
+    
+    return value
+
+
+
 def _apply_yaml_overrides(default_config: Dict[str, Any], yaml_config: Dict[str, Any]) -> Dict[str, Any]:
     if not yaml_config:
         return dict(default_config)
@@ -219,6 +253,9 @@ def _apply_yaml_overrides(default_config: Dict[str, Any], yaml_config: Dict[str,
 
     if "compile_mode" in cfg:
         cfg["compile_mode"] = _normalize_compile_mode(cfg.get("compile_mode"))
+
+    if "cache_implementation" in cfg:
+        cfg["cache_implementation"] = _normalize_cache_implementation(cfg.get("cache_implementation"))
 
     # DraftParams can be specified as a dict in YAML.
     if isinstance(cfg.get("draft_params"), dict):
@@ -307,7 +344,6 @@ def _maybe_reexec_with_nsys(enabled: bool, output: str) -> None:
         "--python-sampling=true",
         "--cuda-memory-usage=true",
         "--gpuctxsw=true",
-        "--python-backtrace",
         "-x",
         "true",
         "-o",
@@ -447,7 +483,7 @@ def _apply_cli_overrides(config: AppConfig, config_args: argparse.Namespace) -> 
     config.top_p = config_args.top_p
     config.do_sample = bool(config_args.do_sample)
     config.warmup_iter = int(config_args.warmup_iter)
-    config.cache_implementation = config_args.cache_implementation
+    config.cache_implementation = _normalize_cache_implementation(config_args.cache_implementation)
     config.generator_profiling = bool(config_args.generator_profiling)
 
     # Optional research toggles: only override when explicitly provided.

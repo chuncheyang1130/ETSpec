@@ -22,7 +22,15 @@ class GeneratorBase(nn.Module):
         else:
             self.draft_model = None
 
-        self.cache_implementation = cache_implementation
+        # Handle cache_implementation as either string or dict
+        if isinstance(cache_implementation, dict):
+            self.target_cache_implementation = cache_implementation.get("target", "dynamic")
+            self.draft_cache_implementation = cache_implementation.get("draft", "dynamic")
+            self.cache_implementation = cache_implementation.get("target", "dynamic")  # For backward compatibility
+        else:
+            self.target_cache_implementation = cache_implementation
+            self.draft_cache_implementation = cache_implementation
+            self.cache_implementation = cache_implementation
         
         # Set prefill function same as forward so torch.compile() forward will not execute on prefill phase)
         self.target_model.prefill_forward = self.target_model.forward
