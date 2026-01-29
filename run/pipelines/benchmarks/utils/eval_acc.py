@@ -74,13 +74,18 @@ def _run_warmup(
     if n_iter <= 0:
         generator.profiling = original_profiling
         return
+    
+    if hasattr(args, 'generator_kwargs') and args.generator_kwargs:
+        enable_thinking = args.generator_kwargs.get('enable_thinking')
+        if enable_thinking is None:
+            enable_thinking = False
 
     iterator = tqdm(range(n_iter), desc="Warming up") if show_progress else range(n_iter)
     for _ in iterator:
         tokenizer.use_default_system_prompt = True
         warmup_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": warmup_prompt}],
-            tokenize=True, add_generation_prompt=True, return_tensors="pt",
+            tokenize=True, add_generation_prompt=True, return_tensors="pt", enable_thinking=enable_thinking
         ).to("cuda:0" if generator.device == "auto" else generator.device)
 
         gen_kwargs = _build_gen_kwargs(args, past_key_values, draft_past_key_values, 
@@ -127,12 +132,6 @@ def _build_gen_kwargs(args, past_key_values, draft_past_key_values, max_length=N
         gen_kwargs['top_p'] = args.top_p
     if hasattr(args, 'min_p') and args.min_p is not None:
         gen_kwargs['min_p'] = args.min_p
-    
-    # Extract enable_thinking from generator_kwargs if present
-    if hasattr(args, 'generator_kwargs') and args.generator_kwargs:
-        enable_thinking = args.generator_kwargs.get('enable_thinking')
-        if enable_thinking is not None:
-            gen_kwargs['enable_thinking'] = enable_thinking
     
     return gen_kwargs
 
@@ -214,6 +213,11 @@ def run_math_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
         warmup_prompt,
         max_length=args.max_length,
     )
+    
+    if hasattr(args, 'generator_kwargs') and args.generator_kwargs:
+        enable_thinking = args.generator_kwargs.get('enable_thinking')
+        if enable_thinking is None:
+            enable_thinking = False
 
     # 2. Main evaluation loop
     log_file = os.path.join(log_dir, "0.jsonl")
@@ -233,7 +237,7 @@ def run_math_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
         tokenizer.use_default_system_prompt = True
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            tokenize=True, add_generation_prompt=True, return_tensors="pt"
+            tokenize=True, add_generation_prompt=True, return_tensors="pt", enable_thinking=enable_thinking
         ).to("cuda:0" if generator.device == "auto" else generator.device)
 
         if input_ids.shape[1] > args.max_length:

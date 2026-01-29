@@ -23,6 +23,11 @@ def main(builder):
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     random.seed(args.seed)
+    
+    if hasattr(args, 'generator_kwargs') and args.generator_kwargs:
+        enable_thinking = args.generator_kwargs.get('enable_thinking')
+        if enable_thinking is None:
+            enable_thinking = False
 
     # warm up
     if args.warmup_iter > 0:
@@ -35,7 +40,7 @@ def main(builder):
                 messages = [{"role": "user", "content": input_message}]
                 tokenizer.use_default_system_prompt = True
                 with nvtx.annotate("Warm up"):
-                    input_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(args.device)
+                    input_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", enable_thinking=enable_thinking).to(args.device)
                     with sdpa_kernel(backends=[SDPBackend.MATH]):
                         generator.generate(input_ids, temperature=args.temperature, max_length=args.max_length, do_sample=args.do_sample, past_key_values=past_kv, draft_past_key_values=draft_past_kv)
                 
@@ -50,7 +55,7 @@ def main(builder):
     # input_message = "Describe what is large language models to me."
     messages = [{"role": "user", "content": input_message}]
     tokenizer.use_default_system_prompt = True
-    input_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(args.device)
+    input_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", enable_thinking=enable_thinking).to(args.device)
     prompt = tokenizer.decode(input_ids[0])
     
     start_event = torch.cuda.Event(enable_timing=True)
