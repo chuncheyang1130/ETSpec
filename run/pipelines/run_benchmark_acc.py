@@ -84,7 +84,7 @@ BENCHMARK_EVALUATORS = {
 
 MATH_BENCHMARKS = ['gsm8k', 'aime', 'math-500']
 
-def main(builder, benchmarks=None, max_samples=None, query_version="general"):
+def main(builder, benchmarks=None, max_samples=None, query_version="llama"):
     torch.manual_seed(0)
     random.seed(0)
         
