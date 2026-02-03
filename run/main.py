@@ -6,6 +6,7 @@ import os
 import shutil
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, TYPE_CHECKING
+import torch
 
 if TYPE_CHECKING:
     from .core.configuration import AppConfig
@@ -47,9 +48,10 @@ def _maybe_patch_auto_gptq() -> None:
 
 
 def _configure_runtime_environment() -> None:
+    torch.set_float32_matmul_precision('high')
     # Reduce run-to-run drift from cuBLAS matmul reductions.
     # Important: set before the first CUDA context initialization.
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    # os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 
     # Keep allocator behavior stable by default (can be overridden via env).
     _configure_allocator_env(default="expandable_segments:True")
