@@ -38,7 +38,7 @@ class NaiveGeneratorBase(GeneratorBase):
 
         if model_kwargs.get("past_key_values") is not None:
             past_key_values = model_kwargs["past_key_values"]
-            max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
+            # max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
         else:
             raise ValueError("past_key_values should be provided")
 
