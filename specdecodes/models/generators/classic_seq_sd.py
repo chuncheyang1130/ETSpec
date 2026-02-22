@@ -123,7 +123,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
             while not finished:
                 with nvtx.annotate("speculate", color="cyan"):
                     input_ids = input_ids.clone(memory_format=torch.contiguous_format)
-                    draft_ids = self._speculate(input_ids)
+                    draft_ids = self._speculate(input_ids, logits_processor=logits_processor, do_sample=do_sample)
                     if self.cache_implementation == 'dynamic':
                         _, input_len = input_ids.shape
                         draft_past_key_values.crop(input_len)
