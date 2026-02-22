@@ -96,7 +96,7 @@ BENCHMARK_EVALUATORS = {
 # common: "mt-bench", "human-eval", "gsm8k", "alpaca", "cnn-dm"
 # reasoning: "aime", "gpqa", "math-500", "livecodebench"
 
-def main(builder, benchmarks=None, max_samples=None):
+def main(builder, benchmarks=None, max_samples=None, query_version="llama"):
     torch.manual_seed(0)
     random.seed(0)
         
@@ -137,7 +137,7 @@ def main(builder, benchmarks=None, max_samples=None):
         write_settings_yaml(log_dir, getattr(args, "settings_snapshot", None))
         
         # Load dataset
-        dataset = DATASET_LOADER[bench_name]()
+        dataset = DATASET_LOADER[bench_name](query_version=query_version)
         num_samples = min(len(dataset), max_samples) if max_samples is not None else len(dataset)
         print(f"Running benchmark: {bench_name}, samples: {num_samples}")
 

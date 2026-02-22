@@ -51,17 +51,17 @@ def run_app(builder):
         )
         
     @app.command()
-    def run_benchmark(benchmarks: str = None, max_samples: int = None):
+    def run_benchmark(benchmarks: str = None, max_samples: int = None, query_version: str = "llama"):
         """
         Example subcommand for benchmarking.
         Usage: 
             python custom.py run-benchmark --bench-name=mt-bench
         """
         from run.pipelines.run_benchmark import main as main_run_benchmark
-        main_run_benchmark(builder, benchmarks=benchmarks, max_samples=max_samples)
+        main_run_benchmark(builder, benchmarks=benchmarks, max_samples=max_samples, query_version=query_version)
         
     @app.command()
-    def run_benchmark_acc(benchmarks: str = None, max_samples: int = None, query_version: str = "general"):
+    def run_benchmark_acc(benchmarks: str = None, max_samples: int = None, query_version: str = "llama"):
         """
         Example subcommand for benchmarking.
         Usage: 
