@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from typing import Any, Optional, Tuple
-from .lossy_seq_verify import edit_distance_verify, fly_verify, fly_verify_sequence, custom_verify
+from .lossy_seq_verify import edit_tolerance_verify, fly_verify, fly_verify_sequence, custom_verify, edit_tolerance_verify_v2
 # from .fly_seq_verify import fly_verify, fly_verify_sequence
 
 import logging
@@ -51,15 +51,33 @@ def verify_seq(
     max_entropy = np.log(vocab_size)     # By math, when all token has equal prob -> 1 / |V|, entropy = -sigma{ 1/|V| * log(1/|V|) } = sigma{ 1/|V| * log|V| } = log|V|
     normalized_entropy = entropy / max_entropy  # normalized entropy -> [T], in range [0, 1]
 
-    if method == "edit_distance":
-        accept_len = edit_distance_verify(
+    if method == "edit":
+        max_edit = int(vk.get("max_edit", 2))
+        
+        # edit distance verification with max edit tolerance
+        accept_len = edit_tolerance_verify(
             draft_ids=draft_ids[1:],
             target_ids=target_ids[:-1],
             entropy=normalized_entropy[:-1],
             eos_token_id=eos_token_id,
             threshold=threshold,
-            window_size=window_size
+            window_size=window_size,
+            max_edit=max_edit,
         )
+        
+    elif method == "edit_v2":
+        max_edit = int(vk.get("max_edit", 2))
+        # a more relaxed edit distance verification that allows some tolerance even when the draft token is correct
+        accept_len = edit_tolerance_verify_v2(
+            draft_ids=draft_ids[1:],
+            target_ids=target_ids[:-1],
+            entropy=normalized_entropy[:-1],
+            eos_token_id=eos_token_id,
+            threshold=threshold,
+            window_size=window_size,
+            max_edit=max_edit,
+        )
+        
     elif method == "fly":
         # ---- FLy verifier (Training-Free Loosely Speculative Decoding) ----
         # Implements the exact FLy algorithm from the paper

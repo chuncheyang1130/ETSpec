@@ -3,102 +3,111 @@ import torch.nn as nn
 import torch
 import transformers
 
-NOP = 0
-INSERT = 1
-DELETE = 2
-SUBSTITUTE = 3
-KEEP = 4
-
-def edit_distance_verify(
+def edit_tolerance_verify(
     *,
     draft_ids: torch.Tensor,
     target_ids: torch.Tensor,
     entropy: torch.Tensor,
     eos_token_id: int,
     threshold: float = 0.9,
-    window_size: int = 6
+    window_size: int = 8,
+    max_edit: int = 2
+):
+    # check if draft_ids match target_ids
+    is_match = (draft_ids[:] == target_ids[:]) & (target_ids[:] != eos_token_id)
+    not_eos = draft_ids[:] != eos_token_id
+    max_length = int(torch.cumprod(not_eos.to(torch.int64), dim=0).sum().item()) 
+    
+    # use for dp on accumulative edit count 
+    mismatch_count = [0] * (max_length + 1)
+    for i in range(1, max_length+1):
+        if not is_match[i-1]:
+            if entropy[i-1] < threshold:
+                max_length = i-1    # strict reject from here -> set to end position
+                break
+            elif entropy[i-1] >= threshold:
+                mismatch_count[i] = mismatch_count[i-1] + 1
+        else:
+            mismatch_count[i] = mismatch_count[i-1]
+            
+    logging.debug(f"max_length: {max_length}, mismatch_count: {mismatch_count[max_length]}")
+        
+    # check mismatch token in window
+    window_begin, window_end = 0, window_size   # window_end is exclusive
+    accept_len = max_length
+    
+    while window_end <= max_length:
+        if mismatch_count[window_end] - mismatch_count[window_begin] > max_edit:
+            accept_len = window_begin
+            break
+        else:
+            window_begin += 1
+            window_end += 1
+
+    # accept match tokens after edit tolerance checkpoint
+    while accept_len < max_length and is_match[accept_len-1]:
+        accept_len += 1
+        
+    return accept_len
+
+def edit_tolerance_verify_v2(
+    *,
+    draft_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    entropy: torch.Tensor,
+    eos_token_id: int,
+    threshold: float = 0.9,
+    window_size: int = 8,
+    max_edit: int = 2,
+    verify_window_size: int = 3
 ):
     
-    # check if eos token is in target tokens
-    is_eos = (draft_ids[:] == eos_token_id)
-    if is_eos.any():
-        eos_index = is_eos.float().argmax()
-    else:
-        eos_index = len(draft_ids)
-        
-    M = min(len(draft_ids), eos_index)
-    N = M
-    # 
-    # N = len(target_ids[:-1])    # Note: last token is potential bonus token
-    INF = max(M, N) + 1
-
-    # edit distance verify
-    # dp: 2-D matrix to store edit counts
-    edit_count_matrix = torch.zeros((N+1, M+1), dtype=torch.float)
-    edit_count_matrix[:, 0] = torch.arange(N+1)
-    edit_count_matrix[0, :] = torch.arange(M+1)
+    # check if draft_ids match target_ids
+    is_match = (draft_ids[:] == target_ids[:]) & (target_ids[:] != eos_token_id)
+    not_eos = draft_ids[:] != eos_token_id
+    max_length = int(torch.cumprod(not_eos.to(torch.int64), dim=0).sum().item()) 
     
-    # calculate edit count
-    for i in range(1, N + 1):
-        for j in range(1, M + 1):
-            draft_token_id = draft_ids[i-1]
-            target_token_id = target_ids[i-1]
-            
-            # check matchness
-            if draft_token_id == target_token_id:
-                edit_count_matrix[i][j] = edit_count_matrix[i-1][j-1]
-            else:
-                edit_count_matrix[i][j] = 1 + min(edit_count_matrix[i, j-1], edit_count_matrix[i-1, j], edit_count_matrix[i-1, j-1])
-
-    # backtrace
-    path = []
-    
-    i, j = N, M
-    while i > 0 or j > 0:
-        current_val = edit_count_matrix[i][j]
-        
-        if i > 0 and j > 0:
-            cost = 0 if target_ids[i-1] == draft_ids[j-1] else 1
-            if edit_count_matrix[i-1][j-1] + cost == current_val:
-                op_type = "KEEP" if cost == 0 else "SUB"
-                
-                # record (operation, target_token_id, draft_token_id)
-                path.append((op_type, target_ids[i-1], draft_ids[j-1]))
-                
-                i -= 1
-                j -= 1
-
-                continue
-            
-        if i > 0 and edit_count_matrix[i-1][j] + 1 == current_val:
-            path.append(("DEL", target_ids[i-1], '-'))
-            i -= 1
-            continue
-        
-        if j > 0 and edit_count_matrix[i][j-1] + 1 == current_val:
-            path.append(("INS", '-', draft_ids[j-1]))
-            j -= 1
-            continue
-                
-    path.reverse()
-    
-    idx = 0
-    for op_type, target_token_id, draft_token_id in path:
-        if op_type == "KEEP":
-            idx += 1
-        elif op_type == "SUB":
-            if entropy[idx].item() > threshold:
-                idx += 1
-            else:
+    # use for dp on accumulative edit count 
+    mismatch_count = [0] * (max_length + 1)
+    for i in range(1, max_length+1):
+        if not is_match[i-1]:
+            logging.debug(f"mismatch at position {i-1}, entropy: {entropy[i-1].item():.4f}")
+            if entropy[i-1] < threshold:
+                max_length = i-1    # strict reject from here -> set to end position
                 break
-        elif op_type == "DEL":
-            idx += 1
-        elif op_type == "INS":
-            if entropy[idx].item() > threshold:
-                idx += 1
-            else:
+            elif entropy[i-1] >= threshold:
+                mismatch_count[i] = mismatch_count[i-1] + 1
+        else:
+            mismatch_count[i] = mismatch_count[i-1]
+            
+    logging.debug(f"max_length: {max_length}, mismatch_count: {mismatch_count[max_length]}")
+        
+    # check mismatch token in window
+    window_begin, window_end = 0, window_size   # window_end is exclusive
+    accept_len = max_length
+    
+    while window_end <= max_length:
+        if mismatch_count[window_end] - mismatch_count[window_begin] > max_edit:
+            accept_len = window_begin
+            break
+        else:
+            verify_window_begin, verify_window_end = window_end, window_end + verify_window_size
+            if verify_window_end > max_length:
+                accept_len = window_begin
                 break
-    return idx
+            else:
+                if not is_match[verify_window_begin: verify_window_end].all():
+                    accept_len = window_begin
+                    break
+                else:
+                    window_begin += 1
+                    window_end += 1
+
+    # accept match tokens after edit tolerance checkpoint
+    while accept_len < max_length and is_match[accept_len-1]:
+        accept_len += 1
+        
+    return accept_len    
 
 """
 FLy (Training-Free Loosely Speculative Decoding) verification implementation.
