@@ -9,6 +9,7 @@ This file is largely copied from: https://github.com/ZubinGou/math-evaluation-ha
 """
 import re
 import regex
+import multiprocessing
 from math import isclose
 from typing import Union
 
