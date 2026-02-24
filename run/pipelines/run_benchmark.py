@@ -40,11 +40,11 @@ BENCHMARK_EVALUATORS = {
 }
 
 
-def main(builder, benchmarks=None, max_samples=None):
-    """Run throughput benchmarks on specified datasets."""
-    reset_seeds(0)
-    logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO").upper())
-    
+def main(builder, benchmarks=None, max_samples=None, query_version="llama"):
+    torch.manual_seed(0)
+    random.seed(0)
+        
+    # Enable profiling, disable logging profiling results
     builder.generator_profiling = True
     builder.profiling_verbose = False
     generator, tokenizer, past_kv, draft_past_kv = builder.build()
@@ -68,7 +68,7 @@ def main(builder, benchmarks=None, max_samples=None):
         log_dir = setup_benchmark_dir(log_dir_base, bench_name, getattr(args, "settings_snapshot", None))
         print(f"Log directory: {log_dir}")
         
-        dataset = load_dataset(bench_name, max_samples=max_samples, seed=0, shuffle=True)
+        dataset = load_dataset(bench_name, max_samples=max_samples, seed=0, shuffle=True, query_version="llama")
         print(f"Running benchmark: {bench_name}, samples: {len(dataset)}")
         
         cleanup_gpu()

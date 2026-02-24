@@ -1,33 +1,43 @@
 # Prompt template adapted from https://github.com/openai/simple-evals/tree/main
 from datasets import load_dataset
 
-REASONING_QUERY_TEMPLATE= """
-Solve this math problem. Give the reasoning steps before giving the final answer on the last line by itself in the format of "Answer:". Do not add anything other than the integer answer after "Answer:".
-
-{Question}
+QWEN_QUERY_TEMPLATE = r"""
+Question: {Question}
+Please reason step by step, and put your final answer within \boxed{{}}.
 """.strip()
 
-GENERAL_QUERY_TEMPLATE = """
-Given the following problem, reason and give a final answer to the problem.\nProblem: {Question}\nYour response should end with \"The final answer is [answer]\" where [answer] is the response to the problem.\n
+LLAMA_QUERY_TEMPLATE = r"""
+Given the following problem, reason and give a final answer to the problem.
+Problem: {Question}
+Your response should end with \"The final answer is [answer]\" where [answer] is the response to the problem.
 """.strip()
 
 # GSM8K
-def load_gsm8k_dataset(query_version: str = "reasoning"):
-    dataset = load_dataset("openai/gsm8k", "main")
-    if query_version == "reasoning":
-        formatted_dataset = [REASONING_QUERY_TEMPLATE.format(Question=entry['question']) for entry in dataset['test']]
+def load_gsm8k_dataset(query_version: str = "llama"):
+    if query_version == "qwen":
+        QUERY_TEMPLATE = QWEN_QUERY_TEMPLATE
+    elif query_version == "llama":
+        QUERY_TEMPLATE = LLAMA_QUERY_TEMPLATE
     else:
-        formatted_dataset = [GENERAL_QUERY_TEMPLATE.format(Question=entry['question']) for entry in dataset['test']]
+        raise ValueError(f"Unknown query_version: {query_version}")
+    
+    dataset = load_dataset("openai/gsm8k", "main")
+    formatted_dataset = [QUERY_TEMPLATE.format(Question=entry['question']) for entry in dataset['test']]
+    
     return formatted_dataset
 
-def load_gsm8k_dataset_answer(query_version: str = "reasoning"):
-    raw = load_dataset("openai/gsm8k", "main")['test']
+def load_gsm8k_dataset_answer(query_version: str = "llama"):
+    if query_version == "qwen":
+        QUERY_TEMPLATE = QWEN_QUERY_TEMPLATE
+    elif query_version == "llama":
+        QUERY_TEMPLATE = LLAMA_QUERY_TEMPLATE
+    else:
+        raise ValueError(f"Unknown query_version: {query_version}")
+    
     examples = []
-    for entry in raw:
-        if query_version == "reasoning":
-            q_str = REASONING_QUERY_TEMPLATE.format(Question=entry['question'])
-        else:
-            q_str = GENERAL_QUERY_TEMPLATE.format(Question=entry['question'])
+    dataset = load_dataset("openai/gsm8k", "main")
+    for entry in dataset['test']:
+        q_str = QUERY_TEMPLATE.format(Question=entry['question'])
         a_str = entry['answer']
         examples.append({
             "question": q_str,

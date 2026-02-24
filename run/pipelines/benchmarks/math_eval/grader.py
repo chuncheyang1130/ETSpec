@@ -56,7 +56,6 @@ def math_equal(prediction: Union[bool, float, str],
                 reference: Union[float, str],
                 include_percentage: bool = True,
                 is_close: bool = True,
-                timeout: bool = False,
                 ) -> bool:
     """
     Exact match of math if and only if:
@@ -159,18 +158,10 @@ def math_equal(prediction: Union[bool, float, str],
 
     # print("try final")
     # symbolic equal with sympy
-    if timeout:
-        if call_with_timeout(symbolic_equal_process, prediction, reference):
-            return True
-    else:
-        if symbolic_equal(prediction, reference):
+    if symbolic_equal(prediction, reference):
             return True
 
     return False
-
-
-def math_equal_process(param):
-    return math_equal(param[-2], param[-1])
 
 
 def numeric_equal(prediction: float, reference: float):
@@ -238,27 +229,6 @@ def symbolic_equal(a, b):
         pass
 
     return False
-
-
-def symbolic_equal_process(a, b, output_queue):
-    result = symbolic_equal(a, b)
-    output_queue.put(result)
-
-
-def call_with_timeout(func, *args, timeout=1, **kwargs):
-    output_queue = multiprocessing.Queue()
-    process_args = args + (output_queue,)
-    process = multiprocessing.Process(target=func, args=process_args, kwargs=kwargs)
-    process.start()
-    process.join(timeout)
-
-    if process.is_alive():
-        process.terminate()
-        process.join()
-        return False
-
-    return output_queue.get()
-
 
 def _test_math_equal():
     # print(math_equal("0.0833333333333333", "\\frac{1}{12}"))

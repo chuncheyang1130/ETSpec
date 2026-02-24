@@ -6,6 +6,7 @@ import os
 import shutil
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, TYPE_CHECKING
+import torch
 
 if TYPE_CHECKING:
     from .core.configuration import AppConfig
@@ -47,9 +48,10 @@ def _maybe_patch_auto_gptq() -> None:
 
 
 def _configure_runtime_environment() -> None:
+    torch.set_float32_matmul_precision('high')
     # Reduce run-to-run drift from cuBLAS matmul reductions.
     # Important: set before the first CUDA context initialization.
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    # os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 
     # Keep allocator behavior stable by default (can be overridden via env).
     _configure_allocator_env(default="expandable_segments:True")
@@ -179,11 +181,69 @@ def _resolve_existing_path(path: str) -> str:
 
 
 def _normalize_compile_mode(value):
+    """
+    Normalize compile_mode to support both string and dict formats.
+    Returns dict with 'target' and 'draft' keys, or None.
+    """
     if value is None:
         return None
-    if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
-        return None
+    
+    # String format: normalize to dict
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"none", "null"}:
+            return None
+        return {"target": value, "draft": value}
+    
+    # Dict format: normalize each value
+    if isinstance(value, dict):
+        result = {}
+        for key in ["target", "draft"]:
+            v = value.get(key)
+            if v is None:
+                result[key] = None
+            elif isinstance(v, str):
+                normalized = v.strip().lower()
+                result[key] = None if normalized in {"none", "null"} else v
+            else:
+                result[key] = v
+        return result
+    
     return value
+
+
+def _normalize_cache_implementation(value):
+    """
+    Normalize cache_implementation to support both string and dict formats.
+    Returns dict with 'target' and 'draft' keys, or a string.
+    """
+    if value is None:
+        return "dynamic"
+    
+    # String format: normalize to dict
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"none", "null"}:
+            return "dynamic"
+        # Return as dict with same value for both target and draft
+        return {"target": value, "draft": value}
+    
+    # Dict format: normalize each value
+    if isinstance(value, dict):
+        result = {}
+        for key in ["target", "draft"]:
+            v = value.get(key)
+            if v is None:
+                result[key] = "dynamic"
+            elif isinstance(v, str):
+                normalized = v.strip().lower()
+                result[key] = "dynamic" if normalized in {"none", "null"} else v
+            else:
+                result[key] = v
+        return result
+    
+    return value
+
 
 
 def _apply_yaml_overrides(default_config: Dict[str, Any], yaml_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -195,6 +255,9 @@ def _apply_yaml_overrides(default_config: Dict[str, Any], yaml_config: Dict[str,
 
     if "compile_mode" in cfg:
         cfg["compile_mode"] = _normalize_compile_mode(cfg.get("compile_mode"))
+
+    if "cache_implementation" in cfg:
+        cfg["cache_implementation"] = _normalize_cache_implementation(cfg.get("cache_implementation"))
 
     # DraftParams can be specified as a dict in YAML.
     if isinstance(cfg.get("draft_params"), dict):
@@ -283,7 +346,6 @@ def _maybe_reexec_with_nsys(enabled: bool, output: str) -> None:
         "--python-sampling=true",
         "--cuda-memory-usage=true",
         "--gpuctxsw=true",
-        "--python-backtrace",
         "-x",
         "true",
         "-o",
@@ -307,9 +369,11 @@ def _build_full_parser(base_parser: argparse.ArgumentParser, default_config: Dic
     full_parser.add_argument("--draft-model-path", type=str, default=default_config.get("draft_model_path", None))
     full_parser.add_argument("--max-length", type=int, default=default_config.get("max_length", 2048))
     full_parser.add_argument("--seed", type=int, default=default_config.get("seed", 0))
-    full_parser.add_argument("--device", type=str, default="cuda:0")
+    full_parser.add_argument("--device", type=str, default=default_config.get("device", "cuda:0"))
     full_parser.add_argument("--compile-mode", type=str, default=default_config.get("compile_mode", None))
     full_parser.add_argument("--temperature", type=float, default=default_config.get("temperature", 0.0))
+    full_parser.add_argument("--top-k", type=int, default=default_config.get("top_k", None))
+    full_parser.add_argument("--top-p", type=float, default=default_config.get("top_p", None))
     full_parser.add_argument("--do-sample", action="store_true", default=default_config.get("do_sample", False))
     full_parser.add_argument("--warmup-iter", type=int, default=default_config.get("warmup_iter", 0))
 
@@ -417,9 +481,11 @@ def _apply_cli_overrides(config: AppConfig, config_args: argparse.Namespace) -> 
     config.device = config_args.device
     config.compile_mode = _normalize_compile_mode(config_args.compile_mode)
     config.temperature = float(config_args.temperature)
+    config.top_k = config_args.top_k
+    config.top_p = config_args.top_p
     config.do_sample = bool(config_args.do_sample)
     config.warmup_iter = int(config_args.warmup_iter)
-    config.cache_implementation = config_args.cache_implementation
+    config.cache_implementation = _normalize_cache_implementation(config_args.cache_implementation)
     config.generator_profiling = bool(config_args.generator_profiling)
 
     # Optional research toggles: only override when explicitly provided.

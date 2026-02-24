@@ -2,7 +2,7 @@ import logging
 import torch
 import torch.nn as nn
 from typing import Any
-from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper, LogitNormalization
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper, MinPLogitsWarper, RepetitionPenaltyLogitsProcessor, LogitNormalization
 from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList, MaxLengthCriteria, MaxTimeCriteria, EosTokenCriteria, StopStringCriteria
 from specdecodes.models.utils.cache_utils import TreeDynamicCache, TreeStaticCache
 
@@ -22,7 +22,15 @@ class GeneratorBase(nn.Module):
         else:
             self.draft_model = None
 
-        self.cache_implementation = cache_implementation
+        # Handle cache_implementation as either string or dict
+        if isinstance(cache_implementation, dict):
+            self.target_cache_implementation = cache_implementation.get("target", "dynamic")
+            self.draft_cache_implementation = cache_implementation.get("draft", "dynamic")
+            self.cache_implementation = cache_implementation.get("target", "dynamic")  # For backward compatibility
+        else:
+            self.target_cache_implementation = cache_implementation
+            self.draft_cache_implementation = cache_implementation
+            self.cache_implementation = cache_implementation
         
         # Set prefill function same as forward so torch.compile() forward will not execute on prefill phase)
         self.target_model.prefill_forward = self.target_model.forward
@@ -44,6 +52,7 @@ class GeneratorBase(nn.Module):
         temperature: float = 1.0,
         top_k: int = None,
         top_p: float = None,
+        min_p: float = None,
     ):
         """
         Simplified HuggingFace's `LogitsProcessorList` for multinomial sampling.
@@ -60,6 +69,8 @@ class GeneratorBase(nn.Module):
             warpers.append(TopKLogitsWarper(top_k=top_k))
         if top_p is not None and top_p < 1.0:
             warpers.append(TopPLogitsWarper(top_p=top_p))
+        if min_p is not None and min_p > 0.0:
+            warpers.append(MinPLogitsWarper(min_p=min_p))
         
         return warpers
     
@@ -159,6 +170,7 @@ class GeneratorBase(nn.Module):
         temperature=None,
         top_p=None,
         top_k=None,
+        min_p=None,
         max_new_tokens=None,
         max_length=None,
         do_sample=True,
@@ -181,6 +193,7 @@ class GeneratorBase(nn.Module):
                 temperature=temperature, 
                 top_p=top_p, 
                 top_k=top_k,
+                min_p=min_p,
             ) if do_sample else None
         )
         

@@ -306,6 +306,8 @@ def parse_ground_truth(example: Dict[str, Any], data_name):
         gt_cot, gt_ans = example['answer'].split("####")
     elif data_name == "gsm_hard":
         gt_cot, gt_ans = example['code'], example['target']
+    elif data_name == "math-500":
+        gt_cot, gt_ans = example['solution'], example['answer']
     elif data_name == "svamp":
         gt_cot, gt_ans = example['Equation'], example['Answer']
     elif data_name == "asdiv":

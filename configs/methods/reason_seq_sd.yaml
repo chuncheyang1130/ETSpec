@@ -1,0 +1,32 @@
+# Classic seq-SD with exact verification
+method: classic_seq_sd
+
+llm_path: Qwen/Qwen3-8B
+draft_model_path: Qwen/Qwen3-1.7B
+
+recipe: null
+
+max_length: 16384
+cache_implementation: static
+warmup_iter: 1
+compile_mode: max-autotune
+
+# Target sampling settings (defaults)
+do_sample: false
+temperature: 0.6
+top_k: 20
+top_p: 0.95
+min_p: 0.0
+
+generator_profiling: true
+
+generator_kwargs:
+  enable_thinking: true
+  prefill_chunk_size: 256
+  verify_method: exact
+  verify_kwargs: {}
+
+draft_params:
+  temperature: 1.0
+  max_depth: 16
+  topk_len: 1

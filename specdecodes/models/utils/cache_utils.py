@@ -114,8 +114,8 @@ class TreeDynamicCache(DynamicCache):
         # self.value_cache: List[torch.Tensor] = []
         
         for i in range(len(self.layers)):
-            self.keys = torch.tensor([], dtype=self.layers[i].dtype, device=self.layers[i].device)
-            self.values = torch.tensor([], dtype=self.layers[i].dtype, device=self.layers[i].device)
+            self.layers[i].keys = torch.tensor([], dtype=self.layers[i].dtype, device=self.layers[i].device)
+            self.layers[i].values = torch.tensor([], dtype=self.layers[i].dtype, device=self.layers[i].device)
 
 
 class TreeStaticCache(StaticCache):

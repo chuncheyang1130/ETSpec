@@ -10,6 +10,7 @@ class DraftParams:
     temperature: float = 1
     max_depth: int = 6
     topk_len: int = 10
+    do_sample: bool = False
     max_verify_tokens: int = None
     
     def __post_init__(self):
