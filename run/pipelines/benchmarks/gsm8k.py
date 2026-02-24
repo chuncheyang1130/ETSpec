@@ -14,25 +14,30 @@ Your response should end with \"The final answer is [answer]\" where [answer] is
 
 # GSM8K
 def load_gsm8k_dataset(query_version: str = "llama"):
-    dataset = load_dataset("openai/gsm8k", "main")
     if query_version == "qwen":
-        formatted_dataset = [QWEN_QUERY_TEMPLATE.format(Question=entry['question']) for entry in dataset['test']]
+        QUERY_TEMPLATE = QWEN_QUERY_TEMPLATE
     elif query_version == "llama":
-        formatted_dataset = [LLAMA_QUERY_TEMPLATE.format(Question=entry['question']) for entry in dataset['test']]
+        QUERY_TEMPLATE = LLAMA_QUERY_TEMPLATE
     else:
-        raise ValueError(f"Unknown query_version: {query_version}") 
+        raise ValueError(f"Unknown query_version: {query_version}")
+    
+    dataset = load_dataset("openai/gsm8k", "main")
+    formatted_dataset = [QUERY_TEMPLATE.format(Question=entry['question']) for entry in dataset['test']]
+    
     return formatted_dataset
 
 def load_gsm8k_dataset_answer(query_version: str = "llama"):
-    raw = load_dataset("openai/gsm8k", "main")['test']
+    if query_version == "qwen":
+        QUERY_TEMPLATE = QWEN_QUERY_TEMPLATE
+    elif query_version == "llama":
+        QUERY_TEMPLATE = LLAMA_QUERY_TEMPLATE
+    else:
+        raise ValueError(f"Unknown query_version: {query_version}")
+    
     examples = []
-    for entry in raw:
-        if query_version == "qwen":
-            q_str = QWEN_QUERY_TEMPLATE.format(Question=entry['question'])
-        elif query_version == "llama":
-            q_str = LLAMA_QUERY_TEMPLATE.format(Question=entry['question'])
-        else:
-            raise ValueError(f"Unknown query_version: {query_version}")
+    dataset = load_dataset("openai/gsm8k", "main")
+    for entry in dataset['test']:
+        q_str = QUERY_TEMPLATE.format(Question=entry['question'])
         a_str = entry['answer']
         examples.append({
             "question": q_str,
