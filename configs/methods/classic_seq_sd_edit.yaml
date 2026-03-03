@@ -17,6 +17,24 @@ compile_mode:
   draft: max-autotune
 
 # Target sampling settings (defaults)
+# Suggested setting
+# 1. Llama Model
+#    - do_sample: true / false
+#    - temperature: 0.6 / null
+#    - top_p: 0.9 / null
+# 2. Qwen3 Model with enable_thinking=true
+#    - do_sample: true
+#    - temperature: 0.6
+#    - top_p: 0.95
+#    - top_k: 20
+#    - min_p: 0.0
+# 3. Qwen3 Model with enable_thinking=false
+#    - do_sample: true
+#    - temperature: 0.7
+#    - top_p: 0.8
+#    - top_k: 20
+#    - min_p: 0.0
+
 do_sample: false
 # temperature: 0.6
 # top_k: 20
