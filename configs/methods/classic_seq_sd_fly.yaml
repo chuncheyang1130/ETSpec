@@ -2,24 +2,30 @@
 # Implements the exact FLy algorithm from the paper
 method: classic_seq_sd
 
-llm_path: meta-llama/Llama-3.1-8B-Instruct
-draft_model_path: meta-llama/Llama-3.2-1B-Instruct
+llm_path: meta-llama/Llama-3.1-70B-Instruct
+draft_model_path: meta-llama/Llama-3.1-8B-Instruct
 
 recipe: null
+device: auto
 
-max_length: 4096
-cache_implementation: static
+max_length: 2048
+cache_implementation:
+  target: dynamic
+  draft: static
 warmup_iter: 1
-compile_mode: max-autotune
+compile_mode: 
+  target: null
+  draft: max-autotune
 
 # Target sampling settings (defaults)
 do_sample: false
-temperature: 0
+# temperature: 0.6
+# top_p: 0.9
 
 generator_profiling: true
 
 generator_kwargs:
-  prefill_chunk_size: 4096
+  prefill_chunk_size: 2048
   verify_method: fly
   verify_kwargs:
     # FLy algorithm parameters (from paper Table 4)
