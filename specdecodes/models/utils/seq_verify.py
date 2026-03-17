@@ -3,6 +3,7 @@ import numpy as np
 from typing import Any, Optional, Tuple
 from .lossy_seq_verify import edit_tolerance_verify, fly_verify, fly_verify_sequence, custom_verify, edit_tolerance_verify_v2
 # from .fly_seq_verify import fly_verify, fly_verify_sequence
+from specdecodes.models.utils.utils import get_normalized_entropy
 
 import logging
 
@@ -27,6 +28,9 @@ def verify_seq(
     target_ids = sample_token_fn(logits, logits_processor, do_sample, return_probs=False)[0]  # [T]
     draft_ids = draft_ids[root_ind:root_ind + target_ids.size(0)] # [T]
     
+    if len(target_ids) == 1:
+        return target_ids.unsqueeze(0), None, (1, 0)
+    
     if method == "exact":
         # ---- Exact verifier (existing behavior) ----
         valid = (draft_ids[1:] == target_ids[:-1]) & (target_ids[:-1] != eos_token_id)
@@ -42,14 +46,7 @@ def verify_seq(
     threshold = float(vk.get("threshold", 0.9))
     window_size = int(vk.get("window_size", 6))
     
-    # calculate entropy for each position to see whether target is confident on the prediction
-    vocab_size = logits.size(-1)
-    probs = torch.softmax(logits, dim=-1)   # p -> [1, T]
-    log_probs = torch.log_softmax(logits, dim=-1)   # log(p) -> [1, T]
-    entropy = -(probs * log_probs).sum(dim=-1).squeeze(0)   # entropy -> [T]
-
-    max_entropy = np.log(vocab_size)     # By math, when all token has equal prob -> 1 / |V|, entropy = -sigma{ 1/|V| * log(1/|V|) } = sigma{ 1/|V| * log|V| } = log|V|
-    normalized_entropy = entropy / max_entropy  # normalized entropy -> [T], in range [0, 1]
+    normalized_entropy = get_normalized_entropy(logits)  # [T]
 
     if method == "edit":
         max_edit = int(vk.get("max_edit", 2))
