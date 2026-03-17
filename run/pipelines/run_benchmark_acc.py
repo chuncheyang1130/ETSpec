@@ -15,6 +15,7 @@ BENCHMARK_EVALUATORS = {
     "gsm8k": run_math_eval,
     "aime": run_math_eval,
     "human-eval": run_code_eval,
+    "mbpp": run_code_eval,
     "livecodebench": run_livecodebench_eval,
     "mmlu_pro": run_mmlu_pro_eval,
     "narrativeqa": run_longbench_eval,
@@ -70,10 +71,7 @@ def main(builder, benchmarks=None, max_samples=None, query_version="llama"):
     
         # Evaluate
         eval_start = time.perf_counter()
-        if BENCHMARK_EVALUATORS[bench_name] == run_longbench_eval or BENCHMARK_EVALUATORS[bench_name] == run_math_eval or run_code_eval:
-            metrics_json = BENCHMARK_EVALUATORS[bench_name](generator, tokenizer, past_kv, draft_past_kv, args, dataset, log_dir, bench_name)
-        else:
-            metrics_json = BENCHMARK_EVALUATORS[bench_name](generator, tokenizer, past_kv, draft_past_kv, args, dataset, log_dir)
+        metrics_json = BENCHMARK_EVALUATORS[bench_name](generator, tokenizer, past_kv, draft_past_kv, args, dataset, log_dir, bench_name)
         eval_time_s = time.perf_counter() - eval_start
         
         cleanup_gpu()

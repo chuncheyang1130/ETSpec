@@ -27,6 +27,8 @@ def build_test_code(code_str: str, testcase_str: str, entry_point: str = None, b
     test_code = ""
     if bench_name == "human-eval":
         test_code = f"{code_str}\n\n{testcase_str}\ncheck({entry_point})"
+    elif bench_name == "mbpp":
+        test_code = f"{code_str}\n\n{testcase_str}"
     else:
         raise NotImplementedError(f"Test code generation not implemented for benchmark: {bench_name}")
     

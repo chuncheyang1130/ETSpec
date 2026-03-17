@@ -8,16 +8,17 @@ from typing import Callable, List, Optional, Any
 import random
 
 
-AVAILABLE_BENCHMARKS = [
-    "mt-bench",
-    "human-eval",
+AVAILABLE_BENCHMARKS = [    
+    # math
     "gsm8k",
-    "alpaca",
-    "cnn-dm",
     "aime",
-    "gpqa",
     "math-500",
-    "livecodebench",
+    
+    # code
+    "human-eval",
+    "mbpp",
+    
+    # longbench
     "hotpotqa",
     "narrativeqa",
     "qasper",
@@ -34,18 +35,33 @@ AVAILABLE_BENCHMARKS = [
     "passage_retrieval_en",
     "lcc",
     "repobench_p",
+    
+    # others
+    "mt-bench",
+    "alpaca",
+    "cnn-dm",
+    "gpqa",
+    "livecodebench",
 ]
 
 _LOADER_CONFIG = {
+    # TBD
     "mt-bench":             (".mtbench", "load_mtbench_dataset"),
-    "human-eval":           (".humaneval", "load_humaneval_dataset"),
-    "gsm8k":                (".gsm8k", "load_gsm8k_dataset"),
     "alpaca":               (".alpaca", "load_alpaca_dataset"),
     "cnn-dm":               (".cnndm", "load_cnndm_dataset"),
-    "aime":                 (".aime", "load_aime_dataset"),
     "gpqa":                 (".gpqa", "load_gpqa_dataset"),
-    "math-500":             (".math500", "load_math500_dataset"),
     "livecodebench":        (".livecodebench", "load_livecodebench_dataset"),
+    
+    # math
+    "gsm8k":                (".gsm8k", "load_gsm8k_dataset"),
+    "aime":                 (".aime", "load_aime_dataset"),
+    "math-500":             (".math500", "load_math500_dataset"),
+    
+    # code
+    "human-eval":           (".humaneval", "load_humaneval_dataset"),
+    "mbpp":                 (".mbpp", "load_mbpp_dataset"),
+    
+    # longbench
     "hotpotqa":             (".hotpotqa", "load_hotpotqa_dataset"),
     "narrativeqa":          (".narrativeqa", "load_narrativeqa_dataset"),
     "qasper":               (".qasper", "load_qasper_dataset"),

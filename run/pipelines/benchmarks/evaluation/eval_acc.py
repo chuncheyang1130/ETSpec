@@ -346,7 +346,8 @@ def run_code_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
     correct_q = 0
     
     for idx, sample in tqdm(enumerate(dataset), total=len(dataset), desc=f"Evaluating {bench_name}"):
-        query, testcase_str, entry_point = sample["query"], sample["testcase"], sample["entry_point"]
+        query, testcase_str = sample["query"], sample["testcase"]
+        entry_point = sample.get("entry_point", None)
 
         # 2.1 Generate model output IDs (same as original)
         tokenizer.use_default_system_prompt = True
@@ -383,7 +384,7 @@ def run_code_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
         record.update({
             "query": query,
             "response": output_str,
-            "testcase": testcase_str,
+            # "testcase": testcase_str,
             "status": status,
             "peak_memory": torch.cuda.max_memory_reserved(generator.device) / (1024 ** 3)
         })
