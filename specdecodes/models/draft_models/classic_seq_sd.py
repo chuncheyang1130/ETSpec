@@ -4,6 +4,7 @@ import nvtx
 import logging
 
 from specdecodes.models.utils.wandb_logger import wandb_logger
+from specdecodes.models.utils.utils import get_normalized_entropy
 
 from .base import DraftModelBase
 
@@ -26,6 +27,7 @@ class ClassicSDDraftModel(DraftModelBase):
         
         do_sample = kwargs.get("do_sample", False)
         logits_processor = kwargs.get("logits_processor", None)
+        is_lossy = kwargs.get("is_lossy", False)
         
         # 2) Initialize kv_len & cache_position
         with nvtx.annotate("kv_init"):
@@ -47,7 +49,11 @@ class ClassicSDDraftModel(DraftModelBase):
             self.past_key_values.seq_len = input_len
             
         with nvtx.annotate("draft_sample", color="green"):
-            sampled_probs = torch.softmax(logits / self.draft_params.temperature, dim=-1)
+            if not is_lossy:
+                sampled_probs = torch.softmax(logits / self.draft_params.temperature, dim=-1)
+            else:
+                sampled_probs = self._sample_probs(logits=logits, logits_warper=logits_processor, do_sample=do_sample)
+            
             if not do_sample:
                 sampled_token = torch.argmax(sampled_probs[:, -1:], dim=-1)
             else:
@@ -57,12 +63,19 @@ class ClassicSDDraftModel(DraftModelBase):
         # 4) Initialize sequential draft state (token buffer + cache position).
         self.token_ids = []
         self.token_ids.append(input_ids[:, -1:])
+        
+        # Draft Model is confident enough
+        if get_normalized_entropy(logits) >= self.draft_params.draft_threshold:
+            return torch.cat(self.token_ids, dim=-1)
+        
         self.token_ids.append(sampled_token)
         self.cache_position = torch.arange(kv_len, kv_len+self.draft_params.topk_len, dtype=torch.long, device=device)
         
         # 5) Main loop
         for depth_i in range(self.draft_params.max_depth-1):
-            self.speculate_once(do_sample=do_sample, logits_processor=logits_processor)
+            is_valid = self.speculate_once(do_sample=do_sample, logits_processor=logits_processor, is_lossy=is_lossy)
+            if not is_valid:
+                break
         
         return torch.cat(self.token_ids, dim=-1)
     
@@ -76,6 +89,7 @@ class ClassicSDDraftModel(DraftModelBase):
         # this setting is mainly for llm  from same family (e.g. Qwen3 Family)
         do_sample = kwargs.get("do_sample", False)
         logits_processor = kwargs.get("logits_processor", None)
+        is_lossy = kwargs.get("is_lossy", False)
 
         with nvtx.annotate("draft_forward", color="red"):
             logits = self(
@@ -85,12 +99,21 @@ class ClassicSDDraftModel(DraftModelBase):
                 cache_position=cache_position,
                 past_key_values=self.past_key_values.cache,
             )
+            
+            if is_lossy and get_normalized_entropy(logits) >= self.draft_params.draft_threshold:
+                return False
+            
         with nvtx.annotate("draft_sample", color="green"):
-            sampled_probs = self._sample_probs(logits, logits_processor, do_sample)                
+            if not is_lossy:
+                sampled_probs = torch.softmax(logits / self.draft_params.temperature, dim=-1)
+            else:
+                sampled_probs = self._sample_probs(logits=logits, logits_warper=logits_processor, do_sample=do_sample)
+                
             if not do_sample:
                 sampled_token = torch.argmax(sampled_probs[:, -1, :], dim=-1, keepdim=True)
             else:
                 sampled_token = torch.multinomial(sampled_probs[:, -1, :], num_samples=1)
+                
             token_ids.append(sampled_token)
             
         if wandb_logger.get_flag("detailed_analysis", False):
@@ -99,3 +122,5 @@ class ClassicSDDraftModel(DraftModelBase):
         # Update internal state
         self.token_ids = token_ids
         self.cache_position += 1
+        
+        return True
