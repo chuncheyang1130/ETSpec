@@ -289,7 +289,7 @@ def run_math_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
         torch.cuda.empty_cache()
 
     # 3. Aggregate overall metrics
-    answer_accuracy = correct_q / total_q if total_q > 0 else 0
+    answer_accuracy = correct_q * 100 / total_q if total_q > 0 else 0
     perf_stats = _finalize_perf(perf, generator)
     _print_summary(bench_name, perf_stats, accuracy=answer_accuracy, correct_q=correct_q, total_q=total_q)
 
@@ -406,7 +406,7 @@ def run_code_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
         torch.cuda.empty_cache()
 
     # 3. Aggregate overall metrics
-    answer_accuracy = correct_q / total_q if total_q > 0 else 0
+    answer_accuracy = correct_q * 100 / total_q if total_q > 0 else 0
     perf_stats = _finalize_perf(perf, generator)
     _print_summary(bench_name, perf_stats, accuracy=answer_accuracy, correct_q=correct_q, total_q=total_q)
 
