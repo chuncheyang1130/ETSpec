@@ -41,24 +41,30 @@ def edit_tolerance_verify(
     
     while window_end <= max_length:
         if mismatch_count[window_end] - mismatch_count[window_begin] > max_edit or mismatch_count[window_end] >= 3:     # TODO: add a maximum edit count stopper check
-            accept_len = window_begin
+            if window_begin == 0:
+                accept_len = min_accept_len
+            else:
+                accept_len = window_end - 1
             break
         else:
             window_begin += 1
             window_end += 1
-            
-    accept_len = max(accept_len, min_accept_len)
+    
+    # if accept_len == 0:        
+    #     accept_len = max(accept_len, min_accept_len)
+    # else:
+    #     accept_len = window_end - 1
 
     # accept match tokens after edit tolerance checkpoint
     # while accept_len < max_length and is_match[accept_len]:
     #     accept_len += 1
         
     # fallback check
-    # while accept_len > 0:
-    #     if not is_match[accept_len-1]:
-    #         accept_len -= 1
-    #     else:
-    #         break
+    while accept_len > 0:
+        if not is_match[accept_len-1]:
+            accept_len -= 1
+        else:
+            break
         
     # logging.info(f"max-length: {max_length} \t/ mismatch-count: {mismatch_count[max_length]} \t/ exact-match: {exact_match}\t/ accept-length: {accept_len} \t/ mismatch status: {''.join(mismatch_status)}")
     return accept_len
@@ -72,13 +78,15 @@ def edit_tolerance_verify_v2(
     threshold: float = 0.9,
     window_size: int = 8,
     max_edit: int = 2,
-    verify_window_size: int = 3
+    min_interval: int = 3
 ):
     
     # check if draft_ids match target_ids
     is_match = (draft_ids[:] == target_ids[:]) & (target_ids[:] != eos_token_id)
     not_eos = draft_ids[:] != eos_token_id
     max_length = int(torch.cumprod(not_eos.to(torch.int64), dim=0).sum().item()) 
+    min_accept_len = int(torch.cumprod(is_match.to(torch.int64), dim=0).sum().item())
+    # exact_match = int(torch.cumprod(is_match.to(torch.int64), dim=0).sum().item())
     
     # use for dp on accumulative edit count 
     mismatch_count = [0] * (max_length + 1)
@@ -91,33 +99,54 @@ def edit_tolerance_verify_v2(
                 mismatch_count[i] = mismatch_count[i-1] + 1
         else:
             mismatch_count[i] = mismatch_count[i-1]
+            
+    # logging.debug(f"max_length: {max_length}, mismatch_count: {mismatch_count[max_length]}")
+    # mismatch_status = ["X" if mismatch_count[i] > mismatch_count[i-1] else "O" for i in range(1, max_length+1)]
         
     # check mismatch token in window
     window_begin, window_end = 0, window_size   # window_end is exclusive
     accept_len = max_length
     
     while window_end <= max_length:
-        if mismatch_count[window_end] - mismatch_count[window_begin] > max_edit:
-            accept_len = window_begin
+        if mismatch_count[window_end] - mismatch_count[window_begin] > max_edit or mismatch_count[window_end] >= 3:     # TODO: add a maximum edit count stopper check
+            if window_begin != 0:
+                accept_len = window_end - 1
+                # fallback check
+                while accept_len > 0:
+                    if not is_match[accept_len-1]:
+                        accept_len -= 1
+                    else:
+                        break
+            else:
+                accept_len = 0
             break
         else:
-            verify_window_begin, verify_window_end = window_end, window_end + verify_window_size
-            if verify_window_end > max_length:
-                accept_len = window_begin
+            window_begin += 1
+            window_end += 1
+            
+    if accept_len == 0:
+        window_begin, window_end = 0, window_size // 2
+        while window_end <= max_length:
+            if mismatch_count[window_end] - mismatch_count[window_begin] > 1 or mismatch_count[window_end] >= 3:
+                if window_begin != 0:
+                    accept_len = window_end - 1
+                    # fallback check
+                    while accept_len > 0:
+                        if not is_match[accept_len-1]:
+                            accept_len -= 1
+                        else:
+                            break
+                else:
+                    accept_len = 0
                 break
             else:
-                if not is_match[verify_window_begin: verify_window_end].all():
-                    accept_len = window_begin
-                    break
-                else:
-                    window_begin += 1
-                    window_end += 1
+                window_begin += 1
+                window_end += 1
+                
+    accept_len = max(accept_len, min_accept_len)
 
-    # accept match tokens after edit tolerance checkpoint
-    while accept_len < max_length and is_match[accept_len-1]:
-        accept_len += 1
-        
-    return accept_len    
+    # logging.info(f"max-length: {max_length} \t/ mismatch-count: {mismatch_count[max_length]} \t/ exact-match: {exact_match}\t/ accept-length: {accept_len} \t/ mismatch status: {''.join(mismatch_status)}")
+    return accept_len
 
 """
 FLy (Training-Free Loosely Speculative Decoding) verification implementation.

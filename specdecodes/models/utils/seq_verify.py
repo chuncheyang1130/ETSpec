@@ -64,6 +64,8 @@ def verify_seq(
         
     elif method == "edit_v2":
         max_edit = int(vk.get("max_edit", 2))
+        min_interval = int(vk.get("min_interval", 3))
+        
         # a more relaxed edit distance verification that allows some tolerance even when the draft token is correct
         accept_len = edit_tolerance_verify_v2(
             draft_ids=draft_ids[1:],
@@ -73,6 +75,7 @@ def verify_seq(
             threshold=threshold,
             window_size=window_size,
             max_edit=max_edit,
+            min_interval=min_interval
         )
         
     elif method == "fly":
