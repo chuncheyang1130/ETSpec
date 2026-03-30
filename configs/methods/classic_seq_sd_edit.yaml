@@ -48,11 +48,13 @@ generator_kwargs:
   prefill_chunk_size: 256
   verify_method: edit
   verify_kwargs:
-    threshold: 0.03
-    window_size: 8
+    threshold: 0.04
+    window_size: 12
     max_edit: 2
+    # min_interval: 3
 
 draft_params:
   # do_sample: true
+  draft_threshold: 0.15
   max_depth: 16
   topk_len: 1
