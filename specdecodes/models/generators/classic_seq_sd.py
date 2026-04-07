@@ -80,6 +80,8 @@ class ClassicSDGeneratorBase(GeneratorBase):
         input_ids = input_ids.clone()
         batch_size, org_input_len = input_ids.shape
         assert batch_size == 1, "Only support batch_size=1 for now."
+        
+        is_lossy = self.generator_kwargs.get("verify_method", "exact").strip().lower() != "exact"
 
         # Raise error if max_length not set while using static cache
         if stopping_criteria.max_length is None:
@@ -115,7 +117,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
 
         with nvtx.annotate("state_update"):
             input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-            cache_position = torch.arange(org_input_len, org_input_len+self.draft_params.max_verify_tokens, dtype=torch.long, device=input_ids.device)
+            # cache_position = torch.arange(org_input_len, org_input_len+self.draft_params.max_verify_tokens, dtype=torch.long, device=input_ids.device)
             self._maybe_stream(stream_callback, sampled_tokens)
 
         with nvtx.annotate("decode_loop"):
@@ -123,13 +125,14 @@ class ClassicSDGeneratorBase(GeneratorBase):
             while not finished:
                 with nvtx.annotate("speculate", color="cyan"):
                     input_ids = input_ids.clone(memory_format=torch.contiguous_format)
-                    draft_ids = self._speculate(input_ids, logits_processor=logits_processor, do_sample=do_sample)
+                    draft_ids = self._speculate(input_ids, logits_processor=logits_processor, do_sample=do_sample, is_lossy=is_lossy)
                     if self.cache_implementation == 'dynamic':
                         _, input_len = input_ids.shape
                         draft_past_key_values.crop(input_len)
 
                 with nvtx.annotate("target_decode", color="orange"):
                     prev_kv_len = past_key_values.get_seq_length()
+                    cache_position = torch.arange(prev_kv_len, prev_kv_len+draft_ids.size(-1), dtype=torch.long, device=input_ids.device)
                     outputs = self._tree_decoding(draft_ids, cache_position, past_key_values)
                     next_token_logits = outputs.logits
                     del outputs

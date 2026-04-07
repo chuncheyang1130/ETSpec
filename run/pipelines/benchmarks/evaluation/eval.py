@@ -43,7 +43,8 @@ def run_common_eval(generator, tokenizer, past_key_values, draft_past_key_values
     total_draft_time = 0.0
     total_target_time = 0.0
     post_verify_count_list, speculate_count_list = [], []
-    for idx, query in tqdm(enumerate(dataset), total=len(dataset), desc="Evaluating", leave=True):
+    for idx, sample in tqdm(enumerate(dataset), total=len(dataset), desc="Evaluating", leave=True):
+        query = sample['query']
         messages = [{"role": "user", "content": query}]
         tokenizer.use_default_system_prompt = True
         input_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(generator.device)

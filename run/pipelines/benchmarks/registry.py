@@ -8,16 +8,17 @@ from typing import Callable, List, Optional, Any
 import random
 
 
-AVAILABLE_BENCHMARKS = [
-    "mt-bench",
-    "human-eval",
+AVAILABLE_BENCHMARKS = [    
+    # math
     "gsm8k",
-    "alpaca",
-    "cnn-dm",
     "aime",
-    "gpqa",
     "math-500",
-    "livecodebench",
+    
+    # code
+    "human-eval",
+    "mbpp",
+    
+    # longbench
     "hotpotqa",
     "narrativeqa",
     "qasper",
@@ -34,34 +35,49 @@ AVAILABLE_BENCHMARKS = [
     "passage_retrieval_en",
     "lcc",
     "repobench_p",
+    
+    # others
+    "mt-bench",
+    "alpaca",
+    "cnn-dm",
+    "gpqa",
+    "livecodebench",
 ]
 
 _LOADER_CONFIG = {
-    "mt-bench": (".mtbench", "load_mtbench_dataset", "load_mtbench_dataset_answer"),
-    "human-eval": (".humaneval", "load_humaneval_dataset", "load_humaneval_dataset_answer"),
-    "gsm8k": (".gsm8k", "load_gsm8k_dataset", "load_gsm8k_dataset_answer"),
-    "alpaca": (".alpaca", "load_alpaca_dataset", None),
-    "cnn-dm": (".cnndm", "load_cnndm_dataset", None),
-    "aime": (".aime", "load_aime_dataset", "load_aime_dataset_answer"),
-    "gpqa": (".gpqa", "load_gpqa_dataset", "load_gpqa_dataset_answer"),
-    "math-500": (".math500", "load_math500_dataset", "load_math500_dataset_answer"),
-    "livecodebench": (".livecodebench", "load_livecodebench_dataset", None),
-    "hotpotqa": (".hotpotqa", "load_hotpotqa_dataset", None),
-    "narrativeqa": (".narrativeqa", "load_narrativeqa_dataset", None),
-    "qasper": (".qasper", "load_qasper_dataset", None),
-    "multifieldqa_en": (".multifieldqa_en", "load_multifieldqa_en_dataset", None),
-    "2wikimqa": ("._2wikimqa", "load_2wikimqa_dataset", None),
-    "musique": (".musique", "load_musique_dataset", None),
-    "gov_report": (".gov_report", "load_gov_report_dataset", None),
-    "qmsum": (".qmsum", "load_qmsum_dataset", None),
-    "multi_news": (".multi_news", "load_multi_news_dataset", None),
-    "trec": (".trec", "load_trec_dataset", None),
-    "triviaqa": (".triviaqa", "load_triviaqa_dataset", None),
-    "samsum": (".samsum", "load_samsum_dataset", None),
-    "passage_count": (".passage_count", "load_passage_count_dataset", None),
-    "passage_retrieval_en": (".passage_retrieval_en", "load_passage_retrieval_en_dataset", None),
-    "lcc": (".lcc", "load_lcc_dataset", None),
-    "repobench_p": (".repobench_p", "load_repobench_p_dataset", None),
+    # TBD
+    "mt-bench":             (".mtbench", "load_mtbench_dataset"),
+    "alpaca":               (".alpaca", "load_alpaca_dataset"),
+    "cnn-dm":               (".cnndm", "load_cnndm_dataset"),
+    "gpqa":                 (".gpqa", "load_gpqa_dataset"),
+    "livecodebench":        (".livecodebench", "load_livecodebench_dataset"),
+    
+    # math
+    "gsm8k":                (".gsm8k", "load_gsm8k_dataset"),
+    "aime":                 (".aime", "load_aime_dataset"),
+    "math-500":             (".math500", "load_math500_dataset"),
+    
+    # code
+    "human-eval":           (".humaneval", "load_humaneval_dataset"),
+    "mbpp":                 (".mbpp", "load_mbpp_dataset"),
+    
+    # longbench
+    "hotpotqa":             (".hotpotqa", "load_hotpotqa_dataset"),
+    "narrativeqa":          (".narrativeqa", "load_narrativeqa_dataset"),
+    "qasper":               (".qasper", "load_qasper_dataset"),
+    "multifieldqa_en":      (".multifieldqa_en", "load_multifieldqa_en_dataset"),
+    "2wikimqa":             ("._2wikimqa", "load_2wikimqa_dataset"),
+    "musique":              (".musique", "load_musique_dataset"),
+    "gov_report":           (".gov_report", "load_gov_report_dataset"),
+    "qmsum":                (".qmsum", "load_qmsum_dataset"),
+    "multi_news":           (".multi_news", "load_multi_news_dataset"),
+    "trec":                 (".trec", "load_trec_dataset"),
+    "triviaqa":             (".triviaqa", "load_triviaqa_dataset"),
+    "samsum":               (".samsum", "load_samsum_dataset"),
+    "passage_count":        (".passage_count", "load_passage_count_dataset"),
+    "passage_retrieval_en": (".passage_retrieval_en", "load_passage_retrieval_en_dataset"),
+    "lcc":                  (".lcc", "load_lcc_dataset"),
+    "repobench_p":          (".repobench_p", "load_repobench_p_dataset"),
 }
 
 
@@ -92,19 +108,12 @@ def get_loader(bench_name: str, with_answers: bool = False) -> Callable:
             f"Available: {', '.join(AVAILABLE_BENCHMARKS)}"
         )
     
-    module_name, func_name, func_name_answer = _LOADER_CONFIG[bench_name]
-    
-    if with_answers:
-        if func_name_answer is None:
-            raise ValueError(f"Benchmark '{bench_name}' does not support with_answers=True")
-        target_func = func_name_answer
-    else:
-        target_func = func_name
+    module_name, dataset_loader = _LOADER_CONFIG[bench_name]
     
     try:
         import importlib
-        module = importlib.import_module(module_name, package="run.pipelines.benchmarks")
-        return getattr(module, target_func)
+        module = importlib.import_module(module_name, package="run.pipelines.benchmarks.loader")
+        return getattr(module, dataset_loader)
     except ImportError as e:
         raise ImportError(_import_error_message(bench_name)) from e
 
@@ -133,7 +142,7 @@ def load_dataset(
     max_samples: Optional[int] = None,
     seed: int = 0,
     shuffle: bool = True,
-    with_answers: bool = False,
+    query_version: str = "llama"
 ) -> List[Any]:
     """Load a benchmark dataset with optional shuffling and sampling.
     
@@ -147,8 +156,8 @@ def load_dataset(
     Returns:
         List of dataset items
     """
-    loader = get_loader(bench_name, with_answers=with_answers)
-    dataset = loader()
+    loader = get_loader(bench_name)
+    dataset = loader(query_version=query_version)
     
     if shuffle:
         random.seed(seed)
@@ -160,7 +169,7 @@ def load_dataset(
     return dataset
 
 
-def validate_benchmarks(bench_list: List[str], with_answers: bool = False) -> None:
+def validate_benchmarks(bench_list: List[str]) -> None:
     """Validate that all benchmark names are known and support requested mode.
     
     Args:
@@ -176,10 +185,3 @@ def validate_benchmarks(bench_list: List[str], with_answers: bool = False) -> No
             f"Unknown benchmark(s): {', '.join(unknown)}. "
             f"Available: {', '.join(AVAILABLE_BENCHMARKS)}"
         )
-    
-    if with_answers:
-        no_answer = [b for b in bench_list if _LOADER_CONFIG[b][2] is None]
-        if no_answer:
-            raise ValueError(
-                f"Benchmark(s) do not support with_answers=True: {', '.join(no_answer)}"
-            )

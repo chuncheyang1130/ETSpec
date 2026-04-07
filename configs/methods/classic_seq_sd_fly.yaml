@@ -2,28 +2,53 @@
 # Implements the exact FLy algorithm from the paper
 method: classic_seq_sd
 
-llm_path: meta-llama/Llama-3.1-8B-Instruct
-draft_model_path: meta-llama/Llama-3.2-1B-Instruct
+llm_path: meta-llama/Llama-3.1-70B-Instruct
+draft_model_path: meta-llama/Llama-3.1-8B-Instruct
 
 recipe: null
+device: auto
 
-max_length: 4096
-cache_implementation: static
+max_length: 2048
+cache_implementation:
+  target: dynamic
+  draft: static
 warmup_iter: 1
-compile_mode: max-autotune
+compile_mode: 
+  target: null
+  draft: max-autotune
 
 # Target sampling settings (defaults)
+# Suggested setting
+# 1. Llama Model
+#    - do_sample: true / false
+#    - temperature: 0.6 / null
+#    - top_p: 0.9 / null
+# 2. Qwen3 Model with enable_thinking=true
+#    - do_sample: true
+#    - temperature: 0.6
+#    - top_p: 0.95
+#    - top_k: 20
+#    - min_p: 0.0
+# 3. Qwen3 Model with enable_thinking=false
+#    - do_sample: true
+#    - temperature: 0.7
+#    - top_p: 0.8
+#    - top_k: 20
+#    - min_p: 0.0
+
 do_sample: false
-temperature: 0
+# temperature: 0.6
+# top_p: 0.9
 
 generator_profiling: true
 
 generator_kwargs:
-  prefill_chunk_size: 4096
+  enable_thinking: false
+  prefill_chunk_size: 2048
   verify_method: fly
   verify_kwargs:
     # FLy algorithm parameters (from paper Table 4)
-    threshold: 0.03  # θ: Entropy gate threshold (default from paper)
+    threshold: 0.04  # θ: Entropy gate threshold (default from paper)
     window_size: 6          # W: Deferred window size (default from paper)
 
 draft_params:

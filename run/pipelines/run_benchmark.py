@@ -41,8 +41,7 @@ BENCHMARK_EVALUATORS = {
 
 
 def main(builder, benchmarks=None, max_samples=None, query_version="llama"):
-    torch.manual_seed(0)
-    random.seed(0)
+    reset_seeds(0)
         
     # Enable profiling, disable logging profiling results
     builder.generator_profiling = True
@@ -68,7 +67,7 @@ def main(builder, benchmarks=None, max_samples=None, query_version="llama"):
         log_dir = setup_benchmark_dir(log_dir_base, bench_name, getattr(args, "settings_snapshot", None))
         print(f"Log directory: {log_dir}")
         
-        dataset = load_dataset(bench_name, max_samples=max_samples, seed=0, shuffle=True, query_version="llama")
+        dataset = load_dataset(bench_name, max_samples=max_samples, seed=0, shuffle=True, query_version=query_version)
         print(f"Running benchmark: {bench_name}, samples: {len(dataset)}")
         
         cleanup_gpu()

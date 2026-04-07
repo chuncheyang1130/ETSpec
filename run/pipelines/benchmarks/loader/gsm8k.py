@@ -1,4 +1,6 @@
 # Prompt template adapted from https://github.com/openai/simple-evals/tree/main
+from random import sample
+
 from datasets import load_dataset
 
 QWEN_QUERY_TEMPLATE = r"""
@@ -21,26 +23,13 @@ def load_gsm8k_dataset(query_version: str = "llama"):
     else:
         raise ValueError(f"Unknown query_version: {query_version}")
     
+    samples = []
     dataset = load_dataset("openai/gsm8k", "main")
-    formatted_dataset = [QUERY_TEMPLATE.format(Question=entry['question']) for entry in dataset['test']]
     
-    return formatted_dataset
-
-def load_gsm8k_dataset_answer(query_version: str = "llama"):
-    if query_version == "qwen":
-        QUERY_TEMPLATE = QWEN_QUERY_TEMPLATE
-    elif query_version == "llama":
-        QUERY_TEMPLATE = LLAMA_QUERY_TEMPLATE
-    else:
-        raise ValueError(f"Unknown query_version: {query_version}")
-    
-    examples = []
-    dataset = load_dataset("openai/gsm8k", "main")
     for entry in dataset['test']:
-        q_str = QUERY_TEMPLATE.format(Question=entry['question'])
-        a_str = entry['answer']
-        examples.append({
-            "question": q_str,
-            "answer": a_str
+        samples.append({
+            "query": QUERY_TEMPLATE.format(Question=entry['question']),
+            "answer": entry['answer']
         })
-    return examples
+    
+    return samples
