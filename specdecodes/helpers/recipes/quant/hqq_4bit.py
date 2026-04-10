@@ -1,13 +1,14 @@
-from ..base_recipe import QuantOffloadRecipe
+from ..base_recipe import BaseRecipe
 from ...quantizers.hqq import HqqQuantizer
 from hqq.core.quantize import *
 
-class Recipe(QuantOffloadRecipe):
+class Recipe(BaseRecipe):
     def __init__(self):
         super().__init__()
         # Assign quantizer and offloader objects.
         self.quantizer = HqqQuantizer
         self.offloader = None
+        self.factorizer = None
 
     def generate_configurations(self, target_model, draft_model, max_length, cpu_offload_gb, dtype, device):
         # Quantization

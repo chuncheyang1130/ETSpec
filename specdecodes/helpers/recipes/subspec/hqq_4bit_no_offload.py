@@ -1,16 +1,17 @@
 """SubSpec recipe: HQQ 4-bit quant (attn + MLP) without offloading."""
 
-from ..base_recipe import QuantOffloadRecipe
+from ..base_recipe import BaseRecipe
 from hqq.core.quantize import *
 
 from ...quantizers.hqq import HqqQuantizer
 
 
-class Recipe(QuantOffloadRecipe):
+class Recipe(BaseRecipe):
 
     def __init__(self):
         super().__init__()
         self.quantizer = HqqQuantizer
+        self.factorizer = None
 
     def generate_configurations(
         self, target_model, draft_model, max_length, cpu_offload_gb, dtype, device

@@ -1,14 +1,15 @@
-from ..base_recipe import QuantOffloadRecipe
+from ..base_recipe import BaseRecipe
 from ...quantizers.sinq import SINQQuantizer
 from hqq.core.quantize import *
 from sinq.sinqlinear import BaseQuantizeConfig
 
-class Recipe(QuantOffloadRecipe):
+class Recipe(BaseRecipe):
     def __init__(self):
         super().__init__()
         # Assign quantizer and offloader objects.
         self.quantizer = SINQQuantizer
         self.offloader = None
+        self.factorizer = None
 
     def generate_configurations(self, target_model, draft_model, max_length, cpu_offload_gb, dtype, device):
         # Quantization

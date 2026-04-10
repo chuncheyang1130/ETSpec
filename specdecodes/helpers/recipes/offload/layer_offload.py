@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
-from ..base_recipe import QuantOffloadRecipe
+from ..base_recipe import BaseRecipe
 from specdecodes.helpers.offloaders.offloader import Offloader
 
 
-class LayerOffloadRecipe(QuantOffloadRecipe):
+class LayerOffloadRecipe(BaseRecipe):
     """Offload all decoder layers after the first N to CPU.
 
     This matches the exp_offloading/* recipes that were duplicated per model, where the
@@ -17,6 +17,7 @@ class LayerOffloadRecipe(QuantOffloadRecipe):
         super().__init__()
         self.quantizer = None
         self.offloader = Offloader
+        self.factorizer = None
         self.keep_first_n_layers_on_gpu = int(keep_first_n_layers_on_gpu)
 
     def generate_configurations(

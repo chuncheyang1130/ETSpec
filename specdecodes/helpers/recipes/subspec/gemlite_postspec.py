@@ -7,18 +7,19 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
-from ..base_recipe import QuantOffloadRecipe
+from ..base_recipe import BaseRecipe
 from ...offloaders.prefetch_offloader_postspec import PrefetchOffloader
 from ...quantizers.gemlite import GemliteQuantizer
 
 from hqq.core.quantize import BaseQuantizeConfig
 
 
-class Recipe(QuantOffloadRecipe):
+class Recipe(BaseRecipe):
     def __init__(self, processor: str = "A4W4_NVFP_dynamic", skip_modules: Optional[list[str]] = None):
         super().__init__()
         self.quantizer = GemliteQuantizer
         self.offloader = PrefetchOffloader
+        self.factorizer = None
         self.processor = str(processor)
         self.skip_modules = list(skip_modules) if skip_modules is not None else []
 
