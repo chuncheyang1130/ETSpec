@@ -453,6 +453,23 @@ def register_presets():
         )
     except ImportError:
         pass
+    
+    try:
+        from specdecodes.models.generators.moe_sd import MoESpecSDGenerator
+        from specdecodes.models.draft_models.moe_sd import MoESpecSDDraftModel
+        from specdecodes.helpers.recipes.factorize.svd import Recipe as MoESDRecipe
+        
+        ModelRegistry.register(
+            name="moe_sd",
+            generator_cls=MoESpecSDGenerator,
+            draft_model_cls=MoESpecSDDraftModel,
+            default_config={
+                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "recipe": MoESDRecipe(),
+            }
+        )
+    except ImportError:
+        pass
 
     # Vanilla Quant
     try:

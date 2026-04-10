@@ -424,7 +424,13 @@ class GeneratorPipelineBuilder:
                 device=self.device,
             )
             
-            # Apply quantization first
+            # Apply SVD first so later quantization/offloading sees the transformed modules.
+            if draft_model and draft_config and draft_config.get("svd_config"):
+                self.recipe.apply_svd(draft_model.model, draft_config["svd_config"], self.dtype, self.device)
+            if target_config and target_config.get("svd_config"):
+                self.recipe.apply_svd(model, target_config["svd_config"], self.dtype, self.device)
+
+            # Apply quantization next.
             if draft_model and draft_config and draft_config.get("quant_config"):
                 self.recipe.apply_quantization(draft_model.model, draft_config["quant_config"], self.dtype, self.device)
             if target_config and target_config.get("quant_config"):

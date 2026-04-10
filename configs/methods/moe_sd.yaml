@@ -1,0 +1,48 @@
+# Tree-based SD + shared-basis SVD for MoE FFN experts
+method: classic_sd
+
+llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+device: auto
+
+recipe:
+  class_path: specdecodes.helpers.recipes.factorize.svd:Recipe
+  kwargs:
+    # Set one of rank or rank_ratio.
+    rank: 64
+    # rank_ratio: 0.125
+
+    # Match MoE expert FFN projection names (Mixtral/Qwen style).
+    # include_patterns:
+    #   - ".*experts\\.\\d+\\.w1$"
+    #   - ".*experts\\.\\d+\\.w2$"
+    #   - ".*experts\\.\\d+\\.w3$"
+    #   - ".*experts\\.\\d+\\.gate_proj$"
+    #   - ".*experts\\.\\d+\\.up_proj$"
+    #   - ".*experts\\.\\d+\\.down_proj$"
+
+    # In vanilla mode, only target model exists.
+    # apply_to_target: true
+    # apply_to_draft: false
+
+    # min_rank: 8
+    # freeze_params: true
+    # svd_device: cpu
+    # verbose: true
+
+max_length: 4096
+cache_implementation: static
+warmup_iter: 1
+compile_mode: max-autotune
+
+# Target sampling settings
+# (keep deterministic by default for benchmarking)
+do_sample: false
+temperature: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 4096
+  verify_method: exact
+  verify_kwargs: {}
