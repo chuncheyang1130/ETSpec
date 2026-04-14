@@ -402,6 +402,27 @@ def register_presets():
         )
     except ImportError:
         pass
+    
+    # SubSpec SVD SD No Offload
+    try:
+        from specdecodes.models.generators.subspec_sd import SubSpecSDGenerator as SubSpecSVDSDGenerator
+        from specdecodes.models.draft_models.subspec_sd import SubSpecSDDraftModel as SubSpecSVDSDDraftModel
+        from specdecodes.helpers.recipes.subspec.hqq_4bit_svd_no_offload import (
+            Recipe as SubSpecSVDRecipeNoOffload,
+        )
+        
+        ModelRegistry.register(
+            name="subspec_svd_sd_no_offload",
+            generator_cls=SubSpecSVDSDGenerator,
+            draft_model_cls=SubSpecSVDSDDraftModel,
+            default_config={
+                "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
+                "recipe": SubSpecSVDRecipeNoOffload(),
+            },
+            needs_draft_kv_cache=False,
+        )
+    except ImportError:
+        pass
 
     # Eagle SD
     try:
@@ -454,6 +475,7 @@ def register_presets():
     except ImportError:
         pass
     
+    # MoE SD
     try:
         from specdecodes.models.generators.moe_sd import MoESpecSDGenerator
         from specdecodes.models.draft_models.moe_sd import MoESpecSDDraftModel
