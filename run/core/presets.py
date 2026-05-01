@@ -480,7 +480,7 @@ def register_presets():
         from specdecodes.models.generators.moe_sd import MoESpecSDGenerator
         from specdecodes.models.draft_models.moe_sd import MoESpecSDDraftModel
         from specdecodes.helpers.recipes.factorize.svd import Recipe as MoESDRecipe
-        
+
         ModelRegistry.register(
             name="moe_sd",
             generator_cls=MoESpecSDGenerator,
@@ -489,6 +489,25 @@ def register_presets():
                 "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                 "recipe": MoESDRecipe(),
             }
+        )
+    except ImportError:
+        pass
+
+    # MoE SVD SD: top-N expert tracking + SVD-compressed draft
+    try:
+        from specdecodes.models.generators.subspec_moe_svd_sd import MoESvdSDGenerator
+        from specdecodes.models.draft_models.subspec_moe_svd_sd import MoESvdSDDraftModel
+        from specdecodes.helpers.recipes.factorize.moe_topn_svd import Recipe as MoESvdSDRecipe
+
+        ModelRegistry.register(
+            name="moe_svd_sd",
+            generator_cls=MoESvdSDGenerator,
+            draft_model_cls=MoESvdSDDraftModel,
+            default_config={
+                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "recipe": MoESvdSDRecipe(),
+            },
+            needs_draft_kv_cache=False,
         )
     except ImportError:
         pass
