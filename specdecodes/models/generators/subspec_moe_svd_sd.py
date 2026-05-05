@@ -1,14 +1,18 @@
 """Generator for MoE TopN-SVD speculative decoding.
 
-Step 1 (build time): the draft's MoE blocks are swapped for
-`PackedTopNSvdMoeBlock` instances with random-initialized packed tensors.
+Build time: the draft's MoE blocks are swapped for `PackedTopNSvdMoeBlock`
+instances (random init).
 
-Step 2 (this file): after prefill, and again after every verification
-round, we read per-layer expert-hit counts off the target, pick the top-N
-most-activated experts per layer, and write those ids onto each draft
-block's `kept_expert_ids` bookkeeping buffer. The packed SVD weights are
-**not** refilled yet — that is the next step. The block forward keeps
-running against whatever weights are currently in the packed tensors.
+Generate time:
+  1. Install a tracker on the target's MoE blocks that accumulates per-expert
+     hit counts across **all** target forwards (prefill + every round).
+     Counts are *not* reset between rounds — picks are denser and more
+     stable when drawn from cumulative usage than from a single tree.
+  2. After prefill, and again after every verification round, pick the top-N
+     most-activated experts per layer, then SVD-fill each draft block's
+     packed tensors and refresh its router buffers from the target. The
+     per-block fill is cached on the kept set, so layers whose pick didn't
+     change pay nothing.
 """
 
 import torch
@@ -20,7 +24,6 @@ from specdecodes.models.utils.moe.qwen3_moe_topn_svd import (
     get_expert_usage,
     install_expert_usage_tracker,
     pick_top_n_per_layer,
-    reset_expert_routing,
     reset_expert_usage,
 )
 
@@ -43,13 +46,12 @@ class MoESvdSDGeneratorBase(ClassicSDGeneratorBase):
         return int(cfg.get("top_n", 32))
 
     def _pick_and_update_kept(self) -> None:
-        """End-to-end: pick top-N per layer from the latest tracker counts,
-        write the ids onto each draft block's `kept_expert_ids` buffer
-        (step 2), and SVD-fill the packed tensors from the target's
-        experts at those ids (step 3).
+        """Pick top-N per layer from cumulative tracker counts, then SVD-fill
+        the packed tensors and refresh routing buffers from the target's
+        experts at those ids.
 
-        Per-block SVD is cached on the kept set, so layers whose kept
-        set didn't change pay nothing here.
+        Per-block SVD is cached on the kept set (`_last_filled_ids`), so
+        layers whose kept set didn't change pay nothing here.
         """
         counts = get_expert_usage(self.target_model)
         if not counts:
@@ -58,10 +60,6 @@ class MoESvdSDGeneratorBase(ClassicSDGeneratorBase):
         if not kept:
             return
 
-        # step 2: stash kept ids on the bookkeeping buffer
-        self.draft_model.update_kept_ids(kept)
-
-        # step 3: SVD-fill from target experts at those ids
         cfg = getattr(self.draft_model, "topn_svd_config", None) or {}
         svd_device = str(cfg.get("svd_device", "cuda:0"))
         self.draft_model.materialize_kept_from_target(
@@ -69,10 +67,9 @@ class MoESvdSDGeneratorBase(ClassicSDGeneratorBase):
         )
 
     def _tree_decoding(self, tree, past_key_values, position_offset, cache_position, device):
-        # Clear tracker state before the target forward so what we read
-        # after only reflects this round.
-        reset_expert_usage(self.target_model)
-        reset_expert_routing(self.target_model)
+        # Counts are *not* reset here: we let them accumulate across the
+        # whole generation so picks are drawn from a dense, stable
+        # distribution rather than a single tree's worth of tokens.
         outputs = super()._tree_decoding(
             tree=tree,
             past_key_values=past_key_values,
@@ -80,8 +77,6 @@ class MoESvdSDGeneratorBase(ClassicSDGeneratorBase):
             cache_position=cache_position,
             device=device,
         )
-        # Step 2: pick top-N per layer from this round's counts and stash
-        # them on the draft blocks.
         with nvtx.annotate("topn_pick", color="purple"):
             self._pick_and_update_kept()
         return outputs
@@ -119,8 +114,9 @@ class MoESvdSDGeneratorBase(ClassicSDGeneratorBase):
 
         with nvtx.annotate("expert_tracker_install"):
             self._ensure_tracker_installed()
+            # Reset cumulative counts at the start of every prompt; from this
+            # point on they accumulate across prefill + every SD round.
             reset_expert_usage(self.target_model)
-            reset_expert_routing(self.target_model)
 
         with nvtx.annotate("prefill_chunked", color="orange"):
             self._init_tree_mask(

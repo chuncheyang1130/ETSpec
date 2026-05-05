@@ -1,14 +1,16 @@
-"""Draft model for MoE TopN-SVD speculative decoding (step 1: structure only).
+"""Draft model for MoE TopN-SVD speculative decoding.
 
 The draft is built as a `share_param_deepcopy` of the target so that all
 non-MoE submodules (attention, embeddings, layernorms, lm_head) reuse the
 target's parameters directly. The recipe's `MoETopNSVDFactorizer` then runs
 at build time and replaces every `Qwen3MoeSparseMoeBlock` with a
-`PackedTopNSvdMoeBlock` whose packed tensors are random-initialized.
+`PackedTopNSvdMoeBlock` (random init for the packed tensors, zero init for
+the routing buffers).
 
-Step 2 will swap that random fill for actual SVD-derived weights using the
-target's expert usage. For now this class just owns construction and stashes
-the recipe config under `topn_svd_config`.
+At generate time, the generator picks per-layer kept expert ids from the
+target's tracked usage and calls `materialize_kept_from_target`, which
+SVD-fills the packed tensors and refreshes each block's full target
+router + cluster-mass redirect from the target's experts.
 """
 
 from copy import deepcopy
@@ -98,36 +100,3 @@ class MoESvdSDDraftModel(SubSpecSDDraftModel):
             if dmod.materialize_from_target(tmod, kept, svd_device=svd_device):
                 rebuilt += 1
         return rebuilt
-
-    @torch.no_grad()
-    def update_kept_ids(self, kept_ids_per_layer: Dict[str, torch.Tensor]) -> int:
-        """Update each `PackedTopNSvdMoeBlock`'s `kept_expert_ids` buffer.
-
-        For step 2 selection only: this writes the most-recently-picked
-        top-N expert ids onto each block's bookkeeping buffer. It does
-        **not** yet refill the SVD packed tensors — that's the next step.
-        Block forwards still run on whatever weights are currently in
-        `vh_shared` / `u_packed` / `down_vh_packed` / `down_u_shared`.
-
-        Args:
-            kept_ids_per_layer: maps the MoE block's module path to a 1D
-                long tensor of kept expert ids (size `top_n`).
-
-        Returns:
-            Number of blocks whose buffer was updated.
-        """
-        updated = 0
-        for name, mod in self.model.named_modules():
-            if not isinstance(mod, PackedTopNSvdMoeBlock):
-                continue
-            kept = kept_ids_per_layer.get(name)
-            if kept is None:
-                continue
-            if int(kept.numel()) != int(mod.top_n):
-                # Ignore mismatched sizes rather than truncate silently.
-                continue
-            mod.kept_expert_ids.copy_(
-                kept.to(device=mod.kept_expert_ids.device, dtype=mod.kept_expert_ids.dtype)
-            )
-            updated += 1
-        return updated

@@ -497,7 +497,7 @@ def register_presets():
     try:
         from specdecodes.models.generators.subspec_moe_svd_sd import MoESvdSDGenerator
         from specdecodes.models.draft_models.subspec_moe_svd_sd import MoESvdSDDraftModel
-        from specdecodes.helpers.recipes.factorize.moe_topn_svd import Recipe as MoESvdSDRecipe
+        from specdecodes.helpers.recipes.factorize.moe_topn_svd_no_offload import Recipe as MoESvdSDRecipe
 
         ModelRegistry.register(
             name="moe_svd_sd",

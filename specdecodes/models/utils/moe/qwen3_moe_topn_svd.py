@@ -4,33 +4,31 @@ This module ships two things:
 
   1. `PackedTopNSvdMoeBlock` — a drop-in replacement for
      `Qwen3MoeSparseMoeBlock` that stores `top_n` kept experts in
-     **packed**, **shared-basis** SVD form (gateless: every token is
-     processed by all `top_n` experts and their outputs are uniformly
-     averaged):
+     **packed**, **shared-basis** SVD form, and uses the target's *full*
+     router (with cluster-mass redirection from dropped experts onto the
+     kept set) to weight per-expert outputs:
 
-         vh_shared       : [rank_up, hidden]                       # shared input basis (gate+up)
-         u_packed        : [top_n, 2 * intermediate, rank_up]      # per-expert U (gate+up)
-         down_vh_packed  : [top_n, rank_down, intermediate]        # per-expert input basis (down)
-         down_u_shared   : [hidden, rank_down]                     # shared output basis (down)
+         vh_shared        : [rank_up, hidden]                       # shared input basis (gate+up)
+         u_packed         : [top_n, 2 * intermediate, rank_up]      # per-expert U (gate+up)
+         down_vh_packed   : [top_n, rank_down, intermediate]        # per-expert input basis (down)
+         down_u_shared    : [hidden, rank_down]                     # shared output basis (down)
+         full_gate_weight : [num_experts, hidden]                   # copied from target.gate (whole router)
+         redirect_P       : [num_experts, top_n]                    # one-hot redirect of dropped mass
 
-     The structure is **fixed** (no ModuleList swaps round-to-round,
-     no router, no data-dependent control flow), which is what makes
-     the draft compile-friendly.
-
-     STEP 1: tensors are filled with random numbers at build time. The
-     real SVD-fill happens in a later step that consumes target-side
-     usage statistics.
+     The structure is **fixed** (no ModuleList swaps round-to-round, no
+     data-dependent branching, no scatter/gather over expert ids), which
+     is what makes the block torch.compile-friendly: a single static graph
+     in which only tensor *values* change between rounds.
 
   2. The expert-usage tracker (`install_expert_usage_tracker`,
-     `get_expert_usage`, `reset_expert_usage`, `get_expert_routing`,
-     `reset_expert_routing`) — kept here unchanged because step 2 will
-     drive SVD-fill from these signals.
+     `get_expert_usage`, `reset_expert_usage`) — used at generate time to
+     pick which `top_n` experts to keep for SVD-fill.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
@@ -41,10 +39,6 @@ from transformers.activations import ACT2FN
 
 _TRACKER_BUFFER = "_expert_usage_counts"
 _TRACKER_HANDLE = "_expert_usage_handle"
-# Latest forward's per-position routing — `[total_tokens, top_k]` long tensor.
-# Stored as a Python attribute (not a registered buffer) so the shape can vary
-# from forward to forward (prefill chunk vs verification tree).
-_LATEST_ROUTING = "_expert_usage_latest_routing"
 
 
 def _is_qwen3_moe_block(module: nn.Module) -> bool:
@@ -64,16 +58,7 @@ def _is_qwen3_moe_block(module: nn.Module) -> bool:
 
 
 def _make_tracker_hook(block: nn.Module):
-    """Forward pre-hook that records expert routing for the current forward.
-
-    Two pieces of state are written:
-      * `_expert_usage_counts` — a *cumulative* `[num_experts]` int64 buffer,
-        updated in-place. Drives the `tree` aggregation mode and prefill
-        bootstrap.
-      * `_expert_usage_latest_routing` — the *most recent* forward's
-        `[total_tokens, top_k]` long tensor of selected expert ids. Drives
-        the `verified` mode (combined with `hidden_indices` from `_verify`).
-    """
+    """Forward pre-hook that accumulates per-expert routing hit counts."""
 
     def hook(module: nn.Module, inputs):
         hidden_states = inputs[0] if isinstance(inputs, tuple) else inputs
@@ -83,20 +68,13 @@ def _make_tracker_hook(block: nn.Module):
             else hidden_states
         )
 
-        # Re-run the gating; cheap relative to the expert FFNs.
         router_logits = module.gate(flat)
         weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         _, selected = torch.topk(weights, module.top_k, dim=-1)
 
-        # Cumulative count (tree mode + bootstrap).
         counts = torch.bincount(selected.flatten(), minlength=int(module.num_experts))
         buf = getattr(module, _TRACKER_BUFFER)
         buf += counts.to(buf.device, buf.dtype)
-
-        # Latest per-position routing (verified mode). Stored detached so it
-        # doesn't keep autograd graphs alive; replaced (not appended) on every
-        # forward so we always read the most recent forward's routing.
-        setattr(module, _LATEST_ROUTING, selected.detach())
 
     return hook
 
@@ -108,8 +86,9 @@ def install_expert_usage_tracker(model: nn.Module) -> List[torch.utils.hooks.Rem
         if not _is_qwen3_moe_block(module):
             continue
 
-        # Reset / allocate counts buffer.
-        counts = torch.zeros(int(module.num_experts), dtype=torch.long, device=next(module.parameters()).device)
+        counts = torch.zeros(
+            int(module.num_experts), dtype=torch.long, device=next(module.parameters()).device
+        )
         if hasattr(module, _TRACKER_BUFFER):
             setattr(module, _TRACKER_BUFFER, counts)
         else:
@@ -151,46 +130,20 @@ def reset_expert_usage(model: nn.Module) -> None:
             buf.zero_()
 
 
-def get_expert_routing(model: nn.Module) -> Dict[str, torch.Tensor]:
-    """Read each block's *latest forward's* per-position routing."""
-    routing: Dict[str, torch.Tensor] = {}
-    for name, module in model.named_modules():
-        if not _is_qwen3_moe_block(module):
-            continue
-        sel = getattr(module, _LATEST_ROUTING, None)
-        if sel is None:
-            continue
-        routing[name] = sel
-    return routing
-
-
-def reset_expert_routing(model: nn.Module) -> None:
-    for _, module in model.named_modules():
-        if _is_qwen3_moe_block(module) and hasattr(module, _LATEST_ROUTING):
-            setattr(module, _LATEST_ROUTING, None)
-
-
 def pick_top_n_per_layer(
     expert_counts: Dict[str, torch.Tensor],
     top_n: int,
 ) -> Dict[str, torch.Tensor]:
     """For each layer, return the indices of the `top_n` most-activated experts.
 
-    Args:
-        expert_counts: per-layer hit counts (e.g., from `get_expert_usage`),
-            indexed by the MoE block's module path.
-        top_n: how many experts to keep per layer.
-
-    Returns:
-        A dict mapping the same keys to a 1D long tensor of `top_n` expert
-        ids (sorted ascending for deterministic equality checks).
+    Returns a dict mapping the same keys to a 1D long tensor of `top_n` expert
+    ids, sorted ascending for deterministic equality checks.
     """
     kept: Dict[str, torch.Tensor] = {}
     for name, counts in expert_counts.items():
         if counts.numel() == 0:
             continue
         n = min(int(top_n), int(counts.numel()))
-        # `largest=True, sorted=True` then re-sort by id for determinism.
         _, ids = torch.topk(counts, k=n, largest=True, sorted=True)
         ids, _ = torch.sort(ids)
         kept[name] = ids.to(torch.long)
@@ -203,38 +156,46 @@ def pick_top_n_per_layer(
 
 
 class PackedTopNSvdMoeBlock(nn.Module):
-    """Gateless, shared-basis, packed-tensor low-rank top-N expert block.
+    """Compile-friendly low-rank top-N expert block with target-faithful routing.
 
-    There is no router: every token is processed by **all** `top_n` kept
-    experts, and their outputs are uniformly averaged. The whole forward is
-    a fixed pipeline of broadcasted matmuls — no data-dependent control
-    flow, no scatter/gather, no `for expert in expert_hit` loop — which
-    makes the block torch.compile-friendly and a single static graph.
+    The block runs **all** `top_n` kept experts in parallel on every token via
+    broadcasted matmuls (no scatter/gather, no `for expert in routing` loop),
+    then weights each expert's output by routing mass derived from the target's
+    full router. Mass that the target would have spent on dropped experts is
+    redirected via a fixed `[num_experts, top_n]` one-hot matrix to the most
+    similar kept expert (chosen by cosine similarity of router rows), so no
+    routing mass is silently lost.
 
-    Both halves of the FFN are SVD-factorized with shared bases:
-
-      gate/up share the **input** basis (everyone reads from the same residual)
-      down    shares the **output** basis (everyone writes into the same residual)
+    The whole forward is a fixed pipeline of broadcasted matmuls — only tensor
+    *values* change when the kept set is refreshed between rounds, never any
+    shapes — which keeps the block as a single torch.compile graph.
 
     Layout (per layer):
-        vh_shared       : [rank_up, hidden]                         # shared input basis (gate+up)
-        u_packed        : [top_n, 2 * intermediate, rank_up]        # per-expert U (gate+up)
-        down_vh_packed  : [top_n, rank_down, intermediate]          # per-expert input basis (down)
-        down_u_shared   : [hidden, rank_down]                       # shared output basis (down)
+        vh_shared        : [rank_up, hidden]                         # shared input basis (gate+up)
+        u_packed         : [top_n, 2 * intermediate, rank_up]        # per-expert U (gate+up)
+        down_vh_packed   : [top_n, rank_down, intermediate]          # per-expert input basis (down)
+        down_u_shared    : [hidden, rank_down]                       # shared output basis (down)
+        full_gate_weight : [num_experts, hidden]                     # target router (copied)
+        redirect_P       : [num_experts, top_n]                      # one-hot mass redirector
 
-    Forward (all `top_n` experts active per token):
-        vh_x      = x @ vh_sharedᵀ                                  # [T, rank_up]
-        gate_up   = vh_x @ u_packedᵀ                                # [top_n, T, 2*intermediate]
-        gate, up  = chunk(gate_up, 2, -1)
-        interm    = silu(gate) * up                                 # [top_n, T, intermediate]
-        proj_e    = interm @ down_vh_packedᵀ                        # [top_n, T, rank_down]
-        proj_mean = proj_e.mean(dim=0)                              # [T, rank_down]
-        final     = proj_mean @ down_u_sharedᵀ                      # [T, hidden]
+    Forward (top_k matches target's `top_k`):
+        # routing — target-faithful softmax over top_k of full router, then redirect.
+        all_logits  = x @ full_gate_weightᵀ                         # [T, num_experts]
+        kept_logits = topk_mask_with_neg_inf(all_logits, top_k)
+        all_w       = softmax(kept_logits)                          # zeros outside top_k
+        kept_w      = all_w @ redirect_P                            # [T, top_n], rows sum to 1
 
-    Note on the `down_*` factorization: because `down_u_shared` is linear
-    and identical across experts, taking the mean across experts at the
-    rank_down stage is mathematically equivalent to the mean of the full
-    [hidden]-space outputs — but cheaper.
+        # gate / up — shared input basis, per-expert U
+        vh_x        = x @ vh_sharedᵀ                                # [T, rank_up]
+        gate_up     = vh_x @ u_packedᵀ                              # [top_n, T, 2*intermediate]
+        gate, up    = chunk(gate_up, 2, -1)
+        interm      = silu(gate) * up                               # [top_n, T, intermediate]
+
+        # down — per-expert input basis, shared output basis (linearity defers
+        # the [hidden, rank_down] matmul to once after weighted-mixing).
+        proj        = interm @ down_vh_packedᵀ                      # [top_n, T, rank_down]
+        proj_mix    = (kept_wᵀ.unsqueeze(-1) * proj).sum(dim=0)     # [T, rank_down]
+        out         = proj_mix @ down_u_sharedᵀ                     # [T, hidden]
     """
 
     def __init__(
@@ -247,17 +208,26 @@ class PackedTopNSvdMoeBlock(nn.Module):
         dtype: torch.dtype,
         device: torch.device | str,
         hidden_act: str,
+        target_top_k: int,
         rank_down: int | None = None,
     ):
         super().__init__()
+        if top_n > num_experts:
+            raise ValueError(f"top_n ({top_n}) cannot exceed num_experts ({num_experts}).")
+        if target_top_k > num_experts:
+            raise ValueError(
+                f"target_top_k ({target_top_k}) cannot exceed num_experts ({num_experts})."
+            )
+
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
-        # `num_experts` is the original count (e.g. 128); kept for bookkeeping
-        # so step 2 can map local kept-id -> original target expert id.
+        # `num_experts` is the original count (e.g. 128), kept so the router /
+        # redirect matrix can recover full target routing semantics.
         self.num_experts = int(num_experts)
         self.top_n = int(top_n)
         self.rank = int(rank)
         self.rank_down = int(rank_down) if rank_down is not None else int(rank)
+        self.target_top_k = int(target_top_k)
         self.act_fn = ACT2FN[hidden_act]
 
         # Gate / up: shared input basis + per-expert U.
@@ -265,19 +235,37 @@ class PackedTopNSvdMoeBlock(nn.Module):
             torch.empty(self.rank, self.hidden_size, dtype=dtype, device=device)
         )
         self.u_packed = nn.Parameter(
-            torch.empty(self.top_n, 2 * self.intermediate_size, self.rank, dtype=dtype, device=device)
+            torch.empty(
+                self.top_n, 2 * self.intermediate_size, self.rank, dtype=dtype, device=device
+            )
         )
 
         # Down: per-expert input basis + shared output basis.
         self.down_vh_packed = nn.Parameter(
-            torch.empty(self.top_n, self.rank_down, self.intermediate_size, dtype=dtype, device=device)
+            torch.empty(
+                self.top_n, self.rank_down, self.intermediate_size, dtype=dtype, device=device
+            )
         )
         self.down_u_shared = nn.Parameter(
             torch.empty(self.hidden_size, self.rank_down, dtype=dtype, device=device)
         )
 
-        # Bookkeeping: local-kept-id -> original-expert-id. Initialized to
-        # the identity (placeholder); step 2 will overwrite it.
+        # Target router (copied verbatim at materialize time). Buffer because
+        # we never train it; non-persistent so it doesn't bloat checkpoints.
+        self.register_buffer(
+            "full_gate_weight",
+            torch.zeros(self.num_experts, self.hidden_size, dtype=dtype, device=device),
+            persistent=False,
+        )
+        # One-hot redirect: each of the `num_experts` rows points at one of
+        # `top_n` kept-cluster slots. Kept experts redirect to themselves.
+        self.register_buffer(
+            "redirect_P",
+            torch.zeros(self.num_experts, self.top_n, dtype=dtype, device=device),
+            persistent=False,
+        )
+
+        # Bookkeeping: local-kept-id -> original-expert-id. Identity init.
         self.register_buffer(
             "kept_expert_ids",
             torch.arange(self.top_n, dtype=torch.long, device=device),
@@ -287,11 +275,42 @@ class PackedTopNSvdMoeBlock(nn.Module):
         self.reset_random_()
 
     def reset_random_(self) -> None:
-        """Re-seed the packed tensors with small random values (placeholder fill)."""
+        """Re-seed packed tensors with small random values (placeholder fill).
+
+        Routing buffers (`full_gate_weight`, `redirect_P`) intentionally stay
+        zero-initialized: forward called before `materialize_from_target`
+        produces zero output, which is louder than producing garbage.
+        """
         nn.init.normal_(self.vh_shared, std=0.02)
         nn.init.normal_(self.u_packed, std=0.02)
         nn.init.normal_(self.down_vh_packed, std=0.02)
         nn.init.normal_(self.down_u_shared, std=0.02)
+
+    @torch.no_grad()
+    def _build_redirect_P(
+        self,
+        full_gate_f32: torch.Tensor,
+        kept_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cluster every expert onto the kept set by router-row cosine similarity.
+
+        Args:
+            full_gate_f32: target.gate.weight in float32, shape [num_experts, hidden].
+            kept_ids: 1D long tensor of kept expert ids, length top_n, on the
+                same device as `full_gate_f32`.
+
+        Returns:
+            One-hot matrix `P[num_experts, top_n]` (float32, same device).
+            Kept experts always map to their own slot; non-kept experts map to
+            the kept expert with highest cosine similarity in router space.
+        """
+        gate_norm = F.normalize(full_gate_f32, dim=-1)
+        sim = gate_norm @ gate_norm[kept_ids].T  # [num_experts, top_n]
+        nearest = sim.argmax(dim=-1)             # [num_experts]
+        # Kept experts always redirect to their own slot — overrule cosine.
+        kept_pos = torch.arange(self.top_n, device=full_gate_f32.device, dtype=nearest.dtype)
+        nearest[kept_ids] = kept_pos
+        return F.one_hot(nearest, num_classes=self.top_n).to(torch.float32)
 
     @torch.no_grad()
     def materialize_from_target(
@@ -300,31 +319,18 @@ class PackedTopNSvdMoeBlock(nn.Module):
         kept_ids: torch.Tensor,
         svd_device: torch.device | str = "cuda:0",
     ) -> bool:
-        """SVD-fill the packed tensors from `target_block.experts[kept_ids]`.
+        """SVD-fill packed tensors and refresh routing buffers from `target_block`.
 
-        Two shared-basis SVDs, each with **balanced σ split** — sqrt(σ) is
-        absorbed into both the U and Vh sides:
+        Two shared-basis SVDs (gate/up and down), each with **balanced σ split**
+        — sqrt(σ) absorbed into both U and Vh sides so neither factor blows up
+        in bf16. Plus:
 
-          gate/up : M = vstack([gate_e ; up_e] for e in kept_ids)
-                    M ≈ U_r diag(σ_r) Vh_r
-                       = (U_r √σ) (√σ Vh_r)
-                    vh_shared = √σ · Vh_r                      # [rank_up, hidden]
-                    u_packed[i] = U_r[i-th block] · √σ          # [2*intermediate, rank_up]
-
-          down    : N = hstack(down_e for e in kept_ids)
-                    N ≈ U_r diag(σ_r) Vh_r
-                       = (U_r √σ) (√σ Vh_r)
-                    down_u_shared      = U_r · √σ              # [hidden, rank_down]
-                    down_vh_packed[i] = √σ · Vh_r[i-th col-block]  # [rank_down, intermediate]
-
-        Splitting σ symmetrically keeps both sides on the same magnitude
-        scale, which matters for the bf16 cast at the end.
-
-        SVD runs on `svd_device` in float32; results are cast back to the
-        block's dtype/device.
+          * `full_gate_weight` ← target_block.gate.weight (verbatim copy).
+          * `redirect_P` ← cluster every non-kept expert onto its nearest kept
+            expert by cosine similarity of `target.gate.weight` rows.
 
         Skips the entire fill (returns False) if the kept set matches the
-        previous fill (cached on `_last_filled_ids`).
+        previous fill — `_last_filled_ids` cache.
 
         Returns True iff the packed tensors were actually rebuilt.
         """
@@ -335,7 +341,11 @@ class PackedTopNSvdMoeBlock(nn.Module):
             )
 
         prev = getattr(self, "_last_filled_ids", None)
-        if isinstance(prev, torch.Tensor) and prev.numel() == kept_ids.numel() and torch.equal(prev, kept_ids):
+        if (
+            isinstance(prev, torch.Tensor)
+            and prev.numel() == kept_ids.numel()
+            and torch.equal(prev, kept_ids)
+        ):
             return False
 
         target_dtype = self.vh_shared.dtype
@@ -346,11 +356,9 @@ class PackedTopNSvdMoeBlock(nn.Module):
         im = self.intermediate_size
 
         # ---- gate / up shared-basis SVD with balanced σ split ----
-        # W_i  = vstack(gate_proj_e_i, up_proj_e_i)              [2*intermediate, hidden]
-        # M    = vstack(W_i for i)                               [top_n * 2*intermediate, hidden]
+        # M = vstack(W_e for e in kept_ids), W_e = vstack([gate_proj_e, up_proj_e])
         W_blocks = [
-            torch.cat([m.gate_proj.weight, m.up_proj.weight], dim=0)
-            for m in experts
+            torch.cat([m.gate_proj.weight, m.up_proj.weight], dim=0) for m in experts
         ]
         M = torch.cat(W_blocks, dim=0).to(device=svd_device, dtype=torch.float32)
 
@@ -361,19 +369,17 @@ class PackedTopNSvdMoeBlock(nn.Module):
             return False
 
         rank_up = max(1, min(int(self.rank), int(S.shape[0])))
-        sqrt_S = torch.sqrt(S[:rank_up])                          # [rank_up]
-        U_scaled = U[:, :rank_up] * sqrt_S.unsqueeze(0)           # [top_n*2*intermediate, rank_up]
-        vh_scaled = sqrt_S.unsqueeze(1) * Vh[:rank_up, :]         # [rank_up, hidden]
+        sqrt_S = torch.sqrt(S[:rank_up])
+        U_scaled = U[:, :rank_up] * sqrt_S.unsqueeze(0)            # [top_n*two_im, rank_up]
+        vh_scaled = sqrt_S.unsqueeze(1) * Vh[:rank_up, :]          # [rank_up, hidden]
 
         self.vh_shared.data.copy_(vh_scaled.to(device=target_device, dtype=target_dtype))
-        # Row-major reshape lands directly on `u_packed`'s [top_n, two_im, rank_up]
-        # layout — experts are stacked along rows in `U_scaled`, so no permute.
+        # Row-major reshape — experts are stacked along rows in `U_scaled`.
         u_packed_view = U_scaled.reshape(self.top_n, two_im, rank_up)
         self.u_packed.data.copy_(u_packed_view.to(device=target_device, dtype=target_dtype))
 
         # ---- down shared-basis SVD with balanced σ split ----
-        # D_i = down_proj_e_i                              [hidden, intermediate]
-        # N   = hstack(D_i for i)                          [hidden, top_n * intermediate]
+        # N = hstack(D_e for e in kept_ids), D_e = down_proj_e.weight
         D_blocks = [m.down_proj.weight for m in experts]
         N = torch.cat(D_blocks, dim=1).to(device=svd_device, dtype=torch.float32)
 
@@ -384,24 +390,33 @@ class PackedTopNSvdMoeBlock(nn.Module):
             return False
 
         rank_down = max(1, min(int(self.rank_down), int(S.shape[0])))
-        sqrt_S = torch.sqrt(S[:rank_down])                        # [rank_down]
-        u_scaled = U[:, :rank_down] * sqrt_S.unsqueeze(0)         # [hidden, rank_down]
-        Vh_scaled = sqrt_S.unsqueeze(1) * Vh[:rank_down, :]       # [rank_down, top_n * intermediate]
+        sqrt_S = torch.sqrt(S[:rank_down])
+        u_scaled = U[:, :rank_down] * sqrt_S.unsqueeze(0)          # [hidden, rank_down]
+        Vh_scaled = sqrt_S.unsqueeze(1) * Vh[:rank_down, :]        # [rank_down, top_n*im]
 
         self.down_u_shared.data.copy_(u_scaled.to(device=target_device, dtype=target_dtype))
-        # Experts are stacked along columns in `Vh_scaled`, so reshape splits
-        # the column axis into (top_n, intermediate) and we permute the new
-        # `top_n` axis to the front to match `down_vh_packed`'s
-        # [top_n, rank_down, intermediate] layout. `copy_` accepts the
-        # resulting strided view.
-        down_vh_packed_view = (
-            Vh_scaled.reshape(rank_down, self.top_n, im).permute(1, 0, 2)
+        # Experts are stacked along columns in `Vh_scaled`; split + permute to
+        # [top_n, rank_down, im].
+        down_vh_packed_view = Vh_scaled.reshape(rank_down, self.top_n, im).permute(1, 0, 2)
+        self.down_vh_packed.data.copy_(
+            down_vh_packed_view.to(device=target_device, dtype=target_dtype)
         )
-        self.down_vh_packed.data.copy_(down_vh_packed_view.to(device=target_device, dtype=target_dtype))
 
-        # Refresh bookkeeping so callers that compare buffers see the truth.
-        self.kept_expert_ids.copy_(kept_ids.to(device=self.kept_expert_ids.device,
-                                               dtype=self.kept_expert_ids.dtype))
+        # ---- routing: full target gate (copy) + cluster-mass redirect ----
+        full_gate = target_block.gate.weight.detach()
+        full_gate_f32 = full_gate.to(device=svd_device, dtype=torch.float32)
+        kept_ids_dev = kept_ids.to(svd_device)
+
+        self.full_gate_weight.data.copy_(
+            full_gate.to(device=target_device, dtype=target_dtype)
+        )
+        P = self._build_redirect_P(full_gate_f32, kept_ids_dev)
+        self.redirect_P.data.copy_(P.to(device=target_device, dtype=target_dtype))
+
+        # Bookkeeping.
+        self.kept_expert_ids.copy_(
+            kept_ids.to(device=self.kept_expert_ids.device, dtype=self.kept_expert_ids.dtype)
+        )
         self._last_filled_ids = kept_ids.clone()
         return True
 
@@ -409,23 +424,32 @@ class PackedTopNSvdMoeBlock(nn.Module):
         bsz, seq_len, hidden = hidden_states.shape
         x = hidden_states.view(-1, hidden)  # [T, hidden]
 
+        # ---- routing: target-faithful top_k softmax over all experts, then
+        # redirect each expert's mass to its assigned kept-cluster slot.
+        # Done in fp32 to match Qwen3's reference router (numerical parity).
+        all_logits = F.linear(x, self.full_gate_weight)                  # [T, num_experts]
+        all_logits_f32 = all_logits.to(torch.float32)
+        topk_vals, topk_idx = torch.topk(all_logits_f32, k=self.target_top_k, dim=-1)
+        masked = torch.full_like(all_logits_f32, float("-inf"))
+        masked.scatter_(-1, topk_idx, topk_vals)
+        all_weights = F.softmax(masked, dim=-1).to(x.dtype)              # [T, num_experts]
+        kept_weights = all_weights @ self.redirect_P                     # [T, top_n]
+
         # ---- gate / up: shared input basis, per-expert U ----
-        vh_x = F.linear(x, self.vh_shared)  # [T, rank_up]
-        # Broadcast batched matmul: vh_x @ u_packed_eᵀ for every expert e.
-        gate_up = torch.matmul(vh_x, self.u_packed.transpose(-2, -1))  # [top_n, T, 2*intermediate]
+        vh_x = F.linear(x, self.vh_shared)                               # [T, rank_up]
+        gate_up = torch.matmul(vh_x, self.u_packed.transpose(-2, -1))    # [top_n, T, 2*im]
         gate, up = gate_up.chunk(2, dim=-1)
-        interm = self.act_fn(gate) * up  # [top_n, T, intermediate]
+        interm = self.act_fn(gate) * up                                  # [top_n, T, im]
 
         # ---- down: per-expert input basis, shared output basis ----
-        # Per-expert input projection: interm @ down_vh_packed_eᵀ.
         proj = torch.matmul(interm, self.down_vh_packed.transpose(-2, -1))  # [top_n, T, rank_down]
 
-        # Average across experts at the low-rank stage. Because
-        # `down_u_shared` is linear, mean(down_u @ proj_e) == down_u @ mean(proj_e),
-        # which lets us defer the expensive `[hidden, rank_down]` matmul to once.
-        proj_mean = proj.mean(dim=0)  # [T, rank_down]
-
-        final = F.linear(proj_mean, self.down_u_shared)  # [T, hidden]
+        # Routed-mixture: kept_weights[t, e] · proj[e, t, :], summed over e.
+        # `down_u_shared` is linear and shared, so we defer it to once after
+        # the mixture (mathematically identical, ~`top_n`× cheaper).
+        w = kept_weights.transpose(0, 1).unsqueeze(-1)                   # [top_n, T, 1]
+        proj_mix = (w * proj).sum(dim=0)                                 # [T, rank_down]
+        final = F.linear(proj_mix, self.down_u_shared)                   # [T, hidden]
         return final.view(bsz, seq_len, hidden)
 
 
@@ -452,20 +476,30 @@ def apply_packed_topn_svd_structure(
 ) -> int:
     """Swap every `Qwen3MoeSparseMoeBlock` in `model` for a `PackedTopNSvdMoeBlock`.
 
-    Tensors are filled with random numbers (step 1). Returns the number of
-    blocks replaced. `rank_down` controls the SVD rank used for the down
-    projection; if not given it defaults to `rank` (same as gate/up).
+    Tensors are filled with random numbers; routing buffers are zero. The
+    real fill happens at generate-time via `materialize_from_target` once
+    the kept set is picked.
+
+    `rank_down` controls the SVD rank used for the down projection; if not
+    given it defaults to `rank` (same as gate/up).
+
+    Returns the number of blocks replaced.
     """
     replaced = 0
     for name, module in list(model.named_modules()):
         if not _is_qwen3_moe_block(module):
             continue
 
-        # Read original shapes from the existing block so the replacement
-        # stays a true drop-in regardless of the model variant.
+        # Read original shapes / top_k from the existing block so the
+        # replacement stays a true drop-in regardless of model variant.
         sample_expert = module.experts[0]
-        hidden_size = int(getattr(sample_expert, "hidden_size", sample_expert.gate_proj.in_features))
-        intermediate_size = int(getattr(sample_expert, "intermediate_size", sample_expert.gate_proj.out_features))
+        hidden_size = int(
+            getattr(sample_expert, "hidden_size", sample_expert.gate_proj.in_features)
+        )
+        intermediate_size = int(
+            getattr(sample_expert, "intermediate_size", sample_expert.gate_proj.out_features)
+        )
+        target_top_k = int(getattr(module, "top_k"))
 
         block_dtype = dtype if dtype is not None else next(module.parameters()).dtype
         block_device = device if device is not None else next(module.parameters()).device
@@ -479,14 +513,15 @@ def apply_packed_topn_svd_structure(
             rank_down=rank_down,
             dtype=block_dtype,
             device=block_device,
-            hidden_act=model.config.hidden_act
+            hidden_act=model.config.hidden_act,
+            target_top_k=target_top_k,
         )
 
         _set_module_by_name(model, name, new_block)
         replaced += 1
 
     logging.info(
-        "[Packed-MoE-TopN-SVD] Replaced %d MoE blocks (top_n=%d, rank_up=%d, rank_down=%s, random init).",
+        "[Packed-MoE-TopN-SVD] Replaced %d MoE blocks (top_n=%d, rank_up=%d, rank_down=%s).",
         replaced,
         int(top_n),
         int(rank),
