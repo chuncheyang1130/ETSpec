@@ -12,6 +12,9 @@ _DEFAULTS: Dict[str, Any] = {
     "rank": 1560,
     "rank_down": None,
     "svd_device": "cuda:0",
+    # Per-verification expert-usage logging (off by default).
+    "log_expert_usage": False,
+    "expert_usage_log_path": None,
 }
 
 

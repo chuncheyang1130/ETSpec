@@ -17,15 +17,22 @@ recipe:
       # How many experts to keep per MoE layer (out of `num_experts` in the
       # target). The block always runs all `top_n` experts in parallel; the
       # router decides how to weight them per token.
-      top_n: 16
+      top_n: 32
       # SVD rank for the gate/up factorization. Capped to `min(rank, hidden)`
       # internally — values above hidden don't add capacity.
       rank: 2048
       # Optional separate rank for the down factorization. Defaults to `rank`.
       # rank_down: 1560
       svd_device: cuda:0
+      # Per-verification expert-usage logging. When enabled, every SD round
+      # snapshots the target's per-expert hit-count delta for that round's
+      # tree, compares it against the draft's currently-kept top-N, and
+      # prints a one-line coverage/churn summary. If `expert_usage_log_path`
+      # is set, a richer per-round JSONL record is appended there.
+      log_expert_usage: false
+      expert_usage_log_path: ./logs/expert_usage.jsonl
 
-max_length: 2048
+max_length: 512
 cache_implementation:
   target: static
   draft: static
@@ -47,11 +54,11 @@ temperature: 0
 generator_profiling: true
 
 generator_kwargs:
-  prefill_chunk_size: 2048
+  prefill_chunk_size: 512
   verify_method: exact
   verify_kwargs: {}
 
 draft_params:
-  temperature: 1.0
-  max_depth: 5
-  topk_len: 8
+  temperature: 0.2
+  max_depth: 6
+  topk_len: 3
