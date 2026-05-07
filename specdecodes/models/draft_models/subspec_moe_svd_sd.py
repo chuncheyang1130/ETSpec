@@ -1,70 +1,41 @@
 """Draft model for MoE TopN-SVD speculative decoding.
 
-The draft is built as a `share_param_deepcopy` of the target so that all
-non-MoE submodules (attention, embeddings, layernorms, lm_head) reuse the
-target's parameters directly. The recipe's `MoETopNSVDFactorizer` then runs
-at build time and replaces every `Qwen3MoeSparseMoeBlock` with a
-`PackedTopNSvdMoeBlock` (random init for the packed tensors, zero init for
-the routing buffers).
+Subclass of `MoeTopNSubsetSDDraftModel`. The full-rank base owns the
+build-time `share_param_deepcopy` of the target. This subclass adds the
+two SVD-specific bits:
 
-At generate time, the generator picks per-layer kept expert ids from the
-target's tracked usage and calls `materialize_kept_from_target`, which
-SVD-fills the packed tensors and refreshes each block's full target
-router + cluster-mass redirect from the target's experts.
+  * `topn_svd_config` — the recipe (`recipes.factorize.moe_topn_svd_*`)
+    stashes its config dict here; the matching generator
+    (`MoESvdSDGenerator`) reads it back.
+  * `materialize_kept_from_target(..., svd_device=...)` — forwards the
+    SVD compute device down to each block's `materialize_from_target`,
+    where `PackedTopNSvdMoeBlock._materialize_expert_weights` runs the
+    actual shared-basis SVD decomposition.
+
+The isinstance walk in the base method matches `PackedTopNSvdMoeBlock`
+too (it subclasses `PackedTopNMoeBlock`), so we only need to override
+the call site to thread `svd_device` through.
 """
 
-from copy import deepcopy
 from typing import Any, Dict, Optional
 
 import torch
 
-from specdecodes.models.utils.moe.qwen3_moe_topn_svd import PackedTopNSvdMoeBlock
+from specdecodes.models.utils.moe.qwen3_moe_topn import PackedTopNMoeBlock
 
-from .classic_sd import ClassicSDDraftModel
-from .subspec_sd import SubSpecSDDraftModel
-
-
-def share_param_deepcopy(model: torch.nn.Module) -> torch.nn.Module:
-    """Deep-copy a module while aliasing every Parameter and buffer to the original."""
-    memo: Dict[int, Any] = {}
-    for _, param in model.named_parameters():
-        memo[id(param)] = param
-    for _, buf in model.named_buffers():
-        memo[id(buf)] = buf
-    return deepcopy(model, memo=memo)
+from .subspec_moe_topn_sd import MoeTopNSubsetSDDraftModel
 
 
-class MoESvdSDDraftModel(SubSpecSDDraftModel):
+class MoESvdSDDraftModel(MoeTopNSubsetSDDraftModel):
     """Draft that shares params with the target and has its MoE blocks
     replaced (at build time) by `PackedTopNSvdMoeBlock` instances."""
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path=None,
-        *model_args,
-        target_model=None,
-        torch_dtype=torch.float32,
-        **model_kwargs,
-    ):
-        # AutoModelForCausalLM doesn't take these.
-        eos_token_id = model_kwargs.pop("eos_token_id", None)
-        model_kwargs.pop("device_map", None)
-
-        base_model = share_param_deepcopy(target_model)
-        model = cls(
-            base_model=base_model,
-            eos_token_id=eos_token_id,
-            *model_args,
-            **model_kwargs,
-        )
-        model.to(dtype=torch_dtype)
-        return model
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Filled in by the recipe (see helpers.recipes.factorize.moe_topn_svd).
-        self.topn_svd_config: Optional[Dict[str, Any]] = getattr(self, "topn_svd_config", None)
+        # Filled in by the SVD recipe via setattr after construction.
+        self.topn_svd_config: Optional[Dict[str, Any]] = getattr(
+            self, "topn_svd_config", None
+        )
 
     @torch.no_grad()
     def materialize_kept_from_target(
@@ -75,20 +46,14 @@ class MoESvdSDDraftModel(SubSpecSDDraftModel):
     ) -> int:
         """SVD-fill each `PackedTopNSvdMoeBlock` from the matching target block.
 
-        For each draft block whose name appears in `kept_ids_per_layer`, look
-        up the same-named module on `target_model`, take its `top_n` experts
-        at the kept ids, and run shared-basis SVDs to fill the draft's
-        packed tensors (`vh_shared`, `u_packed`, `down_u_shared`,
-        `down_vh_packed`).
-
-        Per-block calls are cached on the kept set; layers whose kept set
-        matched the previous call are no-ops.
-
-        Returns the number of blocks that were actually rebuilt this call.
+        Same walk as the base, but threads `svd_device` (where the SVD math
+        runs — the kept experts' weights are moved here, decomposed, then
+        the resulting factors are written back to the draft's device) into
+        `materialize_from_target`.
         """
         rebuilt = 0
         for name, dmod in self.model.named_modules():
-            if not isinstance(dmod, PackedTopNSvdMoeBlock):
+            if not isinstance(dmod, PackedTopNMoeBlock):
                 continue
             kept = kept_ids_per_layer.get(name)
             if kept is None:

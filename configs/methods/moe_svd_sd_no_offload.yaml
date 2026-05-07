@@ -10,27 +10,11 @@ llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
 
 device: cuda:0
 
+# Recipe takes no kwargs — fixed config lives in `_DEFAULTS` on the class.
+# To tune `top_n` / `rank` / `svd_device` / expert-usage logging, edit the
+# recipe (or subclass it).
 recipe:
   class_path: specdecodes.helpers.recipes.factorize.moe_topn_svd_no_offload:Recipe
-  kwargs:
-    topn_svd_config:
-      # How many experts to keep per MoE layer (out of `num_experts` in the
-      # target). The block always runs all `top_n` experts in parallel; the
-      # router decides how to weight them per token.
-      top_n: 32
-      # SVD rank for the gate/up factorization. Capped to `min(rank, hidden)`
-      # internally — values above hidden don't add capacity.
-      rank: 2048
-      # Optional separate rank for the down factorization. Defaults to `rank`.
-      # rank_down: 1560
-      svd_device: cuda:0
-      # Per-verification expert-usage logging. When enabled, every SD round
-      # snapshots the target's per-expert hit-count delta for that round's
-      # tree, compares it against the draft's currently-kept top-N, and
-      # prints a one-line coverage/churn summary. If `expert_usage_log_path`
-      # is set, a richer per-round JSONL record is appended there.
-      log_expert_usage: false
-      expert_usage_log_path: ./logs/expert_usage.jsonl
 
 max_length: 512
 cache_implementation:

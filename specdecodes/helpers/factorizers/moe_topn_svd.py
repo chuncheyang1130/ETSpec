@@ -5,6 +5,10 @@ with random-initialized packed tensors) at build time. The actual SVD-fill —
 deriving `vh_shared` / `u_packed` / `down_vh_packed` / `down_u_shared` from
 the target's expert weights, optionally guided by usage statistics — is a
 later step.
+
+`MoETopNSVDFactorizer` extends `MoETopNFactorizer` (the no-SVD base) by
+adding the `rank` / `rank_down` parameters and dispatching to the SVD
+structure-swap helper.
 """
 
 from __future__ import annotations
@@ -15,8 +19,10 @@ import torch.nn as nn
 
 from specdecodes.models.utils.moe.qwen3_moe_topn_svd import apply_packed_topn_svd_structure
 
+from .moe_topn import MoETopNFactorizer
 
-class MoETopNSVDFactorizer:
+
+class MoETopNSVDFactorizer(MoETopNFactorizer):
     """Replace each Qwen3-MoE block in the draft with a PackedTopNSvdMoeBlock."""
 
     @classmethod

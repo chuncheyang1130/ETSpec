@@ -475,24 +475,6 @@ def register_presets():
     except ImportError:
         pass
     
-    # MoE SD
-    try:
-        from specdecodes.models.generators.moe_sd import MoESpecSDGenerator
-        from specdecodes.models.draft_models.moe_sd import MoESpecSDDraftModel
-        from specdecodes.helpers.recipes.factorize.svd import Recipe as MoESDRecipe
-
-        ModelRegistry.register(
-            name="moe_sd",
-            generator_cls=MoESpecSDGenerator,
-            draft_model_cls=MoESpecSDDraftModel,
-            default_config={
-                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "recipe": MoESDRecipe(),
-            }
-        )
-    except ImportError:
-        pass
-
     # MoE SVD SD: top-N expert tracking + SVD-compressed draft
     try:
         from specdecodes.models.generators.subspec_moe_svd_sd import MoESvdSDGenerator
@@ -506,6 +488,27 @@ def register_presets():
             default_config={
                 "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                 "recipe": MoESvdSDRecipe(),
+            },
+            needs_draft_kv_cache=False,
+        )
+    except ImportError:
+        pass
+
+    # MoE TopN-Subset SD: top-N expert tracking, full-rank kept experts (no SVD)
+    try:
+        from specdecodes.models.generators.subspec_moe_topn_sd import MoeTopNSubsetSDGenerator
+        from specdecodes.models.draft_models.subspec_moe_topn_sd import MoeTopNSubsetSDDraftModel
+        from specdecodes.helpers.recipes.moe.moe_topn_no_offload import (
+            Recipe as MoeTopNSubsetRecipe,
+        )
+
+        ModelRegistry.register(
+            name="moe_topn_subset_sd",
+            generator_cls=MoeTopNSubsetSDGenerator,
+            draft_model_cls=MoeTopNSubsetSDDraftModel,
+            default_config={
+                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "recipe": MoeTopNSubsetRecipe(),
             },
             needs_draft_kv_cache=False,
         )
