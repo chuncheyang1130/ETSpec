@@ -477,12 +477,12 @@ def register_presets():
     
     # MoE SVD SD: top-N expert tracking + SVD-compressed draft
     try:
-        from specdecodes.models.generators.subspec_moe_svd_sd import MoESvdSDGenerator
-        from specdecodes.models.draft_models.subspec_moe_svd_sd import MoESvdSDDraftModel
+        from specdecodes.models.generators.subspec_moe_topn_svd_sd import MoESvdSDGenerator
+        from specdecodes.models.draft_models.subspec_moe_topn_svd_sd import MoESvdSDDraftModel
         from specdecodes.helpers.recipes.factorize.moe_topn_svd_no_offload import Recipe as MoESvdSDRecipe
 
         ModelRegistry.register(
-            name="moe_svd_sd",
+            name="moe_topn_svd_sd",
             generator_cls=MoESvdSDGenerator,
             draft_model_cls=MoESvdSDDraftModel,
             default_config={
@@ -503,7 +503,7 @@ def register_presets():
         )
 
         ModelRegistry.register(
-            name="moe_topn_subset_sd",
+            name="moe_topn_sd",
             generator_cls=MoeTopNSubsetSDGenerator,
             draft_model_cls=MoeTopNSubsetSDDraftModel,
             default_config={
