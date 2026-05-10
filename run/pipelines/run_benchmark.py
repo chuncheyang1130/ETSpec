@@ -8,7 +8,7 @@ import logging
 from tqdm import tqdm
 
 from .benchmarks.registry import load_dataset, validate_benchmarks
-from .benchmarks.utils.eval import run_common_eval, run_mtbench_eval
+from .benchmarks.evaluation.eval import run_common_eval, run_mtbench_eval
 from .utils.benchmark_utils import reset_seeds, cleanup_gpu, setup_benchmark_dir
 
 BENCHMARK_EVALUATORS = {
