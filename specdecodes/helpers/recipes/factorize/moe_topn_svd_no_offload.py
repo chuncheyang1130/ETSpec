@@ -24,7 +24,7 @@ class Recipe(MoeTopNRecipe):
         self, target_model, draft_model, max_length, cpu_offload_gb, dtype, device
     ):
         cfg = {
-            "top_n": 16,
+            "top_n": 32,
             "rank": 1560,
             "rank_down": 1560,
             "svd_device": "cuda:0",

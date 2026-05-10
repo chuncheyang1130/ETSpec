@@ -62,7 +62,7 @@ class Recipe(BaseRecipe):
         self, target_model, draft_model, max_length, cpu_offload_gb, dtype, device
     ):
         cfg = {
-            "top_n": 16,  # Default value
+            "top_n": 32,  # Default value
             "log_expert_usage": False,
             "expert_usage_log_path": None,
         }
