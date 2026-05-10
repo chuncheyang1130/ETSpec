@@ -44,6 +44,6 @@ generator_kwargs:
   verify_kwargs: {}
 
 draft_params:
-  temperature: 0.2
-  max_depth: 6
-  topk_len: 3
+  temperature: 1.0
+  max_depth: 16
+  topk_len: 6
