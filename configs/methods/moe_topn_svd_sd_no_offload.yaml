@@ -16,7 +16,7 @@ device: cuda:0
 recipe:
   class_path: specdecodes.helpers.recipes.factorize.moe_topn_svd_no_offload:Recipe
 
-max_length: 512
+max_length: 2048
 cache_implementation:
   target: static
   draft: static
@@ -38,11 +38,11 @@ temperature: 0
 generator_profiling: true
 
 generator_kwargs:
-  prefill_chunk_size: 512
+  prefill_chunk_size: 2048
   verify_method: exact
   verify_kwargs: {}
 
 draft_params:
-  temperature: 0.2
-  max_depth: 6
-  topk_len: 3
+  temperature: 1.0
+  max_depth: 8
+  topk_len: 6
