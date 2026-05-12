@@ -515,6 +515,31 @@ def register_presets():
     except ImportError:
         pass
 
+    # MoE TopN-SoftFit SD: mass-weighted picker + soft top-K weight-space redirect (no SVD)
+    try:
+        from specdecodes.models.generators.subspec_moe_topn_softfit_sd import (
+            MoeTopNSoftFitSDGenerator,
+        )
+        from specdecodes.models.draft_models.subspec_moe_topn_softfit_sd import (
+            MoeTopNSoftFitSDDraftModel,
+        )
+        from specdecodes.helpers.recipes.moe.moe_topn_softfit_no_offload import (
+            Recipe as MoeTopNSoftFitRecipe,
+        )
+
+        ModelRegistry.register(
+            name="moe_topn_softfit_sd",
+            generator_cls=MoeTopNSoftFitSDGenerator,
+            draft_model_cls=MoeTopNSoftFitSDDraftModel,
+            default_config={
+                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "recipe": MoeTopNSoftFitRecipe(),
+            },
+            needs_draft_kv_cache=False,
+        )
+    except ImportError:
+        pass
+
     # Vanilla Quant
     try:
         ModelRegistry.register(
