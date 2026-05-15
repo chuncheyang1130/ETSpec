@@ -1,0 +1,28 @@
+# SubSpec SD (v1) without offloading (HQQ quantization only)
+method: subspec_svd_sd_no_offload
+
+llm_path: meta-llama/Llama-3.1-8B-Instruct
+
+recipe:
+  class_path: specdecodes.helpers.recipes.subspec.hqq_4bit_svd_no_offload:Recipe
+
+max_length: 2048
+cache_implementation: static
+warmup_iter: 1
+compile_mode: max-autotune
+
+# Target sampling settings (defaults)
+do_sample: false
+temperature: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 2048
+  verify_method: exact
+  verify_kwargs: {}
+
+draft_params:
+  temperature: 1.0
+  max_depth: 5
+  topk_len: 8

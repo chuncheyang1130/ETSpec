@@ -1,0 +1,49 @@
+# MoE Top-N Expert Subset SD (full rank, no SVD, no offload).
+#
+# Track expert usage on the target across the whole generation, pick the
+# top-N most-used experts per MoE layer, and copy those experts at full
+# rank into a packed draft block. Routing uses the target's full router
+# with cluster-mass redirect from dropped experts onto the kept set
+# (cosine-similarity nearest neighbour in router space).
+#
+# This is the no-SVD sibling of `moe_svd_sd_no_offload.yaml`: same picker /
+# tracker / refresh loop, but kept experts run at full rank.
+method: moe_topn_sd
+
+llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+device: cuda:0
+
+# Recipe takes no kwargs — fixed config lives in `_DEFAULTS` on the class.
+# To tune `top_n` or expert-usage logging, edit the recipe (or subclass it).
+recipe:
+  class_path: specdecodes.helpers.recipes.moe.moe_topn_no_offload:Recipe
+
+max_length: 2048
+cache_implementation:
+  target: static
+  draft: static
+
+warmup_iter: 1
+# `materialize_kept_from_target` swaps tensor *values* between rounds
+# (never shapes), so the draft's compile graph stays valid. The tracker
+# hook reruns the target router in eager mode, so don't compile target.
+compile_mode:
+  target: null
+  draft: max-autotune
+
+# Target sampling settings (defaults).
+do_sample: false
+temperature: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 2048
+  verify_method: exact
+  verify_kwargs: {}
+
+draft_params:
+  temperature: 1.0
+  max_depth: 16
+  topk_len: 6

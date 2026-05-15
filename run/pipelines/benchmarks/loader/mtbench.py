@@ -6,6 +6,6 @@ QUERY_TEMPLATE = """
 
 # MTBENCH
 def load_mtbench_dataset():
-    with open("run/pipelines/benchmarks/data/mt_bench.jsonl") as f:
+    with open("run/pipelines/benchmarks/loader/data/mt_bench.jsonl") as f:
         dataset = [json.loads(line)['turns'] for line in f]  # list of list of prompts
     return dataset

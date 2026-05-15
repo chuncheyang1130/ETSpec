@@ -157,7 +157,11 @@ def load_dataset(
         List of dataset items
     """
     loader = get_loader(bench_name)
-    dataset = loader(query_version=query_version)
+    
+    if bench_name == "mt-bench":
+        dataset = loader()
+    else:
+        dataset = loader(query_version=query_version)
     
     if shuffle:
         random.seed(seed)

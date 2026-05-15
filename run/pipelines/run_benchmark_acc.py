@@ -14,6 +14,7 @@ from .utils.benchmark_utils import reset_seeds, cleanup_gpu, setup_benchmark_dir
 BENCHMARK_EVALUATORS = {
     "gsm8k": run_math_eval,
     "aime": run_math_eval,
+    "math-500": run_math_eval,
     "human-eval": run_code_eval,
     "mbpp": run_code_eval,
     "livecodebench": run_livecodebench_eval,

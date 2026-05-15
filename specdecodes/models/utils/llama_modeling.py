@@ -2,7 +2,7 @@ import transformers
 import logging
 import nvtx
 
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from transformers import LlamaConfig
@@ -162,3 +162,33 @@ class nvtx_LlamaMLP(nn.Module):
         with nvtx.annotate("mlp forward", color="green"):
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
+    
+
+class SVD_LlamaMLP(nn.Module):
+    def __init__(
+        self,
+        orig_mlp: nn.Module,
+        u_gate_up_weight: torch.Tensor,
+        vh_gate_up_weight: torch.Tensor,
+    ):
+        super().__init__()
+        # Same setting with original MLP
+        self.config = orig_mlp.config
+        self.hidden_size = self.config.hidden_size
+        self.intermediate_size = self.config.intermediate_size
+        self.down_proj = orig_mlp.down_proj
+        self.act_fn = orig_mlp.act_fn
+        
+        # SVD
+        low_rank_size = u_gate_up_weight.shape[1]
+        self.u_gate_up_proj = nn.Linear(low_rank_size, self.intermediate_size * 2, bias=self.config.mlp_bias)
+        self.vh_gate_up_proj = nn.Linear(self.hidden_size, low_rank_size, bias=self.config.mlp_bias)
+
+        # Tie new weight to projection layer
+        self.u_gate_up_proj.weight = nn.Parameter(u_gate_up_weight)
+        self.vh_gate_up_proj.weight = nn.Parameter(vh_gate_up_weight)
+        
+    def forward(self, x: torch.Tensor):
+        vh_proj = self.vh_gate_up_proj(x)
+        gate, up = self.u_gate_up_proj(vh_proj).chunk(2, dim=-1)
+        return self.down_proj(self.act_fn(gate) * up)
