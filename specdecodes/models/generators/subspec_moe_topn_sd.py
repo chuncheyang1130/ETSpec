@@ -94,6 +94,17 @@ class MoeTopNSubsetSDGeneratorBase(ClassicSDGeneratorBase):
         install_expert_usage_tracker(self.target_model)
         setattr(self, _TRACKER_INSTALLED, True)
 
+    def init_cuda_graph_runner(self, device, kvCachePool=None):
+        """Forward CUDA-graph capture to the draft, if it supports one.
+
+        Called by `run.pipelines.utils.eval_utils.maybe_init_cuda_graph_runner`
+        after warmup. No-op for drafts that don't expose the hook (e.g. the
+        plain `MoeTopNSubsetSDDraftModel`).
+        """
+        fn = getattr(self.draft_model, "init_cuda_graph_runner", None)
+        if callable(fn):
+            fn(device=device)
+
     def _topn(self) -> int:
         return int(self._config().get("top_n", 32))
 
@@ -432,6 +443,9 @@ class MoeTopNSubsetSDGeneratorBase(ClassicSDGeneratorBase):
                         sampled_tokens=sampled_tokens,
                         stopping_criteria=stopping_criteria,
                     )
+                    
+                    if len(input_ids[0]) >= 128:
+                        finished = True
                 if kept.numel() > 0:
                     self._maybe_stream(stream_callback, kept)
 

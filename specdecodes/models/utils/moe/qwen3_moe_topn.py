@@ -22,12 +22,11 @@ plumbing:
     _expert_forward(x, kept_weights)
 
 Layout (per layer, full-rank base):
-    gate_proj_packed : [top_n, intermediate, hidden]
-    up_proj_packed   : [top_n, intermediate, hidden]
-    down_proj_packed : [top_n, hidden, intermediate]
-    full_gate_weight : [num_experts, hidden]                 # copied from target.gate
-    redirect_P       : [num_experts, top_n]                  # cosine-NN one-hot redirect
-    kept_expert_ids  : [top_n]                               # local-slot -> original-id
+    gate_up_proj_packed : [top_n, 2 * intermediate, hidden]  # gate rows stacked over up rows
+    down_proj_packed    : [top_n, hidden, intermediate]
+    full_gate_weight    : [num_experts, hidden]              # copied from target.gate
+    redirect_P          : [num_experts, top_n]               # cosine-NN one-hot redirect
+    kept_expert_ids     : [top_n]                            # local-slot -> original-id
 
 Forward (top_k matches target's `top_k`):
     all_logits  = x @ full_gate_weight^T                     # [T, num_experts]
@@ -35,9 +34,9 @@ Forward (top_k matches target's `top_k`):
     all_w       = softmax(kept_logits)                       # zeros outside top_k
     kept_w      = all_w @ redirect_P                         # [T, top_n], rows sum to 1
 
-    gate   = x @ gate_proj_packed^T                          # [top_n, T, im]
-    up     = x @ up_proj_packed^T                            # [top_n, T, im]
-    interm = silu(gate) * up                                 # [top_n, T, im]
+    gate_up   = x @ gate_up_proj_packed^T                    # [top_n, T, 2*im]
+    gate, up  = chunk(gate_up, 2, -1)                        # each [top_n, T, im]
+    interm    = silu(gate) * up                              # [top_n, T, im]
 
     proj   = interm @ down_proj_packed^T                     # [top_n, T, hidden]
     w      = kept_w^T.unsqueeze(-1)                          # [top_n, T, 1]
@@ -225,15 +224,20 @@ class PackedTopNMoeBlock(nn.Module):
     # ----- template hooks (overridable) -----
 
     def _init_expert_weights(self, dtype: torch.dtype, device: torch.device | str) -> None:
-        """Allocate the per-expert weight Parameters. Override for SVD/etc."""
-        self.gate_proj_packed = nn.Parameter(
+        """Allocate the per-expert weight Parameters. Override for SVD/etc.
+
+        Gate and up are packed into a single `[top_n, 2*intermediate, hidden]`
+        tensor (gate rows over up rows) so the forward can fuse them into one
+        matmul + chunk — same FLOPs, half the kernel launches, and `x` is
+        read from HBM once instead of twice.
+        """
+        self.gate_up_proj_packed = nn.Parameter(
             torch.empty(
-                self.top_n, self.intermediate_size, self.hidden_size, dtype=dtype, device=device
-            )
-        )
-        self.up_proj_packed = nn.Parameter(
-            torch.empty(
-                self.top_n, self.intermediate_size, self.hidden_size, dtype=dtype, device=device
+                self.top_n,
+                2 * self.intermediate_size,
+                self.hidden_size,
+                dtype=dtype,
+                device=device,
             )
         )
         self.down_proj_packed = nn.Parameter(
@@ -253,11 +257,11 @@ class PackedTopNMoeBlock(nn.Module):
             nn.init.normal_(p, std=0.02)
 
     def _packed_expert_parameters(self) -> List[nn.Parameter]:
-        return [self.gate_proj_packed, self.up_proj_packed, self.down_proj_packed]
+        return [self.gate_up_proj_packed, self.down_proj_packed]
 
     def _reference_param(self) -> torch.Tensor:
         """Parameter used to read target dtype/device for materialize/forward."""
-        return self.gate_proj_packed
+        return self.gate_up_proj_packed
 
     @torch.no_grad()
     def _materialize_expert_weights(
@@ -276,12 +280,14 @@ class PackedTopNMoeBlock(nn.Module):
         rest of the materialize and report False so the picker can retry).
         """
         del svd_device  # unused on the no-SVD path
+        im = self.intermediate_size
         for slot, eid in enumerate(kept_ids.tolist()):
             expert = target_block.experts[int(eid)]
-            self.gate_proj_packed.data[slot].copy_(
+            # gate rows occupy [0, im); up rows occupy [im, 2*im).
+            self.gate_up_proj_packed.data[slot, :im].copy_(
                 expert.gate_proj.weight.to(device=target_device, dtype=target_dtype)
             )
-            self.up_proj_packed.data[slot].copy_(
+            self.gate_up_proj_packed.data[slot, im:].copy_(
                 expert.up_proj.weight.to(device=target_device, dtype=target_dtype)
             )
             self.down_proj_packed.data[slot].copy_(
@@ -294,8 +300,9 @@ class PackedTopNMoeBlock(nn.Module):
 
         Default: full-rank packed matmul. Override for SVD/etc.
         """
-        gate = torch.matmul(x, self.gate_proj_packed.transpose(-2, -1))  # [top_n, T, im]
-        up = torch.matmul(x, self.up_proj_packed.transpose(-2, -1))      # [top_n, T, im]
+        # Fused gate+up: one batched GEMM reads `x` from HBM once.
+        gate_up = torch.matmul(x, self.gate_up_proj_packed.transpose(-2, -1))  # [top_n, T, 2*im]
+        gate, up = gate_up.chunk(2, dim=-1)                              # each [top_n, T, im]
         interm = self.act_fn(gate) * up                                  # [top_n, T, im]
 
         proj = torch.matmul(interm, self.down_proj_packed.transpose(-2, -1))  # [top_n, T, hidden]

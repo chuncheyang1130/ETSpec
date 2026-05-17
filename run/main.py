@@ -346,6 +346,7 @@ def _maybe_reexec_with_nsys(enabled: bool, output: str) -> None:
         "--python-sampling=true",
         "--cuda-memory-usage=true",
         "--gpuctxsw=true",
+        "--cuda-graph-trace=node",
         "-x",
         "true",
         "-o",

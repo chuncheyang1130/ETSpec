@@ -523,6 +523,9 @@ def register_presets():
         from specdecodes.models.draft_models.subspec_moe_topn_softfit_sd import (
             MoeTopNSoftFitSDDraftModel,
         )
+        from specdecodes.models.draft_models.subspec_moe_topn_sd_cg import (
+            MoeTopNSoftFitSDCgDraftModel,
+        )
         from specdecodes.helpers.recipes.moe.moe_topn_softfit_no_offload import (
             Recipe as MoeTopNSoftFitRecipe,
         )
@@ -530,7 +533,7 @@ def register_presets():
         ModelRegistry.register(
             name="moe_topn_softfit_sd",
             generator_cls=MoeTopNSoftFitSDGenerator,
-            draft_model_cls=MoeTopNSoftFitSDDraftModel,
+            draft_model_cls=MoeTopNSoftFitSDCgDraftModel,
             default_config={
                 "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                 "recipe": MoeTopNSoftFitRecipe(),

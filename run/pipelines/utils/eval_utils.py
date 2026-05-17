@@ -35,6 +35,6 @@ def maybe_init_cuda_graph_runner(
         )
         return
 
-    logger.info("Initializing CUDA Graph runner (FlashInfer).")
+    logger.info("Initializing CUDA Graph runner.")
     init_fn(device)
     reset_kv(past_key_values, draft_past_key_values)

@@ -96,6 +96,13 @@ def _run_warmup(
 
         reset_kv(past_key_values, draft_past_key_values)
 
+    # Optional CUDA-graph capture (idempotent across benches: the draft bails on
+    # re-entry while a graph is held). Runs after warmup so allocators / KV
+    # buffers have stabilized.
+    maybe_init_cuda_graph_runner(
+        generator, past_key_values, draft_past_key_values, args.device, n_iter
+    )
+
     generator.profiling = original_profiling
 
 
@@ -702,9 +709,6 @@ def run_longbench_eval(generator, tokenizer, past_key_values, draft_past_key_val
         max_new_tokens=max_new_tokens,
         show_progress=True,
     )
-
-    # Optional CUDA-graph capture for FlashInfer, after warmup (stabilizes kernels/allocations).
-    maybe_init_cuda_graph_runner(generator, past_key_values, draft_past_key_values, args.device, args.warmup_iter)
 
     log_file = os.path.join(log_dir, "0.jsonl")
     perf = _init_perf()
