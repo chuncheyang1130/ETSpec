@@ -308,6 +308,32 @@ class PackedTopNSoftFitMoeBlock(PackedTopNMoeBlock):
 
         return P
 
+    def _routing_weights(self, x: torch.Tensor) -> torch.Tensor:
+        """Sparse routing override — softmax-over-top_k + gather-mix.
+
+        Mathematically identical to the base's masked-softmax + dense
+        matmul, but skips materializing the [T, num_experts] sparse mask
+        and does (top_k * top_n) multiplies in the redirect instead of
+        (num_experts * top_n). On Qwen3-30B (num_experts=128, top_k=8,
+        top_n≈32) that's ~16× less compute on the redirect step plus
+        fewer kernel launches (7 → 4 in the routing chain).
+
+        Pipeline:
+          1. Router GEMM (unchanged — memory-bound on full_gate_weight).
+          2. top_k on fp32 logits.
+          3. Softmax on the top_k values directly (the -inf-scatter trick
+             produces the same result as softmaxing only the kept slots).
+          4. Gather the relevant rows of redirect_P at the top_k indices.
+          5. Weighted sum across k → [T, top_n].
+        """
+        all_logits = F.linear(x, self.full_gate_weight)                  # [T, num_experts]
+        topk_vals, topk_idx = torch.topk(
+            all_logits.to(torch.float32), k=self.target_top_k, dim=-1
+        )
+        topk_w = F.softmax(topk_vals, dim=-1).to(x.dtype)                # [T, top_k] sums to 1
+        gathered_P = self.redirect_P[topk_idx]                           # [T, top_k, top_n]
+        return (topk_w.unsqueeze(-1) * gathered_P).sum(dim=1)            # [T, top_n]
+
 
 # ---------------------------------------------------------------------------
 # Build-time replacement: full Qwen3MoeSparseMoeBlock -> PackedTopNSoftFitMoeBlock
