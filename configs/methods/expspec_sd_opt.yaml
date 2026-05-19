@@ -1,0 +1,53 @@
+# ExpSpec SD (Optimize) — top-N expert subset draft for Qwen3-MoE with
+# FP8 expert storage + CUDA-graph captured per-step tree forward.
+#
+# Differences vs `expspec_sd`:
+#   - FP8 (e4m3) weight storage via `MoETopNFP8Factorizer` (default
+#     recipe). bf16 silu/mul/output tail; bf16 intermediate to survive
+#     the wide range of unit-scale `bmm_fp8` outputs.
+#   - CG-captured draft tree-step forward via `ExpSpecSDCgDraftModel`
+#     (requires `warmup_iter > 0` and `cache_implementation.draft: static`).
+#
+# Important: requires `dtype: bfloat16`. fp16 saturates the unit-scale
+# bmm_fp8 intermediate to inf and the rescale step turns it into NaN
+# (see qwen3_moe_topn_fp8._expert_forward docstring).
+method: expspec_sd_opt
+
+llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+device: cuda:0
+dtype: bfloat16
+
+recipe:
+  class_path: specdecodes.helpers.recipes.moe.moe_topn_fp8:Recipe
+
+max_length: 2048
+cache_implementation:
+  target: static
+  draft: static
+
+warmup_iter: 1
+# `materialize_kept_from_target` swaps tensor values between rounds
+# (never shapes), so the draft's compile graph stays valid. The tracker
+# hook reruns the target router in eager mode, so leave target uncompiled.
+# Draft compile is off — the CG capture handles per-step optimization
+# and stacking torch.compile on top fights over allocator state.
+compile_mode:
+  target: null
+  draft: null
+
+# Target sampling settings (defaults).
+do_sample: false
+temperature: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 2048
+  verify_method: exact
+  verify_kwargs: {}
+
+draft_params:
+  temperature: 1.0
+  max_depth: 16
+  topk_len: 4

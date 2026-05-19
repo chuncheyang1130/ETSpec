@@ -1,17 +1,18 @@
-"""Draft model for MoE TopN-subset speculative decoding (no SVD).
+"""Draft model for ExpSpec — top-N expert subset speculative decoding (no SVD).
 
 Build time: the draft is constructed as a `share_param_deepcopy` of the
 target so that all non-MoE submodules (attention, embeddings, layernorms,
 lm_head) reuse the target's parameters directly. The recipe's
-`MoETopNFactorizer` then runs and replaces every `Qwen3MoeSparseMoeBlock`
-with a `PackedTopNMoeBlock` (random init for the packed tensors, zero
-init for the routing buffers).
+`MoETopNFactorizer` (or `MoETopNFP8Factorizer` for FP8 storage) then runs
+and replaces every `Qwen3MoeSparseMoeBlock` with a `PackedTopNMoeBlock`
+(or `PackedTopNFP8MoeBlock`) — random / empty init for the packed
+tensors, zero init for the routing buffers.
 
-Generate time: the generator (`MoeTopNSubsetSDGenerator`) picks per-layer
-kept expert ids from the target's tracked usage and calls
-`materialize_kept_from_target`, which copies the kept experts' full-rank
-weights from the target and refreshes each block's full target router +
-cluster-mass redirect.
+Generate time: the generator (`ExpSpecSDGenerator`) picks per-layer kept
+expert ids from the target's tracked routing mass and calls
+`materialize_kept_from_target`, which copies the kept experts' weights
+from the target and refreshes each block's full target router + soft
+top-K weight-space redirect.
 """
 
 from copy import deepcopy
@@ -34,7 +35,7 @@ def share_param_deepcopy(model: torch.nn.Module) -> torch.nn.Module:
     return deepcopy(model, memo=memo)
 
 
-class MoeTopNSubsetSDDraftModel(SubSpecSDDraftModel):
+class ExpSpecSDDraftModel(SubSpecSDDraftModel):
     """Draft that shares params with the target and has its MoE blocks
     replaced (at build time) by `PackedTopNMoeBlock` instances."""
 

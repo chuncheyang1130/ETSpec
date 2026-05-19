@@ -474,69 +474,49 @@ def register_presets():
         )
     except ImportError:
         pass
-    
-    # MoE SVD SD: top-N expert tracking + SVD-compressed draft
-    try:
-        from specdecodes.models.generators.subspec_moe_topn_svd_sd import MoESvdSDGenerator
-        from specdecodes.models.draft_models.subspec_moe_topn_svd_sd import MoESvdSDDraftModel
-        from specdecodes.helpers.recipes.factorize.moe_topn_svd_no_offload import Recipe as MoESvdSDRecipe
 
-        ModelRegistry.register(
-            name="moe_topn_svd_sd",
-            generator_cls=MoESvdSDGenerator,
-            draft_model_cls=MoESvdSDDraftModel,
-            default_config={
-                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "recipe": MoESvdSDRecipe(),
-            },
-            needs_draft_kv_cache=False,
-        )
-    except ImportError:
-        pass
-
-    # MoE TopN-Subset SD: top-N expert tracking, full-rank kept experts (no SVD)
+    # ExpSpec SD: top-N expert subset draft with mass-weighted picker +
+    # soft top-K weight-space redirect (no SVD). Eager draft.
     try:
-        from specdecodes.models.generators.subspec_moe_topn_sd import MoeTopNSubsetSDGenerator
-        from specdecodes.models.draft_models.subspec_moe_topn_sd import MoeTopNSubsetSDDraftModel
+        from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
+        from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
         from specdecodes.helpers.recipes.moe.moe_topn_no_offload import (
-            Recipe as MoeTopNSubsetRecipe,
+            Recipe as ExpSpecRecipe,
         )
 
         ModelRegistry.register(
-            name="moe_topn_sd",
-            generator_cls=MoeTopNSubsetSDGenerator,
-            draft_model_cls=MoeTopNSubsetSDDraftModel,
+            name="expspec_sd",
+            generator_cls=ExpSpecSDGenerator,
+            draft_model_cls=ExpSpecSDDraftModel,
             default_config={
                 "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "recipe": MoeTopNSubsetRecipe(),
+                "recipe": ExpSpecRecipe(),
             },
             needs_draft_kv_cache=False,
         )
     except ImportError:
         pass
 
-    # MoE TopN-SoftFit SD: mass-weighted picker + soft top-K weight-space redirect (no SVD)
+    # ExpSpec SD (Optimize): same draft as above plus a CUDA-graph captured
+    # per-step tree forward. Default recipe is FP8 (PackedTopNFP8MoeBlock);
+    # override `recipe.class_path` in the yaml to use the bf16 recipe if
+    # FP8 is unavailable on your stack.
     try:
-        from specdecodes.models.generators.subspec_moe_topn_softfit_sd import (
-            MoeTopNSoftFitSDGenerator,
+        from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
+        from specdecodes.models.draft_models.expspec_sd_opt import (
+            ExpSpecSDCgDraftModel,
         )
-        from specdecodes.models.draft_models.subspec_moe_topn_softfit_sd import (
-            MoeTopNSoftFitSDDraftModel,
-        )
-        from specdecodes.models.draft_models.subspec_moe_topn_sd_cg import (
-            MoeTopNSoftFitSDCgDraftModel,
-        )
-        from specdecodes.helpers.recipes.moe.moe_topn_softfit_no_offload import (
-            Recipe as MoeTopNSoftFitRecipe,
+        from specdecodes.helpers.recipes.moe.moe_topn_no_offload import (
+            Recipe as ExpSpecOptRecipe,
         )
 
         ModelRegistry.register(
-            name="moe_topn_softfit_sd",
-            generator_cls=MoeTopNSoftFitSDGenerator,
-            draft_model_cls=MoeTopNSoftFitSDCgDraftModel,
+            name="expspec_sd_opt",
+            generator_cls=ExpSpecSDGenerator,
+            draft_model_cls=ExpSpecSDCgDraftModel,
             default_config={
                 "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "recipe": MoeTopNSoftFitRecipe(),
+                "recipe": ExpSpecOptRecipe(),
             },
             needs_draft_kv_cache=False,
         )

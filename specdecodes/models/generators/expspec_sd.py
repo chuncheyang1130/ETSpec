@@ -1,32 +1,38 @@
-"""Generator for MoE TopN-subset speculative decoding (no SVD).
+"""Generator for ExpSpec — top-N expert subset speculative decoding (no SVD).
 
-This is the **base** generator of the MoE top-N family. The SVD variant
-(`subspec_moe_svd_sd.py`) inherits from it without overriding any
-behavior — `PackedTopNSvdMoeBlock` is a subclass of `PackedTopNMoeBlock`
-so the isinstance walks here pick up SVD blocks too.
+The draft runs only `top_n` experts per MoE layer (full rank). The kept
+subset is **dynamic**: it's repicked from the target's tracked routing
+mass at the start of each prompt (after prefill) and again after every
+verification round, so it follows the current generation's hot experts
+instead of being fixed at build time. Mass that the target would have
+spent on dropped experts is redistributed onto the kept set via a soft
+top-K weight-space redirect.
 
 Build time: the draft's MoE blocks are swapped for `PackedTopNMoeBlock`
-instances (random init).
+instances (random init). The FP8 sibling registers `PackedTopNFP8MoeBlock`
+via the same `_block_cls` isinstance walk, since it subclasses the base.
 
 Generate time:
-  1. Install a tracker on the target's MoE blocks that accumulates per-expert
-     hit counts across **all** target forwards (prefill + every round).
-     Counts are *not* reset between rounds — picks are denser and more
-     stable when drawn from cumulative usage than from a single tree.
-  2. After prefill, and again after every verification round, pick the top-N
-     most-activated experts per layer, then refresh each draft block's
-     packed tensors + routing buffers from the target's matching experts.
-     The per-block fill is cached on the kept set, so layers whose pick
-     didn't change pay nothing.
+  1. Install the mass-weighted tracker on the target's MoE blocks. It
+     scatter-adds the actual top-k softmax weights into a per-expert
+     mass accumulator (not bincount hit counts), so an expert that
+     handled a few high-confidence tokens outranks one that scraped many
+     low-confidence top-k slots. Mass accumulates across the whole
+     generation — *not* reset between rounds — so picks come from a
+     dense, stable distribution.
+  2. After prefill, and again after every verification round, pick the
+     top-N highest-mass experts per layer, then refresh each draft
+     block's packed tensors + routing buffers from the target's matching
+     experts. The per-block fill is cached on the kept set, so layers
+     whose pick didn't change pay nothing.
 
 Optional per-round expert-usage logging (gated by `log_expert_usage` in
-the recipe's config — `topn_subset_config` here, `topn_svd_config` in the
-SVD subclass; `_config_attr` decides which one): each verification round,
-snapshot the cumulative tracker delta (= what experts the target activated
-*for this round's tree*), compare against the kept set the draft was using,
-and report coverage / churn / top experts. A single-line console summary
-fires per round; a richer per-round record is appended to
-`expert_usage_log_path` (JSONL, one record per `_generate` call) for
+the recipe's config — `topn_subset_config` here): each verification
+round, snapshot the cumulative tracker delta (= what experts the target
+activated *for this round's tree*), compare against the kept set the
+draft was using, and report coverage / churn / top experts. A single-line
+console summary fires per round; a richer per-round record is appended
+to `expert_usage_log_path` (JSONL, one record per `_generate` call) for
 offline analysis.
 """
 
@@ -58,22 +64,21 @@ _TRACKER_INSTALLED = "_moe_topn_tracker_installed"
 _MAX_TOP_LOG = 16
 
 
-class MoeTopNSubsetSDGeneratorBase(ClassicSDGeneratorBase):
+class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
     """Top-N expert subset speculative-decoding generator (full-rank base).
 
-    Subclasses (e.g. the SVD variant) inherit the picker / tracker / refresh
-    / logging machinery as-is. The only thing they typically swap is the
-    draft block class — but because the SVD block subclasses the full-rank
-    block, even isinstance walks here transparently match both.
+    Subclasses (e.g. an FP8 storage variant) inherit the picker / tracker /
+    refresh / logging machinery as-is. The only thing they typically swap is
+    the draft block class — but because the FP8 block subclasses the
+    full-rank block, isinstance walks here transparently match both.
     """
 
     # Block class used by `_snapshot_kept_ids` to walk the draft's MoE
-    # layers. SVD subclass keeps this — `PackedTopNSvdMoeBlock` is a
+    # layers. FP8 subclass keeps this — `PackedTopNFP8MoeBlock` is a
     # subclass, so isinstance matches both flavors.
     _block_cls = PackedTopNMoeBlock
 
-    # Attribute on the draft model where the recipe stashes its config
-    # dict. SVD subclass overrides to `"topn_svd_config"`.
+    # Attribute on the draft model where the recipe stashes its config dict.
     _config_attr: str = "topn_subset_config"
 
     def _config(self) -> Dict[str, Any]:
@@ -99,7 +104,7 @@ class MoeTopNSubsetSDGeneratorBase(ClassicSDGeneratorBase):
 
         Called by `run.pipelines.utils.eval_utils.maybe_init_cuda_graph_runner`
         after warmup. No-op for drafts that don't expose the hook (e.g. the
-        plain `MoeTopNSubsetSDDraftModel`).
+        plain `ExpSpecSDDraftModel`).
         """
         fn = getattr(self.draft_model, "init_cuda_graph_runner", None)
         if callable(fn):
@@ -466,5 +471,5 @@ class MoeTopNSubsetSDGeneratorBase(ClassicSDGeneratorBase):
         return input_ids
 
 
-class MoeTopNSubsetSDGenerator(SDProfilingMixin, MoeTopNSubsetSDGeneratorBase):
+class ExpSpecSDGenerator(SDProfilingMixin, ExpSpecSDGeneratorBase):
     pass

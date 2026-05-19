@@ -1,6 +1,6 @@
-"""CUDA-graph capture variant of `MoeTopNSoftFitSDDraftModel`.
+"""CUDA-graph capture variant of `ExpSpecSDDraftModel`.
 
-Identical to the SoftFit base in build / materialize / routing — the only
+Identical to the eager base in build / materialize / routing — the only
 difference is the per-step tree forward. After `init_cuda_graph_runner`
 has been called, every `speculate_once` invocation copies fresh inputs
 into pre-allocated static buffers and replays the captured graph
@@ -9,14 +9,14 @@ instead of running eager. The prefill / first-speculate forward
 captured `[1, topk_len]` shape.
 
 The capture itself is block-agnostic: it just records `self(...)` once,
-so the SoftFit blocks' soft-redirect routing (via `redirect_P`) is
+so the packed top-N block's soft-redirect routing (via `redirect_P`) is
 captured along with the rest of the forward.
 
 Capture pre-conditions (caller's responsibility):
   * Draft `past_key_values` is set (`set_past_key_values`) and uses a
     **static** cache implementation with a known `max_cache_len`.
   * The draft has been materialized at least once (kept_ids picked,
-    packed expert tensors filled, SoftFit `redirect_P` built).
+    packed expert tensors filled, `redirect_P` built).
     `materialize_from_target` later only does in-place copies into the
     same Parameters (including `redirect_P`), so subsequent
     re-materialization does **not** invalidate the captured graph.
@@ -37,15 +37,15 @@ from __future__ import annotations
 import torch
 import nvtx
 
-from .subspec_moe_topn_softfit_sd import MoeTopNSoftFitSDDraftModel
+from .expspec_sd import ExpSpecSDDraftModel
 
 
-class MoeTopNSoftFitSDCgDraftModel(MoeTopNSoftFitSDDraftModel):
-    """SoftFit draft model whose tree-step forward is captured as a CUDA graph.
+class ExpSpecSDCgDraftModel(ExpSpecSDDraftModel):
+    """ExpSpec draft model whose tree-step forward is captured as a CUDA graph.
 
     Capture happens once via `init_cuda_graph_runner`; replay happens
-    inside `speculate_once`. Until capture, behavior is identical to
-    `MoeTopNSoftFitSDDraftModel`.
+    inside `speculate_once`. Until capture, behavior is identical to the
+    eager `ExpSpecSDDraftModel`.
     """
 
     def __init__(self, *args, **kwargs):
@@ -154,7 +154,7 @@ class MoeTopNSoftFitSDCgDraftModel(MoeTopNSoftFitSDDraftModel):
 
         self._cg_graph = cg
         print(
-            f"[moe-topn-softfit-cg] captured draft forward "
+            f"[expspec-cg] captured draft forward "
             f"(L={topk_len}, max_cache_len={max_cache_len}, dtype={mask_dtype})."
         )
 
