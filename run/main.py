@@ -246,6 +246,42 @@ def _normalize_cache_implementation(value):
 
 
 
+def _normalize_dtype(value):
+    """Resolve a yaml dtype value into the matching `torch.dtype` object.
+
+    YAML's `safe_load` returns strings, so a field like `dtype: bfloat16`
+    would otherwise land as a string and break downstream code that
+    expects a real `torch.dtype`. Accept the common spellings:
+      "bfloat16" / "bf16"
+      "float16"  / "fp16" / "half"
+      "float32"  / "fp32" / "float"
+    and the fully-qualified `torch.bfloat16` form (with or without the
+    `torch.` prefix). `None` and an already-resolved `torch.dtype` pass
+    through unchanged.
+    """
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(
+            f"dtype must be a string or torch.dtype, got {type(value).__name__}"
+        )
+    name = value.strip().lower()
+    if name.startswith("torch."):
+        name = name[len("torch."):]
+    aliases = {
+        "bf16": "bfloat16",
+        "fp16": "float16",
+        "half": "float16",
+        "fp32": "float32",
+        "float": "float32",
+    }
+    name = aliases.get(name, name)
+    resolved = getattr(torch, name, None)
+    if not isinstance(resolved, torch.dtype):
+        raise ValueError(f"Unknown dtype: {value!r}")
+    return resolved
+
+
 def _apply_yaml_overrides(default_config: Dict[str, Any], yaml_config: Dict[str, Any]) -> Dict[str, Any]:
     if not yaml_config:
         return dict(default_config)
@@ -258,6 +294,9 @@ def _apply_yaml_overrides(default_config: Dict[str, Any], yaml_config: Dict[str,
 
     if "cache_implementation" in cfg:
         cfg["cache_implementation"] = _normalize_cache_implementation(cfg.get("cache_implementation"))
+
+    if "dtype" in cfg:
+        cfg["dtype"] = _normalize_dtype(cfg.get("dtype"))
 
     # DraftParams can be specified as a dict in YAML.
     if isinstance(cfg.get("draft_params"), dict):
