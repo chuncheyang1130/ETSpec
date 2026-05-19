@@ -52,18 +52,15 @@ def apply_flashinfer_kernel_to_llama(
         loaded. Default is None.
     """
     from transformers.models.llama import modeling_llama
-    from transformers.models.qwen3 import modeling_qwen3
 
     if rms_norm:
         modeling_llama.LlamaRMSNorm = FiLlamaRMSNorm
-        modeling_qwen3.Qwen3RMSNorm = FiLlamaRMSNorm
     if attention:
         if use_ragged:
             # modeling_llama.LlamaAttention = RaggedLlamaAttention
             pass
         else:
             modeling_llama.LlamaAttention = FiLlamaAttention
-            modeling_qwen3.Qwen3Attention = FiQwen3Attention
     # replace_llama_qkv_with_fused(model)
 
     if model is not None:
