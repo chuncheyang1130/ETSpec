@@ -3,11 +3,12 @@ from typing import Any, Dict, Optional, Tuple
 
 
 class BaseRecipe:
-    """Base recipe for quantization, factorization (SVD), and offloading transforms."""
+    """Base recipe for structure swaps, quantization, factorization (SVD), and offloading transforms."""
 
     def __init__(self):
         self.quantizer = None
         self.factorizer = None
+        self.restructurer = None
         self.offloader = None
 
     def generate_configurations(
@@ -26,6 +27,17 @@ class BaseRecipe:
             logging.info("No quantizer provided; skipping quantization.")
             return
         self.quantizer.quantize_model(model, quant_config, dtype, device)
+
+    def apply_structure(self, model: Any, structure_config: Dict[str, Any], dtype: Any, device: str):
+        """Swap submodules for a new structural form (e.g. Qwen3 MoE -> PackedTopN).
+
+        Distinct from `apply_svd`: this is a plain class-swap pass with no
+        weight decomposition. Recipes that need it set `self.restructurer`.
+        """
+        if self.restructurer is None:
+            logging.info("No restructurer provided; skipping structure swap.")
+            return
+        self.restructurer.restructure_model(model, structure_config, dtype, device)
 
     def apply_svd(self, model: Any, svd_config: Dict[str, Any], dtype: Any, device: str):
         if self.factorizer is None:

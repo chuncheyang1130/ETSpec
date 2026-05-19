@@ -3,10 +3,11 @@
 Build time: the draft is constructed as a `share_param_deepcopy` of the
 target so that all non-MoE submodules (attention, embeddings, layernorms,
 lm_head) reuse the target's parameters directly. The recipe's
-`MoETopNFactorizer` (or `MoETopNFP8Factorizer` for FP8 storage) then runs
-and replaces every `Qwen3MoeSparseMoeBlock` with a `PackedTopNMoeBlock`
-(or `PackedTopNFP8MoeBlock`) — random / empty init for the packed
-tensors, zero init for the routing buffers.
+`MoETopNRestructurer` (or `MoETopNFP8Restructurer` for FP8 storage)
+then runs via `BaseRecipe.apply_structure` and replaces every
+`Qwen3MoeSparseMoeBlock` with a `PackedTopNMoeBlock` (or
+`PackedTopNFP8MoeBlock`) — random / empty init for the packed tensors,
+zero init for the routing buffers.
 
 Generate time: the generator (`ExpSpecSDGenerator`) picks per-layer kept
 expert ids from the target's tracked routing mass and calls

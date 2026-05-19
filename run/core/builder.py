@@ -424,7 +424,14 @@ class GeneratorPipelineBuilder:
                 device=self.device,
             )
             
-            # Apply SVD first so later quantization/offloading sees the transformed modules.
+            # Apply structure swaps first (plain class-swap, no weight decomp), then SVD,
+            # so later quantization/offloading sees the transformed modules.
+            if draft_model and draft_config and draft_config.get("structure_config"):
+                self.recipe.apply_structure(draft_model.model, draft_config["structure_config"], self.dtype, self.device)
+            if target_config and target_config.get("structure_config"):
+                self.recipe.apply_structure(model, target_config["structure_config"], self.dtype, self.device)
+
+            # Apply SVD next so later quantization/offloading sees the transformed modules.
             if draft_model and draft_config and draft_config.get("svd_config"):
                 self.recipe.apply_svd(draft_model.model, draft_config["svd_config"], self.dtype, self.device)
             if target_config and target_config.get("svd_config"):

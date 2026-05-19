@@ -2,7 +2,7 @@
 # FP8 expert storage + CUDA-graph captured per-step tree forward.
 #
 # Differences vs `expspec_sd`:
-#   - FP8 (e4m3) weight storage via `MoETopNFP8Factorizer` (default
+#   - FP8 (e4m3) weight storage via `MoETopNFP8Restructurer` (default
 #     recipe). bf16 silu/mul/output tail; bf16 intermediate to survive
 #     the wide range of unit-scale `bmm_fp8` outputs.
 #   - CG-captured draft tree-step forward via `ExpSpecSDCgDraftModel`

@@ -1,24 +1,19 @@
-"""Recipe: TopN-Expert subset draft for Qwen3-MoE — bf16, no SVD, no offload.
+"""Recipe: TopN-Expert subset draft for Qwen3-MoE — FP8 expert storage.
 
-Pairs with `ExpSpecSDGenerator` / `ExpSpecSDDraftModel`. The FP8 sibling
-lives in `moe_topn_fp8.py`.
+FP8 sibling of `moe_topn_no_offload.py`. Inherits its config dict /
+generate_configurations / `topn_subset_config` plumbing; only swaps the
+restructurer to install `PackedTopNFP8MoeBlock` instances at build time.
 
-This is the **base** recipe of the MoE top-N family. It stores its
-config dict on the draft model under the attribute `topn_subset_config`;
-the matching generator reads it back.
-
-The structure swap (`Qwen3MoeSparseMoeBlock` -> `PackedTopNMoeBlock`)
-runs through the new `apply_structure` channel on `BaseRecipe` — *not*
-through `apply_svd`, because there's no decomposition happening.
-
-Config is fixed in `generate_configurations` — to tune `top_n` /
-`redirect_topk` either edit it here or subclass the recipe.
+Compute path stays bf16/fp16 (router, silu/mul tail, output tail). FP8
+storage (e4m3) is hard-coded inside the block. Pairs with the
+`expspec_sd_opt` preset which also wraps the draft in CUDA-graph
+capture.
 """
 
 from typing import Any, Dict
 
-from ..base_recipe import BaseRecipe
-from ...restructurer.moe_topn import MoETopNRestructurer
+from specdecodes.helpers.recipes.base_recipe import BaseRecipe
+from ...restructurer.moe_topn_fp8 import MoETopNFP8Restructurer
 
 
 class Recipe(BaseRecipe):
@@ -26,7 +21,7 @@ class Recipe(BaseRecipe):
 
     def __init__(self):
         super().__init__()
-        self.restructurer = MoETopNRestructurer
+        self.restructurer = MoETopNFP8Restructurer
 
     def _build_target_config(
         self, target_model, max_length, cpu_offload_gb, dtype, device
