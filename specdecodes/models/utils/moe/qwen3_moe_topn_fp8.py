@@ -50,10 +50,9 @@ import logging
 from typing import List, Optional, Tuple
 
 import torch
+import torch._dynamo as dynamo
 import torch.nn as nn
 import torch.nn.functional as F
-
-from flashinfer.gemm import bmm_fp8
 
 from .qwen3_moe_topn import (
     PackedTopNMoeBlock,
@@ -61,6 +60,7 @@ from .qwen3_moe_topn import (
     _set_module_by_name,
 )
 from .triton_fused_silu import fused_scale_silu_mul
+from .triton_bmm_fp8 import triton_bmm_fp8
 
 
 __all__ = [
@@ -73,10 +73,14 @@ __all__ = [
 # range for symmetric absmax quantization.
 _FP8_E4M3_MAX = 448.0
 
-
 # ---------------------------------------------------------------------------
 # FP8 quantization helpers
 # ---------------------------------------------------------------------------
+def _quantize_with_scale(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Fused scale -> clamp -> cast chain for fp8 quantization."""
+    return (x.to(torch.float32) * scale).clamp(
+        -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+    ).to(torch.float8_e4m3fn)
 
 
 @torch.no_grad()
@@ -105,11 +109,9 @@ def _quant_weight_per_expert(
     scale = (_FP8_E4M3_MAX / absmax).to(torch.float32)        # [top_n]
     scale_inv = (absmax / _FP8_E4M3_MAX).to(torch.float32)    # [top_n]
 
-    w_scaled = w.to(torch.float32) * scale.view(-1, 1, 1)
     # clamp before cast — out-of-range values would saturate to ±inf in
     # e4m3, which propagates to the matmul.
-    w_scaled = w_scaled.clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    w_fp8 = w_scaled.to(torch.float8_e4m3fn)
+    w_fp8 = _quantize_with_scale(w, scale.view(-1, 1, 1))
     return w_fp8, scale_inv
 
 
@@ -134,8 +136,7 @@ def _quant_act_per_tensor(
     scale = (_FP8_E4M3_MAX / absmax).to(torch.float32)
     scale_inv = (absmax / _FP8_E4M3_MAX).to(torch.float32)
 
-    x_scaled = (x.to(torch.float32) * scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    x_fp8 = x_scaled.to(torch.float8_e4m3fn)
+    x_fp8 = _quantize_with_scale(x, scale)
     return x_fp8, scale_inv
 
 
@@ -167,10 +168,7 @@ def _quant_act_per_expert(
     scale_inv = (absmax / _FP8_E4M3_MAX).to(torch.float32)               # [B]
 
     broadcast_shape = (B,) + (1,) * (x.dim() - 1)
-    x_scaled = (
-        x.to(torch.float32) * scale.view(broadcast_shape)
-    ).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    x_fp8 = x_scaled.to(torch.float8_e4m3fn)
+    x_fp8 = _quantize_with_scale(x, scale.view(broadcast_shape))
     return x_fp8, scale_inv
 
 
@@ -241,7 +239,9 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         Note: `dtype` here is the bf16/fp16 *compute* dtype (used elsewhere);
         FP8 storage is hard-coded.
         """
-        # [B, N, K] row-major; bmm_fp8 sees [B, K, N] column-major via .transpose(-2,-1).
+        # [top_n, 2*intermediate, hidden] stored format for gate_up
+        # [top_n, hidden, intermediate] stored format for down
+        # Kernel expects [B, N, K] directly; pass without transposing.
         self.gate_up_packed_fp8 = nn.Parameter(
             torch.empty(
                 self.top_n,
@@ -272,6 +272,11 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         self.register_buffer(
             "down_scale_inv",
             torch.ones(self.top_n, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_unit_scale",
+            torch.ones((), dtype=torch.float32, device=device),
             persistent=False,
         )
 
@@ -404,12 +409,11 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         # scale=1 on both sides; real scales applied inside the fused
         # rescale+silu kernel (gate_up side) and inside the weighted-sum
         # mixing factor (down side). flashinfer wants scalar A/B scales.
-        # B is stored as [B, N, K] row-major and passed transposed so
-        # bmm_fp8 sees the required [B, K, N] column-major view.
-        unit_scale = torch.ones((), dtype=torch.float32, device=x.device)
-        gate_up = bmm_fp8(
+        # B is stored as [B, N, K] row-major; pass directly to kernel.
+        unit_scale = self._unit_scale
+        gate_up = triton_bmm_fp8(
             a_gate_up,
-            self.gate_up_packed_fp8.data.transpose(-2, -1),
+            self.gate_up_packed_fp8,
             unit_scale,
             unit_scale,
             dtype=compute_dtype,
@@ -433,9 +437,9 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         # interm is already shaped [top_n, T, im] — no broadcast needed.
         interm_fp8_c = interm_fp8.contiguous()
 
-        proj = bmm_fp8(
+        proj = triton_bmm_fp8(
             interm_fp8_c,
-            self.down_packed_fp8.data.transpose(-2, -1),
+            self.down_packed_fp8,
             unit_scale,
             unit_scale,
             dtype=compute_dtype,
