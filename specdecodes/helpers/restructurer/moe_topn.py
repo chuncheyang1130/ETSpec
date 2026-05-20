@@ -1,27 +1,19 @@
-"""Build-time restructurers: swap Qwen3-MoE blocks for packed top-N blocks.
+"""Build-time restructurer: swap Qwen3-MoE blocks for bf16 `PackedTopNMoeBlock`.
 
-Two flavors, selected by **which recipe is used** (not by `compute_dtype`):
+FP8 sibling lives in `moe_topn_fp8.py`. Both share the routing path
+(mass-weighted tracker + soft top-K weight-space redirect + per-expert
+sig cache); only the expert storage and `_expert_forward` differ.
 
-  * `MoETopNRestructurer`     -> bf16 `PackedTopNMoeBlock`
-  * `MoETopNFP8Restructurer`  -> FP8 `PackedTopNFP8MoeBlock`
-
-Both flavors share the same routing path (mass-weighted tracker + soft
-top-K weight-space redirect + per-expert sig cache); only the expert
-storage and `_expert_forward` differ. The FP8 flavor additionally swaps
-in a sparse `_routing_weights` override to save a few kernel launches.
-
-The `dtype` parameter is the *compute* dtype (bf16/fp16) for both
-flavors. FP8 storage is hard-coded inside the FP8 block's
-`_init_expert_weights` — the recipe doesn't pick it.
+The `compute_dtype` parameter is the bf16/fp16 dtype used for the
+packed weight tensors.
 
 Step 1: the restructurer installs the *structure* (a packed block with
-random / empty packed tensors) at build time via `apply_structure`. Step
+random-init packed tensors) at build time via `apply_structure`. Step
 2 — the actual fill from kept-expert weights — happens at generate time
 via `materialize_kept_from_target`, after the picker decides which
 experts to keep based on tracked usage mass.
 
-Pairs with `recipes/moe/moe_topn_no_offload.py` (bf16) and
-`recipes/moe/moe_topn_fp8.py` (FP8).
+Pairs with `recipes/moe/moe_topn_no_offload.py`.
 """
 
 from __future__ import annotations
