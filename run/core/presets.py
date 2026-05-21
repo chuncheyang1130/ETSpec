@@ -503,9 +503,10 @@ def register_presets():
     # FP8 is unavailable on your stack.
     try:
         from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
-        from specdecodes.models.draft_models.expspec_sd_opt import (
-            ExpSpecSDCgDraftModel,
-        )
+        # from specdecodes.models.draft_models.expspec_sd_opt import (
+        #     ExpSpecSDCgDraftModel,
+        # )
+        from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
         from specdecodes.helpers.recipes.moe.moe_topn_no_offload import (
             Recipe as ExpSpecOptRecipe,
         )
@@ -513,7 +514,8 @@ def register_presets():
         ModelRegistry.register(
             name="expspec_sd_opt",
             generator_cls=ExpSpecSDGenerator,
-            draft_model_cls=ExpSpecSDCgDraftModel,
+            # draft_model_cls=ExpSpecSDCgDraftModel,
+            draft_model_cls=ExpSpecSDDraftModel,
             default_config={
                 "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                 "recipe": ExpSpecOptRecipe(),

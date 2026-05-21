@@ -17,7 +17,7 @@ from ...restructurer.moe_topn_fp8 import MoETopNFP8Restructurer
 
 
 class Recipe(BaseRecipe):
-    """Base TopN-subset MoE recipe (bf16/fp16, no SVD, no offload)."""
+    """Base TopN-subset MoE recipe (fp8, no SVD, no offload)."""
 
     def __init__(self):
         super().__init__()

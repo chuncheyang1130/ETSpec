@@ -59,8 +59,9 @@ from .qwen3_moe_topn import (
     _is_qwen3_moe_block,
     _set_module_by_name,
 )
-from .triton_fused_silu import fused_scale_silu_mul
-from .triton_bmm_fp8 import triton_bmm_fp8
+
+from .triton_fused_gate_up_fp8_bmm_silu import triton_fused_gate_up_fp8_bmm_silu
+from .triton_fused_down_fp8_bmm_reduction import triton_fused_down_fp8_bmm_reduction
 
 
 __all__ = [
@@ -209,7 +210,7 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
     ):
         # bf16/fp16 is the *compute* dtype for the silu/mul/output path.
         # FP8 storage dtype is hard-coded to e4m3 (matches bmm_fp8).
-        self._compute_dtype = dtype
+        self._compute_dtype = torch.float8_e4m3fn
         super().__init__(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -242,10 +243,20 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         # [top_n, 2*intermediate, hidden] stored format for gate_up
         # [top_n, hidden, intermediate] stored format for down
         # Kernel expects [B, N, K] directly; pass without transposing.
-        self.gate_up_packed_fp8 = nn.Parameter(
+        self.gate_packed_fp8 = nn.Parameter(
             torch.empty(
                 self.top_n,
                 2 * self.intermediate_size,
+                self.hidden_size,
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            ),
+            requires_grad=False,
+        )
+        self.up_packed_fp8 = nn.Parameter(
+            torch.empty(
+                self.top_n,
+                self.intermediate_size,
                 self.hidden_size,
                 dtype=torch.float8_e4m3fn,
                 device=device,
@@ -265,20 +276,20 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         # Per-expert dequant scales (one fp32 scalar per kept expert per
         # matrix). Output rescaling does `out * act_scale_inv * weight_scale_inv[e]`.
         self.register_buffer(
-            "gate_up_scale_inv",
+            "gate_scale_inv",
             torch.ones(self.top_n, dtype=torch.float32, device=device),
             persistent=False,
+        )
+        self.register_buffer(
+            "up_scale_inv",
+            torch.ones(self.top_n, dtype=torch.float32, device=device)
         )
         self.register_buffer(
             "down_scale_inv",
             torch.ones(self.top_n, dtype=torch.float32, device=device),
             persistent=False,
         )
-        self.register_buffer(
-            "_unit_scale",
-            torch.ones((), dtype=torch.float32, device=device),
-            persistent=False,
-        )
+
 
     def _packed_expert_parameters(self) -> List[nn.Parameter]:
         # Used by `reset_random_`. FP8 init via normal_ would error
@@ -346,8 +357,11 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
 
         # [top_n, 2*im, hidden] matches both Linear.weight layout and the
         # final fp8 storage — no transpose, no extra contiguous copy.
-        gate_up_real = torch.empty(
-            top_n, 2 * im, hidden, dtype=compute_dtype, device=target_device
+        gate_real = torch.empty(
+            top_n, im, hidden, dtype=compute_dtype, device=target_device
+        )
+        up_real = torch.empty(
+            top_n, im, hidden, dtype=compute_dtype, device=target_device
         )
         down_real = torch.empty(
             top_n, hidden, im, dtype=compute_dtype, device=target_device
@@ -355,10 +369,10 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
 
         for slot, eid in enumerate(kept_ids.tolist()):
             expert = target_block.experts[int(eid)]
-            gate_up_real[slot, :im].copy_(
+            gate_real[slot].copy_(
                 expert.gate_proj.weight.to(device=target_device, dtype=compute_dtype)
             )
-            gate_up_real[slot, im:].copy_(
+            up_real[slot].copy_(
                 expert.up_proj.weight.to(device=target_device, dtype=compute_dtype)
             )
             down_real[slot].copy_(
@@ -367,16 +381,20 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
 
         # Quantize directly in [B, N, K] layout. absmax is over (-2, -1) so the
         # per-expert scale is identical regardless of how N and K are ordered.
-        gu_fp8, gu_scale_inv = _quant_weight_per_expert(gate_up_real)
-        dn_fp8, dn_scale_inv = _quant_weight_per_expert(down_real)
+        gate_fp8, gate_scale_inv = _quant_weight_per_expert(gate_real)
+        up_fp8, up_scale_inv = _quant_weight_per_expert(up_real)
+        down_fp8, down_scale_inv = _quant_weight_per_expert(down_real)
 
-        self.gate_up_packed_fp8.data.copy_(gu_fp8)
-        self.down_packed_fp8.data.copy_(dn_fp8)
-        self.gate_up_scale_inv.data.copy_(gu_scale_inv)
-        self.down_scale_inv.data.copy_(dn_scale_inv)
+        self.gate_packed_fp8.data.copy_(gate_fp8)
+        self.up_packed_fp8.data.copy_(up_fp8)
+        self.down_packed_fp8.data.copy_(down_fp8)
+        self.gate_scale_inv.data.copy_(gate_scale_inv)
+        self.up_scale_inv.data.copy_(up_scale_inv)
+        self.down_scale_inv.data.copy_(down_scale_inv)
+        
         return True
 
-    def _expert_forward(self, x: torch.Tensor, kept_weights: torch.Tensor) -> torch.Tensor:
+    def _expert_forward(self, x: torch.Tensor, topn_routing_weights: torch.Tensor) -> torch.Tensor:
         """FP8 batched-MoE forward with fused rescale+silu and folded down rescale.
 
         Steps (per call, all in-graph):
@@ -401,32 +419,14 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         compute_dtype = self._compute_dtype
 
         # --- gate_up ---
-        x_fp8, x_scale_inv = _quant_act_per_tensor(x)              # [T, hidden] fp8, scalar
-        # bmm_fp8 requires contiguous [B, M, K]; stride-0 batch broadcast
-        # is not supported by the wrapper.
-        a_gate_up = x_fp8.unsqueeze(0).expand(top_n, T, hidden).contiguous()
+        x_fp8, x_scale_inv = _quant_act_per_tensor(x)              # [T, hidden] fp8, scalar the wrapper.
+        x_fp8 = x_fp8.unsqueeze(0).expand(top_n, T, hidden).contiguous()
 
-        # scale=1 on both sides; real scales applied inside the fused
-        # rescale+silu kernel (gate_up side) and inside the weighted-sum
-        # mixing factor (down side). flashinfer wants scalar A/B scales.
-        # B is stored as [B, N, K] row-major; pass directly to kernel.
-        unit_scale = self._unit_scale
-        gate_up = triton_bmm_fp8(
-            a_gate_up,
-            self.gate_up_packed_fp8,
-            unit_scale,
-            unit_scale,
+        interm = triton_fused_gate_up_fp8_bmm_silu(
+            x_fp8, self.gate_packed_fp8, self.up_packed_fp8,
+            x_scale_inv, self.gate_scale_inv, self.up_scale_inv,
             dtype=compute_dtype,
-        )  # [top_n, T, 2*im] bf16, in "unit-scale" units
-
-        # Fused (per-expert rescale + silu(gate) * up). Saves the bf16
-        # gate_up R+W between rescale and silu (~12 MB / layer / call)
-        # plus chunk/silu/mul launch overhead.
-        interm = fused_scale_silu_mul(
-            gate_up,
-            self.gate_up_scale_inv,                                # [top_n] fp32
-            x_scale_inv,                                           # scalar fp32
-        )                                                          # [top_n, T, im] bf16
+        )  
 
         # --- down ---
         # Per-expert quant: post-silu interm magnitudes vary 1-2 orders
@@ -435,29 +435,16 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         # smaller experts' interms into fp8 subnormals.
         interm_fp8, interm_scale_inv = _quant_act_per_expert(interm)  # scale_inv: [top_n]
         # interm is already shaped [top_n, T, im] — no broadcast needed.
-        interm_fp8_c = interm_fp8.contiguous()
+        interm_fp8 = interm_fp8.contiguous()
 
-        proj = triton_bmm_fp8(
-            interm_fp8_c,
-            self.down_packed_fp8,
-            unit_scale,
-            unit_scale,
+        out = triton_fused_down_fp8_bmm_reduction(
+            interm_fp8, self.down_packed_fp8,
+            interm_scale_inv, self.down_scale_inv,
+            topn_routing_weights,
             dtype=compute_dtype,
-        )  # [top_n, T, hidden] bf16, in "unit-scale" units
-
-        # --- folded down rescale + weighted sum ---
-        # combined_w[t, e] = kept_weights[t, e] * interm_scale_inv[e] * down_scale_inv[e]
-        # Doing this here (instead of a separate `proj *= ...` pass) avoids
-        # the [top_n, T, hidden] R+W rescale of `proj` (~16 MB / layer / call).
-        # Both factors are now [top_n] (was: interm scalar + down [top_n]),
-        # so the element-wise product is [top_n] and the broadcast still
-        # works unchanged.
-        combined_w = (
-            kept_weights.to(torch.float32)
-            * (interm_scale_inv * self.down_scale_inv).unsqueeze(0)   # broadcast [1, top_n]
-        ).to(compute_dtype)                                            # [T, top_n]
-        w = combined_w.transpose(0, 1).unsqueeze(-1)                  # [top_n, T, 1]
-        return (w * proj).sum(dim=0)                                  # [T, hidden]
+        )  # [T, hidden] bf16
+        
+        return out
 
     def _routing_weights(self, x: torch.Tensor) -> torch.Tensor:
         """Sparse routing override — softmax-over-top_k + gather-mix.

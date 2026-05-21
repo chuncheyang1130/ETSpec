@@ -535,8 +535,8 @@ class PackedTopNMoeBlock(nn.Module):
         bsz, seq_len, hidden = hidden_states.shape
         x = hidden_states.view(-1, hidden)  # [T, hidden]
 
-        kept_weights = self._routing_weights(x)
-        out = self._expert_forward(x, kept_weights)
+        topn_routing_weights = self._routing_weights(x)
+        out = self._expert_forward(x, topn_routing_weights)
         return out.view(bsz, seq_len, hidden)
 
 

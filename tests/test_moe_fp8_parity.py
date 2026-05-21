@@ -129,7 +129,7 @@ def _fp8_expert_stages(block: PackedTopNFP8MoeBlock, x: torch.Tensor) -> dict:
         _quant_act_per_expert,
     )
     from specdecodes.models.utils.moe.triton_fused_silu import fused_scale_silu_mul
-    from flashinfer.gemm import bmm_fp8
+    from specdecodes.models.utils.moe.triton_bmm_fp8 import triton_bmm_fp8
 
     top_n = block.top_n
     T = x.shape[0]
@@ -140,9 +140,9 @@ def _fp8_expert_stages(block: PackedTopNFP8MoeBlock, x: torch.Tensor) -> dict:
     a_gate_up = x_fp8.unsqueeze(0).expand(top_n, T, hidden).contiguous()
 
     unit_scale = torch.ones((), dtype=torch.float32, device=x.device)
-    gate_up_raw = bmm_fp8(
+    gate_up_raw = triton_bmm_fp8(
         a_gate_up,
-        block.gate_up_packed_fp8.data.transpose(-2, -1),  # [B, N, K] -> [B, K, N] col-major
+        block.gate_up_packed_fp8.data,  # [B, N, K] row-major
         unit_scale,
         unit_scale,
         dtype=compute_dtype,
@@ -157,9 +157,9 @@ def _fp8_expert_stages(block: PackedTopNFP8MoeBlock, x: torch.Tensor) -> dict:
     interm_fp8, interm_scale_inv = _quant_act_per_expert(interm)
     interm_fp8_c = interm_fp8.contiguous()
 
-    proj_raw = bmm_fp8(
+    proj_raw = triton_bmm_fp8(
         interm_fp8_c,
-        block.down_packed_fp8.data.transpose(-2, -1),  # [B, N, K] -> [B, K, N] col-major
+        block.down_packed_fp8.data,  # [B, N, K] row-major
         unit_scale,
         unit_scale,
         dtype=compute_dtype,
