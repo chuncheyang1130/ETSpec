@@ -34,7 +34,7 @@ warmup_iter: 1
 # and stacking torch.compile on top fights over allocator state.
 compile_mode:
   target: null
-  draft: null
+  draft: max-autotune
 
 # Target sampling settings (defaults).
 do_sample: false
