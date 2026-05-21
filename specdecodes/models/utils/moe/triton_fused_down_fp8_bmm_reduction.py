@@ -69,7 +69,7 @@ def _fused_down_fp8_bmm_reduction_kernel(
             + off_im_block[None, :] * stride_interm_im
         )
         interm_mask = (off_t[:, None] < T) & (off_im_block[None, :] < IM)
-        interm_block = tl.load(interm_ptr, mask=interm_mask, other=0.0).to(tl.float32)
+        interm_block = tl.load(interm_ptr, mask=interm_mask, other=0.0)
         
         # Load Down Weights: [BLOCK_IM, BLOCK_H] (Transposed read)
         w_down_ptr = (
@@ -80,7 +80,7 @@ def _fused_down_fp8_bmm_reduction_kernel(
         w_mask = (off_h[None, :] < H) & (off_im_block[:, None] < IM)
         w_down_block = tl.load(w_down_ptr, mask=w_mask, other=0.0)
         
-        acc += tl.dot(interm_block, w_down_block)
+        acc += tl.dot(interm_block, w_down_block).to(tl.float32)
     
     # Combined per-expert scalar
     scale_expert = scale_interm * scale_w_down
@@ -97,19 +97,22 @@ def _fused_down_fp8_bmm_reduction_kernel(
     
     tl.atomic_add(out_ptr_base, out.to(tl.bfloat16), mask=out_mask)
 
-
+# ==========================================
+# 1. Register the Custom Op
+# ==========================================
 @torch.library.custom_op(f"{LIB_NAME}::fused_down_fp8_bmm_reduction", mutates_args=())
 def triton_fused_down_fp8_bmm_reduction(
-    interm_fp8: torch.Tensor,     # [B, T, IM]
-    down_fp8: torch.Tensor,       # [B, H, IM]
-    interm_scale: torch.Tensor,   # [B]
-    down_scale: torch.Tensor,     # [B]
-    routing_weights: torch.Tensor,   # [T, B]
+    interm_fp8: torch.Tensor,           # [B, T, IM]
+    down_fp8: torch.Tensor,             # [B, H, IM]
+    interm_scale: torch.Tensor,         # [B]
+    down_scale: torch.Tensor,           # [B]
+    routing_weights: torch.Tensor,      # [T, B]
+    dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     B, T, IM = interm_fp8.shape
     _, H, _ = down_fp8.shape
     
-    out = torch.zeros((T, H), dtype=torch.bfloat16, device=interm_fp8.device)
+    out = torch.zeros((T, H), dtype=dtype, device=interm_fp8.device)
 
     interm_fp8, down_fp8 = interm_fp8.contiguous(), down_fp8.contiguous()
     interm_scale, down_scale = interm_scale.contiguous(), down_scale.contiguous()
@@ -129,8 +132,13 @@ def triton_fused_down_fp8_bmm_reduction(
         out.stride(0), out.stride(1),
         BLOCK_T=BLOCK_T, BLOCK_H=BLOCK_H, BLOCK_IM=BLOCK_IM,
     )
+    
     return out
 
+
+# ==========================================
+# 2. Register the Fake Tensor (Meta) Implementation
+# ==========================================
 @triton_fused_down_fp8_bmm_reduction.register_fake
 def _fused_down_fp8_bmm_reduction_fake(
     interm_fp8: torch.Tensor,
@@ -138,8 +146,9 @@ def _fused_down_fp8_bmm_reduction_fake(
     interm_scale: torch.Tensor,
     down_scale: torch.Tensor,
     routing_weights: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     _, T, _ = interm_fp8.shape
     _, K, _ = down_fp8.shape
     
-    return interm_fp8.new_empty((T, K), dtype=torch.bfloat16)
+    return interm_fp8.new_empty((T, K), dtype=dtype)

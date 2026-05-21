@@ -81,7 +81,7 @@ def _fused_gate_up_fp8_bmm_silu(
             + off_h_block[None, :] * stride_x_h
         )
         x_mask = (off_t[:, None] < T) & (off_h_block[None, :] < H)
-        x_block = tl.load(x_ptr, mask=x_mask, other=0.0).to(tl.float32)
+        x_block = tl.load(x_ptr, mask=x_mask, other=0.0)
 
         # Base masks for W (bounds checking against IM and H)
         w_mask = (off_im[None, :] < IM) & (off_h_block[:, None] < H)
@@ -92,7 +92,7 @@ def _fused_gate_up_fp8_bmm_silu(
             + off_im[None, :] * stride_w_gate_im
             + off_h_block[:, None] * stride_w_gate_h
         )
-        w_gate_block = tl.load(w_gate_ptr, mask=w_mask, other=0.0).to(tl.float32)
+        w_gate_block = tl.load(w_gate_ptr, mask=w_mask, other=0.0)
 
         # Load W_up block: [BLOCK_H, BLOCK_IM]
         w_up_ptr = (
@@ -100,11 +100,11 @@ def _fused_gate_up_fp8_bmm_silu(
             + off_im[None, :] * stride_w_up_im
             + off_h_block[:, None] * stride_w_up_h
         )
-        w_up_block = tl.load(w_up_ptr, mask=w_mask, other=0.0).to(tl.float32)
+        w_up_block = tl.load(w_up_ptr, mask=w_mask, other=0.0)
 
         # Accumulate both: acc += a @ b^T
-        acc_gate += tl.dot(x_block, w_gate_block)
-        acc_up += tl.dot(x_block, w_up_block)
+        acc_gate += tl.dot(x_block, w_gate_block).to(tl.float32)
+        acc_up += tl.dot(x_block, w_up_block).to(tl.float32)
 
     # Epilogue: Apply scales directly to registers
     acc_gate = acc_gate * combined_scale_gate
