@@ -148,7 +148,10 @@ def _fused_down_fp8_bmm_reduction_fake(
     routing_weights: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    _, T, _ = interm_fp8.shape
-    _, K, _ = down_fp8.shape
+    B1, T, IM = interm_fp8.shape
+    B2, H, IM = down_fp8.shape
     
-    return interm_fp8.new_empty((T, K), dtype=dtype)
+    assert B1 == B2, "Batch/Expert dimension must match"
+    assert IM == IM, "Intermediate dimension must match"
+
+    return interm_fp8.new_empty((T, H), dtype=dtype)

@@ -192,7 +192,12 @@ def _fused_gate_up_fp8_bmm_silu_fake(
     scale_w_up: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    B, T, _ = x_fp8.shape
-    _, IM, _ = w_gate_fp8.shape
+    B1, T, H1 = x_fp8.shape
+    B2, IM, H2 = w_gate_fp8.shape
+    
+    assert B1 == B2, "Batch/Expert dimension must match"
+    assert H1 == H2, "Hidden dimension must match"
+
+    B = B1
     
     return x_fp8.new_empty((B, T, IM), dtype=dtype)
