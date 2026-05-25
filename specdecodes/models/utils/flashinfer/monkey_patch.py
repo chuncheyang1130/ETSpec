@@ -4,7 +4,6 @@ from .attention import FiLlamaAttention, FiQwen3Attention
 # from .ragged_attention import LlamaAttention as RaggedLlamaAttention
 from transformers import PreTrainedModel
 from transformers.models.llama.modeling_llama import LlamaAttention
-from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
     
 def _bind_method_to_module(module, method_name: str, new_method: Callable):
     # Binds a new method to a module instance so that self is passed as the first argument
@@ -26,8 +25,6 @@ def _patch_attention_module(module, use_ragged=False):
         if isinstance(module, LlamaAttention):
             _bind_method_to_module(module, "forward", FiLlamaAttention.forward)
 
-        elif isinstance(module, Qwen3Attention):
-            _bind_method_to_module(module, "forward", FiQwen3Attention.forward)
         else:
             raise ValueError(f"Unsupported attention module type, only suppoort llama and qwen for now: {type(module)}")
         
