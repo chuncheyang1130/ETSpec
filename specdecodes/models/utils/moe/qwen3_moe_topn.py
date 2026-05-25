@@ -70,6 +70,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
+from transformers.models.qwen3_moe import Qwen3MoeConfig
 
 
 _TRACKER_BUFFER = "_expert_usage_mass"
@@ -229,9 +230,7 @@ class PackedTopNMoeBlock(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int,
-        intermediate_size: int,
-        num_experts: int,
+        config: Qwen3MoeConfig,
         top_n: int,
         dtype: torch.dtype,
         device: torch.device | str,
@@ -240,16 +239,18 @@ class PackedTopNMoeBlock(nn.Module):
         redirect_topk: int = 4,
     ):
         super().__init__()
-        if top_n > num_experts:
-            raise ValueError(f"top_n ({top_n}) cannot exceed num_experts ({num_experts}).")
-        if target_top_k > num_experts:
+        if top_n > config.num_experts:
+            raise ValueError(f"top_n ({top_n}) cannot exceed num_experts ({config.num_experts}).")
+        if target_top_k > config.num_experts:
             raise ValueError(
-                f"target_top_k ({target_top_k}) cannot exceed num_experts ({num_experts})."
+                f"target_top_k ({target_top_k}) cannot exceed num_experts ({config.num_experts})."
             )
 
-        self.hidden_size = int(hidden_size)
-        self.intermediate_size = int(intermediate_size)
-        self.num_experts = int(num_experts)
+        self.hidden_size = int(config.hidden_size)
+        self.intermediate_size = int(config.intermediate_size)
+        self.num_experts = int(config.num_experts)
+        self.norm_topk_prob = bool(config.norm_topk_prob)
+        
         self.top_n = int(top_n)
         self.target_top_k = int(target_top_k)
         self.redirect_topk = int(redirect_topk)

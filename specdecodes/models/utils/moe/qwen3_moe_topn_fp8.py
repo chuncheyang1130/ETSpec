@@ -339,13 +339,21 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
           4. Gather the relevant rows of redirect_P at the top_k indices.
           5. Weighted sum across k → [T, top_n].
         """
-        all_logits = F.linear(x, self.full_gate_weight)                  # [T, num_experts]
+        all_logits = F.linear(x, self.full_gate_weight)                 # [T, num_experts]
         topk_vals, topk_idx = torch.topk(
             all_logits.to(torch.float32), k=self.target_top_k, dim=-1
         )
-        topk_w = F.softmax(topk_vals, dim=-1).to(x.dtype)                # [T, top_k] sums to 1
-        gathered_P = self.redirect_P[topk_idx]                           # [T, top_k, top_n]
-        return (topk_w.unsqueeze(-1) * gathered_P).sum(dim=1)            # [T, top_n]
+        
+        if self.norm_topk_prob:
+            topk_w = F.softmax(topk_vals, dim=-1).to(x.dtype)           # [T, top_k] sums to 1
+        else:
+            global_softmax = F.softmax(all_logits, dim=-1)
+            topk_w = torch.gather(global_softmax, -1, topk_idx)
+            
+        top_w = top_w.to(x.dtype)
+        # gathered_P = self.redirect_P[topk_idx]                        # [T, top_k, top_n]
+        gathered_P = F.embedding(topk_idx, self.redirect_P)             # [T, top_k, top_n]
+        return (topk_w.unsqueeze(-1) * gathered_P).sum(dim=1)           # [T, top_n]
 
 
 # ---------------------------------------------------------------------------
