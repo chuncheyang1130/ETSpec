@@ -29,6 +29,9 @@ def _fused_down_fp8_bmm_reduction_kernel(
     BLOCK_H: tl.constexpr,   
     BLOCK_IM: tl.constexpr,  
 ):
+    # ==========================================
+    # Grid Coordinates & Early Exit: [B, T_tiles, H_tiles]
+    # ==========================================
     pid_b = tl.program_id(0)  
     pid_t = tl.program_id(1)  
     pid_h = tl.program_id(2)
@@ -36,33 +39,51 @@ def _fused_down_fp8_bmm_reduction_kernel(
     if pid_b >= B:
         return   
 
+    # ==========================================
+    # Tile offsets
+    # ==========================================
     off_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     off_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     off_im = tl.arange(0, BLOCK_IM)
     
-    # Pointer offsets for this batch/expert
+    # ==========================================
+    # Pointer offsets
+    # ==========================================
     interm_ptr_base = interm_fp8_ptr + pid_b * stride_interm_b
     w_down_ptr_base = w_down_fp8_ptr + pid_b * stride_down_b
     
-    # FP32 accumulators for output activations
+    # ==========================================
+    # Initialize accumulators
+    # ==========================================
     acc = tl.zeros((BLOCK_T, BLOCK_H), dtype=tl.float32)
     
-    # Load scalar scale factors
+    # ==========================================
+    # Scale for quantization
+    # ==========================================
     scale_interm = tl.load(scale_interm_ptr + pid_b).to(tl.float32)
     scale_w_down = tl.load(scale_w_down_ptr + pid_b).to(tl.float32)
 
-    # Early Exit checking routing weights
+    # ==========================================
+    # Load routing weights for this block: [BLOCK_T, B]
+    # ==========================================
     rw_ptr = routing_weights_ptr + off_t * stride_weight_t + pid_b * stride_weight_b
     rw_mask = off_t < T
     rw = tl.load(rw_ptr, mask=rw_mask, other=0.0).to(tl.float32)
     if tl.max(rw) == 0.0:
         return
 
-    # Inner loop over Intermediate size (IM)
+    # ==========================================
+    # Main Loop
+    # ==========================================
     for im_offset in range(0, IM, BLOCK_IM):
+        # ==========================================
+        # 1. Inner loop offset (H dimension)
+        # ==========================================
         off_im_block = off_im + im_offset
         
-        # Load Interm: [BLOCK_T, BLOCK_IM] (Native FP8)
+        # ==========================================
+        # 2. Load Interm block: [BLOCK_T, BLOCK_IM] in FP8
+        # ==========================================
         interm_ptr = (
             interm_ptr_base
             + off_t[:, None] * stride_interm_t
@@ -71,7 +92,9 @@ def _fused_down_fp8_bmm_reduction_kernel(
         interm_mask = (off_t[:, None] < T) & (off_im_block[None, :] < IM)
         interm_block = tl.load(interm_ptr, mask=interm_mask, other=0.0)
         
-        # Load Down Weights: [BLOCK_IM, BLOCK_H] (Transposed read)
+        # ==========================================
+        # 3. Load W_down block: [BLOCK_IM, BLOCK_H] (Transposed read)
+        # ==========================================
         w_down_ptr = (
             w_down_ptr_base 
             + off_h[None, :] * stride_down_h
@@ -80,14 +103,20 @@ def _fused_down_fp8_bmm_reduction_kernel(
         w_mask = (off_h[None, :] < H) & (off_im_block[:, None] < IM)
         w_down_block = tl.load(w_down_ptr, mask=w_mask, other=0.0)
         
+        # ==========================================
+        # 4. Accumulate both: acc += a @ b^T
+        # ==========================================
         acc += tl.dot(interm_block, w_down_block).to(tl.float32)
     
-    # Combined per-expert scalar
+    # ==========================================
+    # 5. Scale accumulators and apply routing weights
+    # ==========================================
     scale_expert = scale_interm * scale_w_down
-    
-    # Broadcast across hidden dimension: out * (RouterWeight * Scales)
     out = acc * (rw * scale_expert)[:, None]
 
+    # ==========================================
+    # 6. Store output block: [BLOCK_T, BLOCK_H] in BF16
+    # ==========================================
     out_ptr_base = (
         out_ptr 
         + off_t[:, None] * stride_out_t 
@@ -98,7 +127,7 @@ def _fused_down_fp8_bmm_reduction_kernel(
     tl.atomic_add(out_ptr_base, out.to(tl.bfloat16), mask=out_mask)
 
 # ==========================================
-# 1. Register the Custom Op
+# Register the Custom Op
 # ==========================================
 @torch.library.custom_op(f"{LIB_NAME}::fused_down_fp8_bmm_reduction", mutates_args=())
 def triton_fused_down_fp8_bmm_reduction(
@@ -112,12 +141,21 @@ def triton_fused_down_fp8_bmm_reduction(
     B, T, IM = interm_fp8.shape
     _, H, _ = down_fp8.shape
     
+    # ==========================================
+    # 1. Allocate activation output: [T, H]
+    # ==========================================
     out = torch.zeros((T, H), dtype=dtype, device=interm_fp8.device)
 
+    # ==========================================
+    # 2. Ensure input & weight tensors are contiguous
+    # ==========================================
     interm_fp8, down_fp8 = interm_fp8.contiguous(), down_fp8.contiguous()
     interm_scale, down_scale = interm_scale.contiguous(), down_scale.contiguous()
     routing_weights = routing_weights.contiguous()
 
+    # ==========================================
+    # 3. Launch Triton kernel
+    # ==========================================
     BLOCK_T, BLOCK_H, BLOCK_IM = 16, 128, 128
     if T == 0 or H == 0 or IM == 0: 
         return out
@@ -137,7 +175,7 @@ def triton_fused_down_fp8_bmm_reduction(
 
 
 # ==========================================
-# 2. Register the Fake Tensor (Meta) Implementation
+# Register a fake implementation for Torch Compile
 # ==========================================
 @triton_fused_down_fp8_bmm_reduction.register_fake
 def _fused_down_fp8_bmm_reduction_fake(

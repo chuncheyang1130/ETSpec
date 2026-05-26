@@ -39,30 +39,39 @@ def _fused_gate_up_fp8_bmm_silu(
     Fused Batched FP8 Matrix Multiply + Dequantize + SiLU + Multiply.
     Handles separate gate and up weight tensors.
     """
-    # 3D block grid: [B, T_tiles, IM_tiles]
+    # ==========================================
+    # Grid Coordinates & Early Exit: [B, T_tiles, IM_tiles]
+    # ==========================================
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
     pid_im = tl.program_id(2)
 
-    # Bounds check
     if pid_b >= B:
         return
 
+    # ==========================================
     # Tile offsets
+    # ==========================================
     off_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     off_im = pid_im * BLOCK_IM + tl.arange(0, BLOCK_IM)
     off_h = tl.arange(0, BLOCK_H)
 
-    # Pointer offsets for this batch/expert
+    # ==========================================
+    # Pointer offsets
+    # ==========================================
     x_ptr_base = x_fp8_ptr + pid_b * stride_x_b
     w_gate_ptr_base = w_gate_fp8_ptr + pid_b * stride_w_gate_b
     w_up_ptr_base = w_up_fp8_ptr + pid_b * stride_w_up_b
 
-    # FP32 accumulators for both gate and up
+    # ==========================================
+    # Initialize accumulators
+    # ==========================================
     acc_gate = tl.zeros((BLOCK_T, BLOCK_IM), dtype=tl.float32)
     acc_up = tl.zeros((BLOCK_T, BLOCK_IM), dtype=tl.float32)
 
-    # Load scalar scale factors
+    # ==========================================
+    # Scale for quantization
+    # ==========================================
     scale_x = tl.load(scale_x_ptr).to(tl.float32)                     # scalar
     scale_w_gate = tl.load(scale_w_gate_ptr + pid_b).to(tl.float32)   # per-expert
     scale_w_up = tl.load(scale_w_up_ptr + pid_b).to(tl.float32)       # per-expert
@@ -70,11 +79,18 @@ def _fused_gate_up_fp8_bmm_silu(
     combined_scale_gate = scale_x * scale_w_gate
     combined_scale_up = scale_x * scale_w_up
 
-    # H-loop: process in blocks
+    # ==========================================
+    # Main Loop
+    # ==========================================
     for h_offset in range(0, H, BLOCK_H):
+        # ==========================================
+        # 1. Inner loop offset (H dimension)
+        # ==========================================
         off_h_block = off_h + h_offset
-
-        # Load X block: [BLOCK_T, BLOCK_H] in FP8
+        
+        # ==========================================
+        # 2. Load X block: [BLOCK_T, BLOCK_H] in FP8
+        # ==========================================
         x_ptr = (
             x_ptr_base
             + off_t[:, None] * stride_x_t
@@ -83,10 +99,14 @@ def _fused_gate_up_fp8_bmm_silu(
         x_mask = (off_t[:, None] < T) & (off_h_block[None, :] < H)
         x_block = tl.load(x_ptr, mask=x_mask, other=0.0)
 
-        # Base masks for W (bounds checking against IM and H)
+        # ==========================================
+        # 3-1. Base masks for W (bounds checking against IM and H)
+        # ==========================================
         w_mask = (off_im[None, :] < IM) & (off_h_block[:, None] < H)
 
-        # Load W_gate block: [BLOCK_H, BLOCK_IM] (Transposed read)
+        # ==========================================
+        # 3-2. Load W_gate block: [BLOCK_H, BLOCK_IM] (Transposed read)
+        # ==========================================
         w_gate_ptr = (
             w_gate_ptr_base
             + off_im[None, :] * stride_w_gate_im
@@ -94,7 +114,9 @@ def _fused_gate_up_fp8_bmm_silu(
         )
         w_gate_block = tl.load(w_gate_ptr, mask=w_mask, other=0.0)
 
-        # Load W_up block: [BLOCK_H, BLOCK_IM]
+        # ==========================================
+        # 3-3. Load W_up block: [BLOCK_H, BLOCK_IM]
+        # ==========================================
         w_up_ptr = (
             w_up_ptr_base
             + off_im[None, :] * stride_w_up_im
@@ -102,18 +124,22 @@ def _fused_gate_up_fp8_bmm_silu(
         )
         w_up_block = tl.load(w_up_ptr, mask=w_mask, other=0.0)
 
-        # Accumulate both: acc += a @ b^T
+        # ==========================================
+        # 4. Accumulate both: acc += a @ b^T
+        # ==========================================
         acc_gate += tl.dot(x_block, w_gate_block).to(tl.float32)
         acc_up += tl.dot(x_block, w_up_block).to(tl.float32)
 
-    # Epilogue: Apply scales directly to registers
+    # ==========================================
+    # 5. Scale accumulators and apply SiLU
+    # ==========================================
     acc_gate = acc_gate * combined_scale_gate
     acc_up = acc_up * combined_scale_up
-
-    # Compute SiLU * Up (all in FP32 for numerical stability)
     out = (acc_gate * tl.sigmoid(acc_gate)) * acc_up
 
-    # Store output: [B, T, IM]
+    # ==========================================
+    # 6. Store output block: [B, T, IM] in BF16
+    # ==========================================
     out_ptr_base = (
         out_ptr
         + pid_b * stride_out_b
@@ -126,7 +152,7 @@ def _fused_gate_up_fp8_bmm_silu(
 
 
 # ==========================================
-# 1. Register the Custom Op
+# Register the Custom Op
 # ==========================================
 @torch.library.custom_op(f"{LIB_NAME}::fused_gate_up_fp8_bmm_silu", mutates_args=())
 def triton_fused_gate_up_fp8_bmm_silu(
@@ -144,20 +170,20 @@ def triton_fused_gate_up_fp8_bmm_silu(
     B, T, H = x_fp8.shape
     _, IM, _ = w_gate_fp8.shape
     
-    # Allocate intermediate output [B, T, IM] directly
+    # ==========================================
+    # 1. Allocate intermediate output: [B, T, IM]
+    # ==========================================
     out = torch.zeros((B, T, IM), dtype=dtype, device=x_fp8.device)
 
-    # Ensure memory contiguity
-    x_fp8 = x_fp8.contiguous()
-    w_gate_fp8 = w_gate_fp8.contiguous()
-    w_up_fp8 = w_up_fp8.contiguous()
+    # ==========================================
+    # 2. Ensure input, weight, scale tensors are contiguous
+    # ==========================================
+    x_fp8, w_gate_fp8, w_up_fp8 = x_fp8.contiguous(), w_gate_fp8.contiguous(), w_up_fp8.contiguous()
+    scale_x, scale_w_gate, scale_w_up = scale_x.contiguous(), scale_w_gate.contiguous(), scale_w_up.contiguous()
 
-    # Normalize scales
-    scale_x = scale_x.view(1).to(dtype=torch.float32).contiguous()
-    scale_w_gate = scale_w_gate.expand(B).to(dtype=torch.float32).contiguous()
-    scale_w_up = scale_w_up.expand(B).to(dtype=torch.float32).contiguous()
-
-    # Tuning heuristic
+    # ==========================================
+    # 3. Launch Triton kernel
+    # ==========================================
     BLOCK_T, BLOCK_IM, BLOCK_H = 16, 128, 128
     if T == 0 or IM == 0 or H == 0:
         return out
@@ -180,7 +206,7 @@ def triton_fused_gate_up_fp8_bmm_silu(
     return out
 
 # ==========================================
-# 2. Register the Fake Tensor (Meta) Implementation
+# Register a fake implementation for Torch Compile
 # ==========================================
 @triton_fused_gate_up_fp8_bmm_silu.register_fake
 def _fused_gate_up_fp8_bmm_silu_fake(
