@@ -13,15 +13,38 @@ capture.
 from typing import Any, Dict
 
 from specdecodes.helpers.recipes.base_recipe import BaseRecipe
+from ...restructurer.moe_contiguous import MoEContiguousRestructurer
 from ...restructurer.moe_topn_fp8 import MoETopNFP8Restructurer
 
 
 class Recipe(BaseRecipe):
-    """Base TopN-subset MoE recipe (fp8, no SVD, no offload)."""
+    """Base TopN-subset MoE recipe (fp8 draft, contiguous-weight target).
+
+    Same structure as the bf16 sibling — only the draft restructurer differs
+    (FP8 packed storage instead of bf16). The target swap is the same: HF
+    MoE -> `Qwen3MoeContiguousMoeBlock`.
+    """
 
     def __init__(self):
         super().__init__()
-        self.restructurer = MoETopNFP8Restructurer
+        self.draft_restructurer = MoETopNFP8Restructurer
+        self.target_restructurer = MoEContiguousRestructurer
+
+    def apply_structure(self, model, structure_config, dtype, device):
+        """Dispatch on `kind` so one recipe can apply different swaps to target vs draft."""
+        if not structure_config:
+            return
+        kind = structure_config.get("kind", "draft_packed_topn")
+        if kind == "target_contiguous":
+            self.target_restructurer.restructure_model(
+                model, structure_config, dtype, device
+            )
+        elif kind == "draft_packed_topn":
+            self.draft_restructurer.restructure_model(
+                model, structure_config, dtype, device
+            )
+        else:
+            raise ValueError(f"Unknown structure kind: {kind!r}")
 
     def _build_target_config(
         self, target_model, max_length, cpu_offload_gb, dtype, device
@@ -32,7 +55,8 @@ class Recipe(BaseRecipe):
     def generate_configurations(
         self, target_model, draft_model, max_length, cpu_offload_gb, dtype, device
     ):
-        cfg = {
+        draft_cfg = {
+            "kind": "draft_packed_topn",
             "top_n": 32,
             # How many kept experts each dropped expert distributes its
             # routing mass onto. K=1 reduces to the pre-merge "argmax to
@@ -44,8 +68,10 @@ class Recipe(BaseRecipe):
         }
 
         if draft_model is not None:
-            setattr(draft_model, "topn_subset_config", cfg)
+            setattr(draft_model, "topn_subset_config", draft_cfg)
 
-        target_config: Dict[str, Any] = {}
+        # Swap the target's HF MoE blocks for the contiguous-weight variant
+        # (drives the GMM Triton kernels instead of HF's per-expert dispatch).
+        target_cfg: Dict[str, Any] = {"kind": "target_contiguous"}
 
-        return target_config, {"structure_config": cfg}
+        return {"structure_config": target_cfg}, {"structure_config": draft_cfg}
