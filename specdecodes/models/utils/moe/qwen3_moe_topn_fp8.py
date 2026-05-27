@@ -7,12 +7,16 @@ import torch
 import torch._dynamo as dynamo
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 from .qwen3_moe_topn import (
     PackedTopNMoeBlock,
     _is_qwen3_moe_block,
+    _read_target_expert_weight,
     _set_module_by_name,
 )
+
+from transformers.models.qwen3_moe import Qwen3MoeConfig
 
 from .triton_fused_gate_up_fp8_bmm_silu import triton_fused_gate_up_fp8_bmm_silu
 from .triton_fused_down_fp8_bmm_reduction import triton_fused_down_fp8_bmm_reduction
@@ -105,9 +109,7 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
 
     def __init__(
         self,
-        hidden_size: int,
-        intermediate_size: int,
-        num_experts: int,
+        config: Qwen3MoeConfig,
         top_n: int,
         dtype: torch.dtype,
         device: torch.device | str,
@@ -120,9 +122,7 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         self._compute_dtype = dtype
         self._storage_dtype = torch.float8_e4m3fn
         super().__init__(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
+            config=config,
             top_n=top_n,
             dtype=dtype,
             device=device,
@@ -243,15 +243,15 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         )
 
         for slot, eid in enumerate(kept_ids.tolist()):
-            expert = target_block.experts[int(eid)]
+            gate_w, up_w, down_w = _read_target_expert_weight(target_block, int(eid))
             gate_proj_real[slot].copy_(
-                expert.gate_proj.weight.to(device=target_device, dtype=compute_dtype)
+                gate_w.to(device=target_device, dtype=compute_dtype)
             )
             up_proj_real[slot].copy_(
-                expert.up_proj.weight.to(device=target_device, dtype=compute_dtype)
+                up_w.to(device=target_device, dtype=compute_dtype)
             )
             down_proj_real[slot].copy_(
-                expert.down_proj.weight.to(device=target_device, dtype=compute_dtype)
+                down_w.to(device=target_device, dtype=compute_dtype)
             )
 
         # Quantize directly in [B, N, K] layout. absmax is over (-2, -1) so the
@@ -269,57 +269,6 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         self.down_proj_scale_inv.data.copy_(down_proj_scale_inv)
 
         return True
-
-    def _expert_forward(self, x: torch.Tensor, topn_routing_weights: torch.Tensor) -> torch.Tensor:
-        """FP8 batched-MoE forward with fused rescale+silu and folded down rescale.
-
-        Steps (per call, all in-graph):
-          1. Quantize `x` to FP8 (per-tensor scale).
-          2. Broadcast to [top_n, T, hidden] contiguous (bmm_fp8 batch).
-          3. bmm_fp8 gate_up -> [top_n, T, 2*im] bf16 with unit scales
-             (real dequant scales applied in step 4).
-          4. Triton-fused (per-expert rescale + silu(gate) * up) -> interm
-             [top_n, T, im]. Replaces the chunk+silu+mul chain AND the
-             separate per-expert rescale pass; both reads/writes collapse
-             into one streaming kernel.
-          5. Quantize interm to FP8 per-tensor.
-          6. bmm_fp8 down -> [top_n, T, hidden] bf16 with unit scales.
-          7. Fold (interm_scale_inv * down_scale_inv[e]) into kept_weights
-             and do the weighted sum in one go. No separate down rescale
-             kernel — the per-expert factor rides on the mixing weight,
-             which is already a per-expert per-token elementwise.
-        """
-        top_n = self.top_n
-        T = x.shape[0]
-        hidden = self.hidden_size
-        compute_dtype = self._compute_dtype
-
-        # --- gate_up ---
-        x_fp8, x_scale_inv = _quant_act_per_tensor(x)              # [T, hidden] fp8, scalar the wrapper.
-        x_fp8 = x_fp8.unsqueeze(0).expand(top_n, T, hidden).contiguous()
-
-        interm = triton_fused_gate_up_fp8_bmm_silu(
-            x_fp8, self.gate_proj_packed_fp8, self.up_proj_packed_fp8,
-            x_scale_inv, self.gate_proj_scale_inv, self.up_proj_scale_inv,
-            dtype=compute_dtype,
-        )  
-
-        # --- down ---
-        # Per-expert quant: post-silu interm magnitudes vary 1-2 orders
-        # across experts (`silu(g)*u` with per-expert scales), so a
-        # per-tensor scale would pin to the largest expert and flush the
-        # smaller experts' interms into fp8 subnormals.
-        interm_fp8, interm_scale_inv = _quant_act_per_expert(interm)  # scale_inv: [top_n]
-        interm_fp8 = interm_fp8.contiguous()
-
-        out = triton_fused_down_fp8_bmm_reduction(
-            interm_fp8, self.down_proj_packed_fp8,
-            interm_scale_inv, self.down_proj_scale_inv,
-            topn_routing_weights,
-            dtype=compute_dtype,
-        )  # [T, hidden] bf16
-        
-        return out
 
     def _routing_weights(self, x: torch.Tensor) -> torch.Tensor:
         """Sparse routing override — softmax-over-top_k + gather-mix.
@@ -340,20 +289,65 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
           5. Weighted sum across k → [T, top_n].
         """
         all_logits = F.linear(x, self.full_gate_weight)                 # [T, num_experts]
-        topk_vals, topk_idx = torch.topk(
+        topk_vals, topk_indices = torch.topk(
             all_logits.to(torch.float32), k=self.target_top_k, dim=-1
         )
         
         if self.norm_topk_prob:
-            topk_w = F.softmax(topk_vals, dim=-1).to(x.dtype)           # [T, top_k] sums to 1
+            topk_probs = F.softmax(topk_vals, dim=-1).to(x.dtype)       # [T, top_k] sums to 1
         else:
             global_softmax = F.softmax(all_logits, dim=-1)
-            topk_w = torch.gather(global_softmax, -1, topk_idx)
+            topk_probs = torch.gather(global_softmax, -1, topk_indices)
             
-        top_w = top_w.to(x.dtype)
+        topk_probs = topk_probs.to(x.dtype)
         # gathered_P = self.redirect_P[topk_idx]                        # [T, top_k, top_n]
-        gathered_P = F.embedding(topk_idx, self.redirect_P)             # [T, top_k, top_n]
-        return (topk_w.unsqueeze(-1) * gathered_P).sum(dim=1)           # [T, top_n]
+        gathered_P = F.embedding(topk_indices, self.redirect_P)         # [T, top_k, top_n]
+        return (topk_probs.unsqueeze(-1) * gathered_P).sum(dim=1)       # [T, top_n]
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ================================================
+        # Flatten leading dims to [T, H]
+        # ================================================
+        bsz, seq_len, hidden = x.shape
+        x = x.view(-1, hidden)  
+        
+        # ================================================
+        # 1. Compute gating scores and top-n experts
+        # ================================================
+        topn_routing_weights = self._routing_weights(x)   # [T, top_n]
+        
+        # ================================================
+        # 2. Prepare quantized input
+        # ================================================
+        x_fp8, x_scale_inv = _quant_act_per_tensor(x)                   # [T, hidden] fp8, scalar
+        
+        # ================================================
+        # 3. Fused gate/up packed bmm + silu: interm [T, im]
+        # ================================================
+        compute_dtype = self._compute_dtype
+        interm = triton_fused_gate_up_fp8_bmm_silu(
+            x_fp8, self.gate_proj_packed_fp8, self.up_proj_packed_fp8,
+            x_scale_inv, self.gate_proj_scale_inv, self.up_proj_scale_inv,
+            dtype=compute_dtype,
+        )  
+        
+        # ================================================
+        # 4. Requant interm (scale by expert)
+        # ================================================
+        interm_fp8, interm_scale_inv = _quant_act_per_expert(interm)    # scale_inv: [top_n]
+        interm_fp8 = interm_fp8.contiguous()
+
+        # ================================================
+        # 5. Fused down packed bmm + reduction -> [T, hidden]
+        # ================================================
+        out = triton_fused_down_fp8_bmm_reduction(
+            interm_fp8, self.down_proj_packed_fp8,
+            interm_scale_inv, self.down_proj_scale_inv,
+            topn_routing_weights,
+            dtype=compute_dtype,
+        )  # [T, hidden] bf16
+        
+        return out.view(bsz, seq_len, hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -377,26 +371,18 @@ def apply_packed_topn_fp8_structure(
     Returns the number of blocks replaced.
     """
     replaced = 0
+    block_to_be_replaced = []
     for name, module in list(model.named_modules()):
-        if not _is_qwen3_moe_block(module):
-            continue
-
-        sample_expert = module.experts[0]
-        hidden_size = int(
-            getattr(sample_expert, "hidden_size", sample_expert.gate_proj.in_features)
-        )
-        intermediate_size = int(
-            getattr(sample_expert, "intermediate_size", sample_expert.gate_proj.out_features)
-        )
+        if _is_qwen3_moe_block(module):
+            block_to_be_replaced.append((name, module))
+    
+    for name, module in tqdm(block_to_be_replaced, desc="Constructing Draft FP8 MoE Blocks"):
         target_top_k = int(getattr(module, "top_k"))
-
         block_dtype = dtype if dtype is not None else next(module.parameters()).dtype
         block_device = device if device is not None else next(module.parameters()).device
 
         new_block = PackedTopNFP8MoeBlock(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=int(module.num_experts),
+            config=model.config,
             top_n=int(top_n),
             redirect_topk=int(redirect_topk),
             dtype=block_dtype,

@@ -78,14 +78,75 @@ _TRACKER_HANDLE = "_expert_usage_handle"
 
 
 def _is_qwen3_moe_block(module: nn.Module) -> bool:
-    """Heuristic check for `Qwen3MoeSparseMoeBlock` without importing transformers."""
+    """Heuristic check: HF `Qwen3MoeSparseMoeBlock` OR the contiguous swap variant."""
+    name = module.__class__.__name__
+    if name == "Qwen3MoeSparseMoeBlock":
+        return all(
+            hasattr(module, a) for a in ("experts", "gate", "num_experts", "top_k")
+        )
+    if name == "Qwen3MoeContiguousMoeBlock":
+        return all(
+            hasattr(module, a) for a in ("router_weights", "num_experts", "top_k")
+        )
+    return False
+
+
+def _compute_router_logits(module: nn.Module, flat: torch.Tensor) -> torch.Tensor:
+    """Apply the block's router to flat hidden states, regardless of block type."""
+    if hasattr(module, "router_weights"):  # Qwen3MoeContiguousMoeBlock
+        return F.linear(flat, module.router_weights)
+    return module.gate(flat)                # HF Qwen3MoeSparseMoeBlock
+
+
+# ---------------------------------------------------------------------------
+# Target-block accessors
+#
+# Materialize-from-target paths read per-expert and router weights from the
+# target block. The target can be either:
+#   * HF `Qwen3MoeSparseMoeBlock` — per-expert `nn.Linear`s under `.experts[eid]`.
+#   * `Qwen3MoeContiguousMoeBlock` — stacked weight `nn.Parameter`s with the
+#     expert axis at dim 0 (`gate_proj_contiguous[eid]`, etc.).
+# These helpers hide the difference so the materialize code stays one path.
+# ---------------------------------------------------------------------------
+
+
+def _read_target_expert_weight(target_block: nn.Module, eid: int):
+    """Return (gate_w, up_w, down_w) for expert `eid`.
+
+    Shapes match HF Linear-weight conventions:
+      gate_w: [intermediate, hidden]
+      up_w:   [intermediate, hidden]
+      down_w: [hidden, intermediate]
+    """
+    if hasattr(target_block, "gate_proj_contiguous"):
+        return (
+            target_block.gate_proj_contiguous[eid],
+            target_block.up_proj_contiguous[eid],
+            target_block.down_proj_contiguous[eid],
+        )
+    expert = target_block.experts[int(eid)]
     return (
-        module.__class__.__name__ == "Qwen3MoeSparseMoeBlock"
-        and hasattr(module, "experts")
-        and hasattr(module, "gate")
-        and hasattr(module, "num_experts")
-        and hasattr(module, "top_k")
+        expert.gate_proj.weight,
+        expert.up_proj.weight,
+        expert.down_proj.weight,
     )
+
+
+def _read_target_router_weight(target_block: nn.Module) -> torch.Tensor:
+    """Return router weight matrix `[num_experts, hidden]` regardless of block type."""
+    if hasattr(target_block, "router_weights"):
+        return target_block.router_weights
+    if hasattr(target_block, "router"):
+        return target_block.router.weight
+    return target_block.gate.weight
+
+
+def _read_target_num_experts(target_block: nn.Module) -> int:
+    if hasattr(target_block, "num_experts"):
+        return int(target_block.num_experts)
+    if hasattr(target_block, "config") and hasattr(target_block.config, "num_experts"):
+        return int(target_block.config.num_experts)
+    raise AttributeError("target_block exposes neither .num_experts nor .config.num_experts")
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +172,7 @@ def _make_tracker_hook(block: nn.Module):
             else hidden_states
         )
 
-        router_logits = module.gate(flat)
+        router_logits = _compute_router_logits(module, flat)
         weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         topk_vals, topk_idx = torch.topk(weights, module.top_k, dim=-1)
         # Match Qwen3's `norm_topk_prob=True`: renormalize so each token's
@@ -247,7 +308,7 @@ class PackedTopNMoeBlock(nn.Module):
             )
 
         self.hidden_size = int(config.hidden_size)
-        self.intermediate_size = int(config.intermediate_size)
+        self.intermediate_size = int(config.moe_intermediate_size)
         self.num_experts = int(config.num_experts)
         self.norm_topk_prob = bool(config.norm_topk_prob)
         
@@ -255,7 +316,7 @@ class PackedTopNMoeBlock(nn.Module):
         self.target_top_k = int(target_top_k)
         self.redirect_topk = int(redirect_topk)
         self.act_fn = ACT2FN[hidden_act]
-
+        
         self._init_expert_weights(dtype=dtype, device=device)
         self._init_routing_buffers(dtype=dtype, device=device)
         # Per-expert weight-space footprint cache. Filled lazily on the
@@ -325,16 +386,16 @@ class PackedTopNMoeBlock(nn.Module):
         del svd_device  # unused on the no-SVD path
         im = self.intermediate_size
         for slot, eid in enumerate(kept_ids.tolist()):
-            expert = target_block.experts[int(eid)]
+            gate_w, up_w, down_w = _read_target_expert_weight(target_block, int(eid))
             # gate rows occupy [0, im); up rows occupy [im, 2*im).
             self.gate_up_proj_packed.data[slot, :im].copy_(
-                expert.gate_proj.weight.to(device=target_device, dtype=target_dtype)
+                gate_w.to(device=target_device, dtype=target_dtype)
             )
             self.gate_up_proj_packed.data[slot, im:].copy_(
-                expert.up_proj.weight.to(device=target_device, dtype=target_dtype)
+                up_w.to(device=target_device, dtype=target_dtype)
             )
             self.down_proj_packed.data[slot].copy_(
-                expert.down_proj.weight.to(device=target_device, dtype=target_dtype)
+                down_w.to(device=target_device, dtype=target_dtype)
             )
         return True
 
@@ -393,11 +454,12 @@ class PackedTopNMoeBlock(nn.Module):
             return
 
         fps: List[torch.Tensor] = []
-        for e in range(int(target_block.num_experts)):
-            exp = target_block.experts[e]
-            gate_fp = exp.gate_proj.weight.abs().sum(dim=0)    # [hidden]
-            up_fp = exp.up_proj.weight.abs().sum(dim=0)         # [hidden]
-            down_fp = exp.down_proj.weight.abs().sum(dim=1)     # [hidden]
+        num_experts = _read_target_num_experts(target_block)
+        for e in range(num_experts):
+            gate_w, up_w, down_w = _read_target_expert_weight(target_block, e)
+            gate_fp = gate_w.abs().sum(dim=0)                   # [hidden]
+            up_fp = up_w.abs().sum(dim=0)                       # [hidden]
+            down_fp = down_w.abs().sum(dim=1)                   # [hidden]
             fps.append(torch.cat([gate_fp, up_fp, down_fp]))    # [3*hidden]
         sigs = torch.stack(fps).to(device=target_device, dtype=torch.float32)
         self._cached_expert_sigs = F.normalize(sigs, dim=-1)
@@ -503,7 +565,7 @@ class PackedTopNMoeBlock(nn.Module):
             return False
 
         # Routing: full target gate (copy) + soft top-K redirect.
-        full_gate = target_block.gate.weight.detach()
+        full_gate = _read_target_router_weight(target_block).detach()
         full_gate_f32 = full_gate.to(device=target_device, dtype=torch.float32)
         kept_ids_dev = kept_ids.to(target_device)
 
