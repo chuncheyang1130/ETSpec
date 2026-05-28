@@ -3,10 +3,11 @@ method: vanilla
 
 llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
 
+dtype: bfloat16
 recipe: null
 
-max_length: 4096
-cache_implementation: dynamic
+max_length: 2048
+cache_implementation: static
 warmup_iter: 1
 compile_mode: null
 
@@ -17,6 +18,6 @@ temperature: 0
 generator_profiling: true
 
 generator_kwargs:
-  prefill_chunk_size: 4096
+  prefill_chunk_size: 2048
   verify_method: exact
   verify_kwargs: {}
