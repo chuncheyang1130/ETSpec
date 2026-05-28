@@ -1,32 +1,38 @@
 # Prompt template adapted from https://github.com/openai/simple-evals/tree/main
 from datasets import load_dataset
 
-QUERY_TEMPLATE = """
-Solve the following math problem step by step. The last line of your response should be of the form Answer: $ANSWER (without quotes) where $ANSWER is the answer to the problem.
-
-{Question}
+QWEN_QUERY_TEMPLATE = r"""
+Given the following problem, reason and give a final answer to the problem.
+Question: {Question}
+Please reason step by step, and put your final answer within \boxed{{}}.
 """.strip()
 
-# AIME 2024
-def load_aime_dataset():
-    """
-    Returns list of formatted question strings for AIME‑2024 (30 problems).
-    """
-    # ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
-    ds = load_dataset("yentinglin/aime_2025", split="train")
-    return [
-        QUERY_TEMPLATE.format(Question=example["problem"])
-        for example in ds
-    ]
+LLAMA_QUERY_TEMPLATE = r"""
+Given the following problem, reason and give a final answer to the problem.
+Problem: {Question}
+Your response should end with \"The final answer is [answer]\" where [answer] is the response to the problem.
+""".strip()
 
-def load_aime_dataset_answer():
+def load_aime_dataset(query_version: str = "qwen"):
     """
-    Returns list of dicts with 'question' and 'answer' for AIME‑2024.
+    Returns list of dicts with 'query' and 'solution' for AIME‑2024.
     """
-    ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+    if query_version == "qwen":
+        QUERY_TEMPLATE = QWEN_QUERY_TEMPLATE
+    elif query_version == "llama":
+        QUERY_TEMPLATE = LLAMA_QUERY_TEMPLATE
+    else:
+        raise ValueError(f"Unknown query_version: {query_version}")
+    
+    raw = load_dataset("HuggingFaceH4/aime_2024", split="train")
     examples = []
-    for entry in ds:
-        q = QUERY_TEMPLATE.format(Question=entry["problem"])
-        a = entry["answer"]  # the numeric answer string :contentReference[oaicite:0]{index=0}
-        examples.append({"question": q, "answer": a})
+    for entry in raw:
+        q_str = QUERY_TEMPLATE.format(Question=entry["problem"])
+        a_str = entry["answer"]  
+        sol_str = entry["solution"]
+        examples.append({
+            "query": q_str, 
+            "answer": a_str,
+            "solution": sol_str
+        })
     return examples
