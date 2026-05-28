@@ -449,8 +449,8 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
                         stopping_criteria=stopping_criteria,
                     )
                     
-                    if len(input_ids[0]) >= 128:
-                        finished = True
+                    # if len(input_ids[0]) >= 128:
+                    #     finished = True
                 if kept.numel() > 0:
                     self._maybe_stream(stream_callback, kept)
 
