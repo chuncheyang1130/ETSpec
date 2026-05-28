@@ -240,12 +240,12 @@ def run_mtbench_eval(generator, tokenizer, past_key_values, draft_past_key_value
         total_target_time += overall_log["avg_target_time"] * n_iter
         
         # log post-verify/speculate count (only when supported)
-        if overall_log.get("post_verify_count", None) is not None:
-            logging.info(
-                f"Post-verify count: {overall_log.get('post_verify_count', 0)}, Speculate count: {overall_log.get('speculate_count', 0)}"
-            )
-            post_verify_count_list.append(overall_log.get('post_verify_count', 0))
-            speculate_count_list.append(overall_log.get('speculate_count', 0))
+        # if overall_log.get("post_verify_count", None) is not None:
+        #     logging.info(
+        #         f"Post-verify count: {overall_log.get('post_verify_count', 0)}, Speculate count: {overall_log.get('speculate_count', 0)}"
+        #     )
+        #     post_verify_count_list.append(overall_log.get('post_verify_count', 0))
+        #     speculate_count_list.append(overall_log.get('speculate_count', 0))
             
     print(f"Final Results:")
     tput_mean, tput_std = np.mean(tput_list), np.std(tput_list)
