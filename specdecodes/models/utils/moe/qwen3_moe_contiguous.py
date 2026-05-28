@@ -129,9 +129,9 @@ class Qwen3MoeContiguousMoeBlock(nn.Module):
         topk_vals, topk_indices = torch.topk(routing_logits, k=self.top_k, dim=-1)   # Both [B, T, top_k]
         
         if self.norm_topk_prob:
-            topk_probs = F.softmax(topk_vals, dim=-1).to(x.dtype)                           # [T, top_k] sums to 1
+            topk_probs = F.softmax(topk_vals, dim=-1, dtype=torch.float32)           # [T, top_k] sums to 1
         else:
-            global_softmax = F.softmax(routing_logits, dim=-1)
+            global_softmax = F.softmax(routing_logits, dim=-1, dtype=torch.float32)
             topk_probs = torch.gather(global_softmax, -1, topk_indices)
             
         topk_probs = topk_probs.to(x.dtype)
@@ -208,7 +208,7 @@ def apply_contiguous_moe_block_to_qwen_moe(model: nn.Module) -> int:
     # ==========================================
     # 2: Replace with Contiguous MoE Block
     # ==========================================
-    for absolute_name, hf_block in block_to_replace:
+    for absolute_name, hf_block in tqdm(block_to_replace, desc="Replacing MoE blocks with contiguous weight"):
         # Build new moe block with contiguous weights from the original HuggingFace block
         new_moe_block = Qwen3MoeContiguousMoeBlock.from_huggingface(hf_block)
 
