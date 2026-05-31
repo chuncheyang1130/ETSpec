@@ -90,13 +90,13 @@ def _fused_gate_up_fp8_bmm_silu(
         # ==========================================
         # 2. Load X block: [BLOCK_T, BLOCK_H] in FP8
         # ==========================================
-        x_tile_ptr = (
+        x_block_ptr = (
             x_fp8_ptr
             + off_t[:, None] * stride_x_t
             + off_h_block[None, :] * stride_x_h
         )
         x_mask = (off_t[:, None] < T) & (off_h_block[None, :] < H)
-        x_block = tl.load(x_tile_ptr, mask=x_mask, other=0.0)
+        x_block = tl.load(x_block_ptr, mask=x_mask, other=0.0)
 
         # ==========================================
         # 3-1. Base masks for W (bounds checking against IM and H)
@@ -106,22 +106,22 @@ def _fused_gate_up_fp8_bmm_silu(
         # ==========================================
         # 3-2. Load W_gate block: [BLOCK_H, BLOCK_IM] (Transposed read)
         # ==========================================
-        w_gate_tile_ptr = (
+        w_gate_block_ptr = (
             w_gate_ptr_base
             + off_im[None, :] * stride_w_gate_im
             + off_h_block[:, None] * stride_w_gate_h
         )
-        w_gate_block = tl.load(w_gate_tile_ptr, mask=w_mask, other=0.0)
+        w_gate_block = tl.load(w_gate_block_ptr, mask=w_mask, other=0.0)
 
         # ==========================================
         # 3-3. Load W_up block: [BLOCK_H, BLOCK_IM]
         # ==========================================
-        w_up_tile_ptr = (
+        w_up_block_ptr = (
             w_up_ptr_base
             + off_im[None, :] * stride_w_up_im
             + off_h_block[:, None] * stride_w_up_h
         )
-        w_up_block = tl.load(w_up_tile_ptr, mask=w_mask, other=0.0)
+        w_up_block = tl.load(w_up_block_ptr, mask=w_mask, other=0.0)
 
         # ==========================================
         # 4. Accumulate both: acc += a @ b^T

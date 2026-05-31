@@ -64,7 +64,7 @@ def _fused_down_fp8_bmm_reduction_kernel(
     scale_w_down = tl.load(scale_w_down_ptr + pid_e).to(tl.float32)
 
     # ==========================================
-    # Load routing weights for this block: [BLOCK_T, E]
+    # Load routing weights for this block: [BLOCK_T]
     # ==========================================
     rw_ptr = routing_weights_ptr + off_t * stride_rw_t + pid_e * stride_rw_e
     rw = tl.load(rw_ptr, mask=off_t < T, other=0.0).to(tl.float32)    # [BLOCK_T] routing weights for this expert; 0 for out-of-bounds tokens
