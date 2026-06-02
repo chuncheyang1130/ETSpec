@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional
 
 import torch.nn as nn
 
-from specdecodes.models.utils.moe.qwen3_moe_topn import apply_packed_topn_structure
+from specdecodes.models.utils.moe.base.qwen3_moe_topn import apply_packed_topn_structure
 
 
 class MoETopNRestructurer:

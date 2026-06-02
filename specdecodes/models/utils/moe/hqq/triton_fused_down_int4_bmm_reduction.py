@@ -10,7 +10,11 @@ activation stays bf16 (A16); weights are dequantized to bf16 on the fly.
 Each expert's contribution is scaled by its routing weight and atomically
 summed into the shared [T, H] output.
 
-Affine dequant:  W = (W_q - zero) * scale     (scale == 1 / hqq_scale)
+Affine dequant (FMA-folded form used in the K-loop):
+    W ≈ W_q · scale + zero_scaled,   where  scale == 1 / hqq_scale
+                                            zero_scaled == -hqq_zero · scale
+One FMA per element instead of `(W_q - zero) * scale` (2 ops); the zero is
+pre-folded into `zero_scaled` at materialize time in the HQQ kernel.
 
 Naming: E (Experts), T (Tokens), IM (Intermediate), H (Hidden).
 """
@@ -27,8 +31,8 @@ def _fused_down_int4_bmm_reduction_kernel(
     # Pointers
     interm_ptr,             # [E, T, IM]              (bf16 intermediate activations)
     wq_down_ptr,            # [E, H, IM//2]           (uint8, 2 int4 down weights per byte)
-    scale_down_ptr,         # [E, H, IM//GROUP_SIZE]  (fp32 dequant scales)
-    zero_down_ptr,          # [E, H, IM//GROUP_SIZE]  (fp32 zero points)
+    scale_down_ptr,         # [E, H, IM//GROUP_SIZE]  (fp32 dequant scales, = 1/hqq_scale)
+    zero_scaled_down_ptr,   # [E, H, IM//GROUP_SIZE]  (fp32 FMA bias, = -hqq_zero * scale)
     routing_weights_ptr,    # [T, E]                  (bf16 router weights)
     out_ptr,                # [T, H]                  (bf16 FFN output)
 
@@ -39,7 +43,7 @@ def _fused_down_int4_bmm_reduction_kernel(
     stride_interm_e, stride_interm_t, stride_interm_im,
     stride_wq_down_e, stride_wq_down_h, stride_wq_down_im,
     stride_scale_down_e, stride_scale_down_h, stride_scale_down_g,
-    stride_zero_down_e, stride_zero_down_h, stride_zero_down_g,
+    stride_zero_scaled_down_e, stride_zero_scaled_down_h, stride_zero_scaled_down_g,
     stride_routing_weights_t, stride_routing_weights_e,
     stride_out_t, stride_out_h,
 
@@ -70,10 +74,10 @@ def _fused_down_int4_bmm_reduction_kernel(
     # ==========================================
     # Per-expert base pointers
     # ==========================================
-    interm_base     = interm_ptr     + pid_e * stride_interm_e
-    wq_down_base    = wq_down_ptr    + pid_e * stride_wq_down_e
-    scale_down_base = scale_down_ptr + pid_e * stride_scale_down_e + off_h * stride_scale_down_h
-    zero_down_base  = zero_down_ptr  + pid_e * stride_zero_down_e  + off_h * stride_zero_down_h
+    interm_base           = interm_ptr           + pid_e * stride_interm_e
+    wq_down_base          = wq_down_ptr          + pid_e * stride_wq_down_e
+    scale_down_base       = scale_down_ptr       + pid_e * stride_scale_down_e       + off_h * stride_scale_down_h
+    zero_scaled_down_base = zero_scaled_down_ptr + pid_e * stride_zero_scaled_down_e + off_h * stride_zero_scaled_down_h
 
     # ==========================================
     # Routing weights for this expert/token-tile: [BLOCK_T]; skip if all zero
@@ -102,7 +106,7 @@ def _fused_down_int4_bmm_reduction_kernel(
         # 1. Load dequant params for this group: [BLOCK_H]
         # ==================================
         scale_down = tl.load(scale_down_base + group * stride_scale_down_g, mask=h_mask, other=0.0).to(tl.float32)
-        zero_down = tl.load(zero_down_base + group * stride_zero_down_g, mask=h_mask, other=0.0).to(tl.float32)
+        zero_scaled_down = tl.load(zero_scaled_down_base + group * stride_zero_scaled_down_g, mask=h_mask, other=0.0).to(tl.float32)
 
         # ==================================
         # 2. Packed weight bytes for this group: [HALF, BLOCK_H] (transposed read)
@@ -124,8 +128,10 @@ def _fused_down_int4_bmm_reduction_kernel(
         wq_down_lo = (wq_down_block & 0xF).to(tl.float32)
         wq_down_hi = ((wq_down_block >> 4) & 0xF).to(tl.float32)
 
-        wq_down_lo = (wq_down_lo - zero_down[None, :]) * scale_down[None, :]    # [HALF, BLOCK_H]
-        wq_down_hi = (wq_down_hi - zero_down[None, :]) * scale_down[None, :]
+        # FMA-folded dequant: `(q - zero) * scale == q * scale + zero_scaled`,
+        # where `zero_scaled = -zero * scale` was precomputed at materialize time.
+        wq_down_lo = wq_down_lo * scale_down[None, :] + zero_scaled_down[None, :]   # [HALF, BLOCK_H]
+        wq_down_hi = wq_down_hi * scale_down[None, :] + zero_scaled_down[None, :]
 
         # ==================================
         # 4. Calculate im_offset
@@ -171,15 +177,19 @@ def _fused_down_int4_bmm_reduction_kernel(
 
 @torch.library.custom_op(f"{LIB_NAME}::fused_down_int4_bmm_reduction", mutates_args=())
 def triton_fused_down_int4_bmm_reduction(
-    interm: torch.Tensor,           # [E, T, IM] bf16
-    wq_down: torch.Tensor,          # [E, H, IM//2] uint8
-    scale_down: torch.Tensor,       # [E, H, IM//group_size] fp32
-    zero_down: torch.Tensor,        # [E, H, IM//group_size] fp32
-    routing_weights: torch.Tensor,  # [T, E] bf16
+    interm: torch.Tensor,            # [E, T, IM] bf16
+    wq_down: torch.Tensor,           # [E, H, IM//2] uint8
+    scale_down: torch.Tensor,        # [E, H, IM//group_size] fp32 (= 1 / hqq_scale)
+    zero_scaled_down: torch.Tensor,  # [E, H, IM//group_size] fp32 (= -hqq_zero * scale)
+    routing_weights: torch.Tensor,   # [T, E] bf16
     group_size: int = 128,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """W4A16 fused down BMM + routing reduction. Returns [T, H] bf16."""
+    """W4A16 fused down BMM + routing reduction. Returns [T, H] bf16.
+
+    `zero_scaled_down` is the FMA-folded zero point (HQQ pre-folds `-zero * scale`
+    at materialize time), so the dequant in the K-loop is one FMA per element.
+    """
     E, T, IM = interm.shape
     _, H, _ = wq_down.shape
 
@@ -194,7 +204,7 @@ def triton_fused_down_int4_bmm_reduction(
 
     interm = interm.contiguous()
     wq_down = wq_down.contiguous()
-    scale_down, zero_down = scale_down.contiguous(), zero_down.contiguous()
+    scale_down, zero_scaled_down = scale_down.contiguous(), zero_scaled_down.contiguous()
     routing_weights = routing_weights.contiguous()
 
     BLOCK_T, BLOCK_H = 16, 128
@@ -202,12 +212,12 @@ def triton_fused_down_int4_bmm_reduction(
 
     grid = (E, triton.cdiv(T, BLOCK_T), triton.cdiv(H, BLOCK_H))
     _fused_down_int4_bmm_reduction_kernel[grid](
-        interm, wq_down, scale_down, zero_down, routing_weights, out,
+        interm, wq_down, scale_down, zero_scaled_down, routing_weights, out,
         E, T, H, IM,
         interm.stride(0), interm.stride(1), interm.stride(2),
         wq_down.stride(0), wq_down.stride(1), wq_down.stride(2),
         scale_down.stride(0), scale_down.stride(1), scale_down.stride(2),
-        zero_down.stride(0), zero_down.stride(1), zero_down.stride(2),
+        zero_scaled_down.stride(0), zero_scaled_down.stride(1), zero_scaled_down.stride(2),
         routing_weights.stride(0), routing_weights.stride(1),
         out.stride(0), out.stride(1),
         BLOCK_T=BLOCK_T,
@@ -223,7 +233,7 @@ def _fused_down_int4_bmm_reduction_fake(
     interm: torch.Tensor,
     wq_down: torch.Tensor,
     scale_down: torch.Tensor,
-    zero_down: torch.Tensor,
+    zero_scaled_down: torch.Tensor,
     routing_weights: torch.Tensor,
     group_size: int = 128,
     dtype: torch.dtype = torch.bfloat16,

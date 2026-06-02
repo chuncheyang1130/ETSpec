@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 
 import torch.nn as nn
 
-from specdecodes.models.utils.moe.qwen3_moe_contiguous import (
+from specdecodes.models.utils.moe.base.qwen3_moe_contiguous import (
     apply_contiguous_moe_block_to_qwen_moe,
 )
 

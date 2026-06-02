@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from .qwen3_moe_topn import (
+from ..base.qwen3_moe_topn import (
     PackedTopNMoeBlock,
     _is_qwen3_moe_block,
     _read_target_expert_weight,
@@ -178,7 +178,8 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         )
         self.register_buffer(
             "up_proj_scale_inv",
-            torch.ones(self.top_n, dtype=torch.float32, device=device)
+            torch.ones(self.top_n, dtype=torch.float32, device=device),
+            persistent=False,
         )
         self.register_buffer(
             "down_proj_scale_inv",

@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional
 
 import torch.nn as nn
 
-from specdecodes.models.utils.moe.qwen3_moe_topn_fp8 import apply_packed_topn_fp8_structure
+from specdecodes.models.utils.moe.fp8.qwen3_moe_topn_fp8 import apply_packed_topn_fp8_structure
 
 class MoETopNFP8Restructurer:
     """Replace each Qwen3-MoE block in the draft with an FP8 `PackedTopNFP8MoeBlock`.

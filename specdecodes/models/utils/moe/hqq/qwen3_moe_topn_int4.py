@@ -18,15 +18,21 @@ half-quadratic proximal solver that puts an L_p (p<1) penalty on the
 reconstruction error, which is robust to weight outliers. We run it group-wise
 along the contraction (input) dim — one (scale, zero) per
 (expert, output-channel, group of `group_size`) — so it lines up with the
-kernels' per-group dequant. For the kernel we store the dequant *step*
-`s = 1/scale` and the float `zero`, so dequant is `W = (W_q - zero) * s`.
+kernels' per-group dequant. The dequant is **FMA-folded** for the hot path:
+
+    W ≈ W_q · scale + zero_scaled,   where  scale = 1 / hqq_scale,
+                                            zero_scaled = -hqq_zero · scale.
+
+That's algebraically `(W_q − zero) / hqq_scale` (= `(W_q − zero) · scale`),
+but pre-folding `zero` into `zero_scaled` at materialize time turns the
+in-kernel dequant into a single FMA per element — same trick GemLite uses.
 
 Layout (per kept-expert slot):
     gate_proj_packed_int4 : [top_n, IM, H // 2]   uint8 (2 int4 / byte along H)
     up_proj_packed_int4   : [top_n, IM, H // 2]   uint8
     down_proj_packed_int4 : [top_n, H, IM // 2]   uint8
-    {gate,up}_proj_scale/zero : [top_n, IM, H // group_size] fp32
-    down_proj_scale/zero      : [top_n, H, IM // group_size] fp32
+    {gate,up}_proj_scale, _zero_scaled : [top_n, IM, H // group_size] fp32
+    down_proj_scale, _zero_scaled      : [top_n, H, IM // group_size] fp32
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ from tqdm.auto import tqdm
 
 from transformers.models.qwen3_moe import Qwen3MoeConfig
 
-from .qwen3_moe_topn import (
+from ..base.qwen3_moe_topn import (
     PackedTopNMoeBlock,
     _is_qwen3_moe_block,
     _read_target_expert_weight,
@@ -146,7 +152,12 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
             ),
             persistent=False,
         )
-        # Per-group dequant step (1/hqq_scale) and float zero point.
+        # Per-group dequant scale (= 1/hqq_scale) and FMA-folded zero
+        # (zero_scaled = -hqq_zero * scale), stored in the activation/compute
+        # dtype (typically bf16) — matches HQQ/GemLite's default and halves
+        # metadata HBM traffic vs fp32. The BMM kernels load these and
+        # immediately `.to(tl.float32)`, so internal dequant arithmetic stays
+        # at full precision.
         for name, n_out, ng in (
             ("gate_proj", self.intermediate_size, ng_h),
             ("up_proj",   self.intermediate_size, ng_h),
@@ -154,12 +165,12 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
         ):
             self.register_buffer(
                 f"{name}_scale",
-                torch.ones(self.top_n, n_out, ng, dtype=torch.float32, device=device),
+                torch.ones(self.top_n, n_out, ng, dtype=self._compute_dtype, device=device),
                 persistent=False,
             )
             self.register_buffer(
-                f"{name}_zero",
-                torch.zeros(self.top_n, n_out, ng, dtype=torch.float32, device=device),
+                f"{name}_zero_scaled",
+                torch.zeros(self.top_n, n_out, ng, dtype=self._compute_dtype, device=device),
                 persistent=False,
             )
         # bf16 probe so the inherited `materialize_from_target` reads the right
@@ -222,7 +233,9 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
 
         # Fused HQQ-INT4 quantize + 2-per-byte pack. Dispatches to a fused
         # Triton kernel on CUDA (registers-only, no per-iteration transients)
-        # and falls back to the plain-torch reference on CPU.
+        # and falls back to the plain-torch reference on CPU. Output is in
+        # FMA-folded form: (packed, scale, zero_scaled) where
+        # `zero_scaled = -hqq_zero * scale`.
         gate_packed, gs, gz = hqq_quantize_and_pack_int4(gate_proj_real, self.group_size)
         up_packed,   us, uz = hqq_quantize_and_pack_int4(up_proj_real,   self.group_size)
         down_packed, ds, dz = hqq_quantize_and_pack_int4(down_proj_real, self.group_size)
@@ -232,14 +245,14 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
         self.down_proj_packed_int4.copy_(down_packed)
 
         self.gate_proj_scale.copy_(gs)
-        self.gate_proj_zero.copy_(gz)
-        
+        self.gate_proj_zero_scaled.copy_(gz)
+
         self.up_proj_scale.copy_(us)
-        self.up_proj_zero.copy_(uz)
-        
+        self.up_proj_zero_scaled.copy_(uz)
+
         self.down_proj_scale.copy_(ds)
-        self.down_proj_zero.copy_(dz)
-        
+        self.down_proj_zero_scaled.copy_(dz)
+
         return True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -251,15 +264,15 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
         interm = triton_fused_gate_up_int4_bmm_silu(
             x,
             self.gate_proj_packed_int4, self.up_proj_packed_int4,
-            self.gate_proj_scale, self.gate_proj_zero,
-            self.up_proj_scale, self.up_proj_zero,
+            self.gate_proj_scale, self.gate_proj_zero_scaled,
+            self.up_proj_scale, self.up_proj_zero_scaled,
             group_size=self.group_size, dtype=self._compute_dtype,
         )                                                       # [E, T, IM] bf16
 
         out = triton_fused_down_int4_bmm_reduction(
             interm,
             self.down_proj_packed_int4,
-            self.down_proj_scale, self.down_proj_zero,
+            self.down_proj_scale, self.down_proj_zero_scaled,
             topn_routing_weights,
             group_size=self.group_size, dtype=self._compute_dtype,
         )                                                       # [T, H] bf16

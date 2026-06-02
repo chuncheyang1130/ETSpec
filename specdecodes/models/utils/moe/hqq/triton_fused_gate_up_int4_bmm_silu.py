@@ -14,7 +14,11 @@ of the same HALF bytes. The kernel therefore contracts each group as two
 HALF-wide halves (low-nibble half + high-nibble half), slicing the activation
 into the matching contiguous halves — no nibble interleaving needed.
 
-Affine dequant:  W = (W_q - zero) * scale     (scale == 1 / hqq_scale)
+Affine dequant (FMA-folded form used in the K-loop):
+    W ≈ W_q · scale + zero_scaled,   where  scale == 1 / hqq_scale
+                                            zero_scaled == -hqq_zero · scale
+This is one FMA per element instead of `(W_q - zero) * scale` (2 ops); the
+zero is pre-folded into `zero_scaled` at materialize time in the HQQ kernel.
 
 Naming: E (Experts), T (Tokens), IM (Intermediate), H (Hidden).
 """
@@ -32,10 +36,10 @@ def _fused_gate_up_int4_bmm_silu(
     x_ptr,              # [T, H]                    (bf16 activations, shared across experts)
     wq_gate_ptr,        # [E, IM, H//2]             (uint8, 2 int4 gate weights per byte)
     wq_up_ptr,          # [E, IM, H//2]             (uint8, 2 int4 up weights per byte)
-    scale_gate_ptr,     # [E, IM, H//GROUP_SIZE]    (fp32 gate dequant scales)
-    zero_gate_ptr,      # [E, IM, H//GROUP_SIZE]    (fp32 gate zero points)
-    scale_up_ptr,       # [E, IM, H//GROUP_SIZE]    (fp32 up dequant scales)
-    zero_up_ptr,        # [E, IM, H//GROUP_SIZE]    (fp32 up zero points)
+    scale_gate_ptr,        # [E, IM, H//GROUP_SIZE]    (fp32 gate dequant scales, = 1/hqq_scale)
+    zero_scaled_gate_ptr,  # [E, IM, H//GROUP_SIZE]    (fp32 gate FMA bias, = -hqq_zero * scale)
+    scale_up_ptr,          # [E, IM, H//GROUP_SIZE]    (fp32 up dequant scales)
+    zero_scaled_up_ptr,    # [E, IM, H//GROUP_SIZE]    (fp32 up FMA bias)
     out_ptr,            # [E, T, IM]                (bf16 intermediate activations)
 
     # Metadata
@@ -46,9 +50,9 @@ def _fused_gate_up_int4_bmm_silu(
     stride_wq_gate_e, stride_wq_gate_im, stride_wq_gate_h,
     stride_wq_up_e, stride_wq_up_im, stride_wq_up_h,
     stride_scale_gate_e, stride_scale_gate_im, stride_scale_gate_g,
-    stride_zero_gate_e, stride_zero_gate_im, stride_zero_gate_g,
+    stride_zero_scaled_gate_e, stride_zero_scaled_gate_im, stride_zero_scaled_gate_g,
     stride_scale_up_e, stride_scale_up_im, stride_scale_up_g,
-    stride_zero_up_e, stride_zero_up_im, stride_zero_up_g,
+    stride_zero_scaled_up_e, stride_zero_scaled_up_im, stride_zero_scaled_up_g,
     stride_out_e, stride_out_t, stride_out_im,
 
     # Block sizes
@@ -78,12 +82,12 @@ def _fused_gate_up_int4_bmm_silu(
     # ==========================================
     # Weight & Scale & Zero-point base pointers
     # ==========================================
-    wq_gate_base    = wq_gate_ptr    + pid_e * stride_wq_gate_e
-    wq_up_base      = wq_up_ptr      + pid_e * stride_wq_up_e
-    scale_gate_base = scale_gate_ptr + pid_e * stride_scale_gate_e + off_im * stride_scale_gate_im  
-    zero_gate_base  = zero_gate_ptr  + pid_e * stride_zero_gate_e  + off_im * stride_zero_gate_im   
-    scale_up_base   = scale_up_ptr   + pid_e * stride_scale_up_e   + off_im * stride_scale_up_im    
-    zero_up_base    = zero_up_ptr    + pid_e * stride_zero_up_e    + off_im * stride_zero_up_im    
+    wq_gate_base          = wq_gate_ptr          + pid_e * stride_wq_gate_e
+    wq_up_base            = wq_up_ptr            + pid_e * stride_wq_up_e
+    scale_gate_base       = scale_gate_ptr       + pid_e * stride_scale_gate_e       + off_im * stride_scale_gate_im
+    zero_scaled_gate_base = zero_scaled_gate_ptr + pid_e * stride_zero_scaled_gate_e + off_im * stride_zero_scaled_gate_im
+    scale_up_base         = scale_up_ptr         + pid_e * stride_scale_up_e         + off_im * stride_scale_up_im
+    zero_scaled_up_base   = zero_scaled_up_ptr   + pid_e * stride_zero_scaled_up_e   + off_im * stride_zero_scaled_up_im
 
     # ==========================================
     # Initialize accumulators
@@ -101,23 +105,23 @@ def _fused_gate_up_int4_bmm_silu(
         # 1. Load dequant params for this group: [IM] 
         # ==================================
         scale_gate = tl.load(
-            scale_gate_base 
-            + group * stride_scale_gate_g, 
+            scale_gate_base
+            + group * stride_scale_gate_g,
             mask=im_mask, other=0.0
         ).to(tl.float32)
-        zero_gate = tl.load(
-            zero_gate_base 
-            + group * stride_zero_gate_g, 
+        zero_scaled_gate = tl.load(
+            zero_scaled_gate_base
+            + group * stride_zero_scaled_gate_g,
             mask=im_mask, other=0.0
         ).to(tl.float32)
         scale_up = tl.load(
-            scale_up_base 
-            + group * stride_scale_up_g, 
+            scale_up_base
+            + group * stride_scale_up_g,
             mask=im_mask, other=0.0
         ).to(tl.float32)
-        zero_up = tl.load(
-            zero_up_base 
-            + group * stride_zero_up_g, 
+        zero_scaled_up = tl.load(
+            zero_scaled_up_base
+            + group * stride_zero_scaled_up_g,
             mask=im_mask, other=0.0
         ).to(tl.float32)
 
@@ -149,10 +153,13 @@ def _fused_gate_up_int4_bmm_silu(
         wq_up_lo = (wq_up_block & 0xF).to(tl.float32)
         wq_up_hi = ((wq_up_block >> 4) & 0xF).to(tl.float32)
 
-        wq_gate_lo = (wq_gate_lo - zero_gate[None, :]) * scale_gate[None, :]     # [HALF, BLOCK_IM]
-        wq_gate_hi = (wq_gate_hi - zero_gate[None, :]) * scale_gate[None, :]
-        wq_up_lo = (wq_up_lo - zero_up[None, :]) * scale_up[None, :]
-        wq_up_hi = (wq_up_hi - zero_up[None, :]) * scale_up[None, :]
+        # FMA-folded dequant: `(q - zero) * scale == q * scale + zero_scaled`,
+        # where `zero_scaled = -zero * scale` was precomputed at materialize time.
+        # One FMA per element instead of subtract + multiply.
+        wq_gate_lo = wq_gate_lo * scale_gate[None, :] + zero_scaled_gate[None, :]   # [HALF, BLOCK_IM]
+        wq_gate_hi = wq_gate_hi * scale_gate[None, :] + zero_scaled_gate[None, :]
+        wq_up_lo = wq_up_lo * scale_up[None, :] + zero_scaled_up[None, :]
+        wq_up_hi = wq_up_hi * scale_up[None, :] + zero_scaled_up[None, :]
 
         # ==================================
         # 4. Calculate h_offset
@@ -200,17 +207,21 @@ def _fused_gate_up_int4_bmm_silu(
 
 @torch.library.custom_op(f"{LIB_NAME}::fused_gate_up_int4_bmm_silu", mutates_args=())
 def triton_fused_gate_up_int4_bmm_silu(
-    x: torch.Tensor,            # [T, H] bf16
-    wq_gate: torch.Tensor,      # [E, IM, H//2] uint8
-    wq_up: torch.Tensor,        # [E, IM, H//2] uint8
-    scale_gate: torch.Tensor,   # [E, IM, H//group_size] fp32
-    zero_gate: torch.Tensor,    # [E, IM, H//group_size] fp32
-    scale_up: torch.Tensor,     # [E, IM, H//group_size] fp32
-    zero_up: torch.Tensor,      # [E, IM, H//group_size] fp32
+    x: torch.Tensor,                # [T, H] bf16
+    wq_gate: torch.Tensor,          # [E, IM, H//2] uint8
+    wq_up: torch.Tensor,            # [E, IM, H//2] uint8
+    scale_gate: torch.Tensor,       # [E, IM, H//group_size] fp32 (= 1 / hqq_scale)
+    zero_scaled_gate: torch.Tensor, # [E, IM, H//group_size] fp32 (= -hqq_zero * scale)
+    scale_up: torch.Tensor,         # [E, IM, H//group_size] fp32
+    zero_scaled_up: torch.Tensor,   # [E, IM, H//group_size] fp32
     group_size: int = 128,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """W4A16 fused gate/up BMM + SiLU. Returns [E, T, IM] bf16 intermediate."""
+    """W4A16 fused gate/up BMM + SiLU. Returns [E, T, IM] bf16 intermediate.
+
+    `zero_scaled_*` is the FMA-folded zero point (HQQ pre-folds `-zero * scale`
+    at materialize time), so the dequant in the K-loop is one FMA per element.
+    """
     T, H = x.shape
     E, IM, _ = wq_gate.shape
 
@@ -225,8 +236,8 @@ def triton_fused_gate_up_int4_bmm_silu(
 
     x = x.contiguous()
     wq_gate, wq_up = wq_gate.contiguous(), wq_up.contiguous()
-    scale_gate, zero_gate = scale_gate.contiguous(), zero_gate.contiguous()
-    scale_up, zero_up = scale_up.contiguous(), zero_up.contiguous()
+    scale_gate, zero_scaled_gate = scale_gate.contiguous(), zero_scaled_gate.contiguous()
+    scale_up, zero_scaled_up = scale_up.contiguous(), zero_scaled_up.contiguous()
 
     BLOCK_T, BLOCK_IM = 16, 128
     HALF = group_size // 2
@@ -234,16 +245,16 @@ def triton_fused_gate_up_int4_bmm_silu(
     grid = (E, triton.cdiv(T, BLOCK_T), triton.cdiv(IM, BLOCK_IM))
     _fused_gate_up_int4_bmm_silu[grid](
         x, wq_gate, wq_up,
-        scale_gate, zero_gate, scale_up, zero_up,
+        scale_gate, zero_scaled_gate, scale_up, zero_scaled_up,
         out,
         E, T, IM, H,
         x.stride(0), x.stride(1),
         wq_gate.stride(0), wq_gate.stride(1), wq_gate.stride(2),
         wq_up.stride(0), wq_up.stride(1), wq_up.stride(2),
         scale_gate.stride(0), scale_gate.stride(1), scale_gate.stride(2),
-        zero_gate.stride(0), zero_gate.stride(1), zero_gate.stride(2),
+        zero_scaled_gate.stride(0), zero_scaled_gate.stride(1), zero_scaled_gate.stride(2),
         scale_up.stride(0), scale_up.stride(1), scale_up.stride(2),
-        zero_up.stride(0), zero_up.stride(1), zero_up.stride(2),
+        zero_scaled_up.stride(0), zero_scaled_up.stride(1), zero_scaled_up.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
         BLOCK_T=BLOCK_T,
         BLOCK_IM=BLOCK_IM,
@@ -259,9 +270,9 @@ def _fused_gate_up_int4_bmm_silu_fake(
     wq_gate: torch.Tensor,
     wq_up: torch.Tensor,
     scale_gate: torch.Tensor,
-    zero_gate: torch.Tensor,
+    zero_scaled_gate: torch.Tensor,
     scale_up: torch.Tensor,
-    zero_up: torch.Tensor,
+    zero_scaled_up: torch.Tensor,
     group_size: int = 128,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:

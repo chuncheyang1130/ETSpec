@@ -12,8 +12,19 @@ not on the hot forward path:
   2. `_pack_int4_grouped` — pack uint8 codes (0..15) two-per-byte with a
      per-group low/high-nibble split that matches the int4 kernels' decode.
 
-Together they produce the int4 weight buffers + `(scale, zero)` group params
-consumed by the W4A16 Triton kernels for `PackedTopNINT4MoeBlock`.
+Together they produce the int4 weight buffers + `(step, zero_scaled)` group
+params consumed by the W4A16 Triton kernels for `PackedTopNINT4MoeBlock`.
+The kernels' inner dequant is folded into a single FMA — see `kernel
+dequant` notes below.
+
+Kernel dequant form (folded; what the BMM kernels actually do):
+
+    W ≈ W_q · step + zero_scaled,   where  step = 1 / hqq_scale
+                                           zero_scaled = -zero · step
+
+This is algebraically `(W_q − zero) · step` — but pre-folding `zero` into
+`zero_scaled` at materialize time lets the kernel do one FMA per element
+instead of a subtract + multiply, which is what GemLite does too.
 """
 from __future__ import annotations
 
@@ -124,15 +135,22 @@ def hqq_quantize_and_pack_int4(
     """HQQ-INT4 quantize + 2-per-byte pack, runtime-dispatched.
 
     On CUDA the fused Triton kernel runs one program per
-    (expert, output-channel, group): the entire 20-iter HQQ refinement stays
+    (expert, N-block, group): the entire 20-iter HQQ refinement stays
     in registers, no per-iteration fp32 transient buffers — orders of magnitude
     faster than the torch path on real model sizes.
 
-    On CPU it falls back to `_hqq_quantize_group` + `_pack_int4_grouped`
-    (used for CPU verification when no GPU is present).
+    On CPU it falls back to `_hqq_quantize_group` + `_pack_int4_grouped`,
+    then folds the zero point with `zero_scaled = -zero * step` so the
+    output format matches the CUDA path. Used for CPU verification when
+    no GPU is present.
 
-    Returns: packed [E, N, K // 2] uint8, step [E, N, K // group_size] fp32,
-             zero  [E, N, K // group_size] fp32.
+    Returns: packed       [E, N, K // 2]            uint8
+             step         [E, N, K // group_size]   w.dtype   (= 1 / hqq_scale)
+             zero_scaled  [E, N, K // group_size]   w.dtype   (= -hqq_zero * step)
+
+    Metadata is stored in the activation/compute dtype (`w.dtype`, typically
+    bf16) — matches HQQ/GemLite defaults; the BMM kernels cast to fp32 on
+    load so internal dequant arithmetic stays full-precision.
     """
     if w.is_cuda:
         from .triton_fused_hqq_quantize_int4 import triton_fused_hqq_quantize_int4
@@ -145,4 +163,6 @@ def hqq_quantize_and_pack_int4(
         iters=iters, lp_norm=lp_norm, beta=beta, kappa=kappa,
     )
     packed = _pack_int4_grouped(w_q, group_size)
-    return packed, step, zero
+    zero_scaled = (-zero * step).to(w.dtype)
+    step = step.to(w.dtype)
+    return packed, step, zero_scaled
