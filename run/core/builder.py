@@ -426,6 +426,16 @@ class GeneratorPipelineBuilder:
             
             # Apply structure swaps first (plain class-swap, no weight decomp), then SVD,
             # so later quantization/offloading sees the transformed modules.
+            #
+            # Draft BEFORE target, on purpose: the draft is a `share_param_deepcopy`
+            # of the target, so its MoE blocks alias the target's original expert
+            # Parameters. Restructuring the draft first swaps in pointer-less blocks
+            # and drops those aliases, so when the target restructurer copies experts
+            # into contiguous storage and nulls the source, the originals are actually
+            # freed — instead of being pinned by the draft, which would roughly double
+            # peak MoE memory. Safe because draft restructure does NOT read the target;
+            # the draft's weight pointers are materialized lazily at generate time
+            # (`materialize_from_target`), well after the target is contiguous.
             if draft_model and draft_config and draft_config.get("structure_config"):
                 self.recipe.apply_structure(draft_model.model, draft_config["structure_config"], self.dtype, self.device)
             if target_config and target_config.get("structure_config"):
@@ -459,6 +469,16 @@ class GeneratorPipelineBuilder:
 
         generator = self.load_generator(model, tokenizer, draft_model)
         generator.eval()
+
+        # Bind shared-weight draft MoE blocks to the (already-contiguous) target
+        # ONCE here — outside the per-prompt `_generate` path and BEFORE compile,
+        # so the compiled draft graph captures the bound weight pointers. Device
+        # placement (incl. offloading) is already finalized at this point, so the
+        # aliased weight buffers won't be cloned by a later `.to(...)`. No-op for
+        # generators without this hook (e.g. non-MoE methods).
+        bind_draft_weights = getattr(generator, "bind_draft_weights", None)
+        if callable(bind_draft_weights):
+            bind_draft_weights()
 
         if self.compile_mode is not None:
             # Check if there's any actual compile mode to apply

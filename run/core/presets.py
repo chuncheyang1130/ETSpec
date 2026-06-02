@@ -402,27 +402,6 @@ def register_presets():
         )
     except ImportError:
         pass
-    
-    # SubSpec SVD SD No Offload
-    try:
-        from specdecodes.models.generators.subspec_sd import SubSpecSDGenerator as SubSpecSVDSDGenerator
-        from specdecodes.models.draft_models.subspec_sd import SubSpecSDDraftModel as SubSpecSVDSDDraftModel
-        from specdecodes.helpers.recipes.subspec.hqq_4bit_svd_no_offload import (
-            Recipe as SubSpecSVDRecipeNoOffload,
-        )
-        
-        ModelRegistry.register(
-            name="subspec_svd_sd_no_offload",
-            generator_cls=SubSpecSVDSDGenerator,
-            draft_model_cls=SubSpecSVDSDDraftModel,
-            default_config={
-                "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
-                "recipe": SubSpecSVDRecipeNoOffload(),
-            },
-            needs_draft_kv_cache=False,
-        )
-    except ImportError:
-        pass
 
     # Eagle SD
     try:
@@ -476,7 +455,7 @@ def register_presets():
         pass
 
     # ExpSpec SD: top-N expert subset draft with mass-weighted picker +
-    # soft top-K weight-space redirect (no SVD). Eager draft.
+    # soft top-K weight-space redirect. 
     try:
         from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
         from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
@@ -503,9 +482,6 @@ def register_presets():
     # FP8 is unavailable on your stack.
     try:
         from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
-        # from specdecodes.models.draft_models.expspec_sd_opt import (
-        #     ExpSpecSDCgDraftModel,
-        # )
         from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
         from specdecodes.helpers.recipes.moe.moe_topn_no_offload import (
             Recipe as ExpSpecOptRecipe,
@@ -514,11 +490,54 @@ def register_presets():
         ModelRegistry.register(
             name="expspec_sd_opt",
             generator_cls=ExpSpecSDGenerator,
-            # draft_model_cls=ExpSpecSDCgDraftModel,
             draft_model_cls=ExpSpecSDDraftModel,
             default_config={
                 "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                 "recipe": ExpSpecOptRecipe(),
+            },
+            needs_draft_kv_cache=False,
+        )
+    except ImportError:
+        pass
+    
+    try:
+        from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
+        from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
+        from specdecodes.helpers.recipes.moe.moe_topn_int4 import (
+            Recipe as ExpSpecINT4Recipe,
+        )
+
+        ModelRegistry.register(
+            name="expspec_sd_hqq",
+            generator_cls=ExpSpecSDGenerator,
+            draft_model_cls=ExpSpecSDDraftModel,
+            default_config={
+                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "recipe": ExpSpecINT4Recipe(),
+            },
+            needs_draft_kv_cache=False,
+        )
+    except ImportError:
+        pass
+
+    # ExpSpec SD (Shared): same draft picker/tracker, but the draft MoE block
+    # copies no expert weights — it keeps only the kept expert ids and the two
+    # indexed bf16 Triton kernels read the target's contiguous stacked weights
+    # directly (original dtype, no quantization). `SharedTopNMoeBlock`.
+    try:
+        from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
+        from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
+        from specdecodes.helpers.recipes.moe.moe_topn_shared import (
+            Recipe as ExpSpecSharedRecipe,
+        )
+
+        ModelRegistry.register(
+            name="expspec_sd_shared",
+            generator_cls=ExpSpecSDGenerator,
+            draft_model_cls=ExpSpecSDDraftModel,
+            default_config={
+                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "recipe": ExpSpecSharedRecipe(),
             },
             needs_draft_kv_cache=False,
         )

@@ -1,0 +1,50 @@
+# ExpSpec SD (Shared) — top-N expert subset draft for Qwen3-MoE, shared-weight.
+#
+# Behavior:
+#   - Same mass-weighted tracker + soft top-K weight-space redirect as
+#     `expspec_sd`.
+#   - The draft MoE block (`SharedTopNMoeBlock`) copies NO expert weights:
+#     it keeps only the kept expert ids and aliases the target's contiguous
+#     stacked weights. Two indexed bf16 Triton kernels read those weights
+#     directly, selecting each kept expert by id in-kernel. Compute stays in
+#     the original weight dtype (no quantization).
+#   - Requires the contiguous-weight target swap (handled by the recipe).
+method: expspec_sd_shared
+
+llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+device: cuda:0
+dtype: bfloat16
+
+recipe:
+  class_path: specdecodes.helpers.recipes.moe.moe_topn_shared:Recipe
+
+max_length: 2048
+cache_implementation:
+  target: static
+  draft: static
+
+warmup_iter: 1
+# `materialize_kept_from_target` only swaps `kept_expert_ids` values + the
+# redirect matrix between rounds (never shapes, and the aliased weight tensors
+# keep stable identity), so the draft's compile graph stays valid. The tracker
+# hook reruns the target router in eager mode, so leave target uncompiled.
+compile_mode:
+  target: null
+  draft: max-autotune
+
+# Target sampling settings (defaults).
+do_sample: false
+temperature: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 2048
+  verify_method: exact
+  verify_kwargs: {}
+
+draft_params:
+  temperature: 1.0
+  max_depth: 16
+  topk_len: 4
