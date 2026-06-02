@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from .triton_fused_gate_up_gmm_silu import triton_fused_gate_up_gmm_silu
 from .triton_fused_down_gmm_reduction import triton_fused_down_gmm_reduction
 
+from .qwen3_moe_topn import _set_module_by_name
+
 import gc
 from tqdm.auto import tqdm
 
@@ -208,18 +210,11 @@ def apply_contiguous_moe_block_to_qwen_moe(model: nn.Module) -> int:
     # ==========================================
     # 2: Replace with Contiguous MoE Block
     # ==========================================
-    for absolute_name, hf_block in tqdm(block_to_replace, desc="Replacing MoE blocks with contiguous weight"):
+    for name, hf_block in tqdm(block_to_replace, desc="Replacing MoE blocks with contiguous weight"):
         # Build new moe block with contiguous weights from the original HuggingFace block
         new_moe_block = Qwen3MoeContiguousMoeBlock.from_huggingface(hf_block)
 
-        # Find parent module name and attribute name
-        name_parts = absolute_name.split(".")
-        parent_name = ".".join(name_parts[:-1])
-        child_name = name_parts[-1]
-
-        # Replace the original block with the contiguous version
-        parent_module = model.get_submodule(parent_name)
-        setattr(parent_module, child_name, new_moe_block)
+        _set_module_by_name(model, name, new_moe_block)
 
         # Clean up
         del hf_block

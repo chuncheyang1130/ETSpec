@@ -1,3 +1,28 @@
+"""
+Packed top-N MoE block with **W8A8** experts (FP8 weights, FP8 activations).
+
+Kept experts' gate / up / down weights are quantized to `float8_e4m3fn` with
+per-expert symmetric absmax scales, and activations are quantized on the fly
+(per-tensor before gate/up, per-expert before down).
+
+Quantization is symmetric absmax to the e4m3 range (`±448`):
+
+    scale     = 448 / absmax            # bf16 -> fp8
+    scale_inv = absmax / 448            # fp8  -> bf16 (post-matmul rescale)
+
+Weights are quantized per-expert (one scalar per kept expert per matrix);
+activations are quantized dynamically each forward — per-tensor for the gate/up
+input `x`, per-expert for the gate/up output before the down matmul.
+
+Attributes:
+    gate_proj_packed_fp8 : [top_n, IM, H]    float8_e4m3fn   (Linear [out, in])
+    up_proj_packed_fp8   : [top_n, IM, H]    float8_e4m3fn
+    down_proj_packed_fp8 : [top_n, H, IM]    float8_e4m3fn
+    {gate,up,down}_proj_scale_inv : [top_n]  fp32            per-expert dequant
+
+Storage is row-major `[B, N, K]` (matches `Linear.weight`, so the materialize load is a direct copy)
+"""
+
 from __future__ import annotations
 
 import logging
@@ -29,8 +54,10 @@ __all__ = [
 ]
 
 
-# e4m3 (float8_e4m3fn) max representable magnitude. Used as the target
-# range for symmetric absmax quantization.
+# ================================================
+# e4m3 (float8_e4m3fn) max representable magnitude. 
+# Used as the target range for symmetric absmax quantization.
+# ================================================
 _FP8_E4M3_MAX = 448.0
 
 # ---------------------------------------------------------------------------
@@ -39,7 +66,9 @@ _FP8_E4M3_MAX = 448.0
 @torch.no_grad()
 def _quant_weight_per_expert(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-expert symmetric absmax quantization to fp8_e4m3fn."""
+    # ===================================
     # OPTIMIZATION: Avoid .abs() allocation by using max(max, -min)
+    # ===================================
     amax = w.amax(dim=(-2, -1))
     amin = w.amin(dim=(-2, -1))
     absmax = torch.maximum(amax, -amin).clamp_min(1e-12)
@@ -47,7 +76,9 @@ def _quant_weight_per_expert(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
     scale = (_FP8_E4M3_MAX / absmax).to(torch.float32)        # [top_n]
     scale_inv = (absmax / _FP8_E4M3_MAX).to(torch.float32)    # [top_n]
 
+    # ===================================
     # Fused Triton Kernel
+    # ===================================
     w_fp8 = triton_fused_quantize_bf16_to_fp8(w, scale, is_per_expert=True)
     return w_fp8, scale_inv
 
@@ -55,13 +86,17 @@ def _quant_weight_per_expert(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
 @torch.no_grad()
 def _quant_act_per_tensor(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-tensor symmetric absmax quantization to fp8_e4m3fn."""
+    # ==========================================
     # OPTIMIZATION: Avoid .abs() allocation
+    # ==========================================
     absmax = torch.maximum(x.max(), -x.min()).clamp_min(1e-12)
     
     scale = (_FP8_E4M3_MAX / absmax).to(torch.float32)
     scale_inv = (absmax / _FP8_E4M3_MAX).to(torch.float32)
-
+    
+    # ==========================================
     # Fused Triton Kernel
+    # ==========================================
     x_fp8 = triton_fused_quantize_bf16_to_fp8(x, scale, is_per_expert=False)
     return x_fp8, scale_inv
 
@@ -71,7 +106,9 @@ def _quant_act_per_expert(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-expert symmetric absmax quantization for a packed activation tensor."""
     B = x.shape[0]
     
+    # ==========================================
     # OPTIMIZATION: Avoid .abs() allocation
+    # ==========================================
     x_flat_experts = x.reshape(B, -1)
     amax = x_flat_experts.amax(dim=-1)
     amin = x_flat_experts.amin(dim=-1)
@@ -80,7 +117,9 @@ def _quant_act_per_expert(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     scale = (_FP8_E4M3_MAX / absmax).to(torch.float32)           # [B]
     scale_inv = (absmax / _FP8_E4M3_MAX).to(torch.float32)       # [B]
 
+    # ==========================================
     # Fused Triton Kernel
+    # ==========================================
     x_fp8 = triton_fused_quantize_bf16_to_fp8(x, scale, is_per_expert=True)
     return x_fp8, scale_inv
 
@@ -88,23 +127,9 @@ def _quant_act_per_expert(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 # ---------------------------------------------------------------------------
 # FP8 packed top-N block
 # ---------------------------------------------------------------------------
-
 class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
-    """Packed top-N block with FP8 weights and bf16 activations.
-
-    Inherits routing / materialize-cache plumbing / forward shell from
-    `PackedTopNMoeBlock`. Overrides:
-
-      * `_init_expert_weights`  — allocates FP8 buffers in the K-outer
-        (transposed) layout that `bmm_fp8` wants, plus per-expert scale
-        vectors.
-      * `_materialize_expert_weights` — does NOT call super (the base
-        copies bf16 into the wrong layout); instead loads target weights
-        and per-expert quantizes them inline. The transposed layout means
-        the bmm forward needs no `.transpose(-2, -1)` view.
-      * `_expert_forward` — dynamic activation quant + two `bmm_fp8`
-        calls + per-expert post-rescale + the inherited silu/mul/weighted
-        sum.
+    """
+    Packed top-N block with FP8 weights and BF16 activations.
     """
 
     def __init__(
@@ -117,8 +142,10 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         target_top_k: int,
         redirect_topk: int = 4,
     ):
-        # bf16/fp16 is the *compute* dtype for the silu/mul/output path.
-        # FP8 storage dtype is hard-coded to e4m3 (matches bmm_fp8).
+        # ================================================
+        # BF16 is the *compute* dtype for the silu/mul/output path.
+        # FP8 storage dtype is hard-coded to e4m3
+        # ================================================
         self._compute_dtype = dtype
         self._storage_dtype = torch.float8_e4m3fn
         super().__init__(
@@ -136,9 +163,11 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         """
         Allocate FP8 packed weights & buffers.
         """
+        # ===========================================
         # [top_n, 2*intermediate, hidden] stored format for gate_up
         # [top_n, hidden, intermediate] stored format for down
         # Kernel expects [B, N, K] directly; pass without transposing.
+        # ===========================================
         self.gate_proj_packed_fp8 = nn.Parameter(
             torch.zeros(
                 self.top_n,
@@ -169,8 +198,11 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
             ),
             requires_grad=False,
         )
-        # Per-expert dequant scales (one fp32 scalar per kept expert per
-        # matrix). Output rescaling does `out * act_scale_inv * weight_scale_inv[e]`.
+        
+        # ===========================================
+        # Per-expert dequant scales (one fp32 scalar per kept expert per matrix)
+        # Output rescaling does `out * act_scale_inv * weight_scale_inv[e]`.
+        # ===========================================
         self.register_buffer(
             "gate_proj_scale_inv",
             torch.ones(self.top_n, dtype=torch.float32, device=device),
@@ -211,28 +243,19 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         target_dtype: torch.dtype,
         svd_device: torch.device | str,
     ) -> bool:
-        """Load kept-experts' weights from `target_block` and quantize to FP8.
-
-        Does NOT call super (the bf16 base copies into a Parameter that
-        doesn't exist on the FP8 block). Per-expert absmax → scale → cast
-        to fp8_e4m3fn, stored in [B, N, K] row-major. `Linear.weight` is
-        already [out=N, in=K], so the load is a direct copy — no transpose.
-        bmm_fp8 reads the storage via `.transpose(-2, -1)` (see forward).
         """
-        del svd_device  # unused on the no-SVD path
+        Load kept-experts' weights from `target_block` and quantize to FP8.
+        """
+
         im = self.intermediate_size
         hidden = self.hidden_size
         top_n = self.top_n
 
-        # Stage real-valued kept weights in a top-n-sized scratch tensor and
-        # quantize in one batched call. Doing it batched (vs per-expert) saves
-        # N kernel launches inside `_quant_weight_per_expert`.
-        # `target_dtype` here is the FP8 storage dtype because of
-        # `_reference_param`; pull the real compute dtype from the probe.
         compute_dtype = self._compute_dtype
 
-        # [top_n, 2*im, hidden] matches both Linear.weight layout and the
-        # final fp8 storage — no transpose, no extra contiguous copy.
+        # ==========================================
+        # Original weights
+        # ==========================================
         gate_proj_real = torch.empty(
             top_n, im, hidden, dtype=compute_dtype, device=target_device
         )
@@ -255,8 +278,9 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
                 down_w.to(device=target_device, dtype=compute_dtype)
             )
 
-        # Quantize directly in [B, N, K] layout. absmax is over (-2, -1) so the
-        # per-expert scale is identical regardless of how N and K are ordered.
+        # ==========================================
+        # Quantize per-expert weight
+        # ==========================================
         gate_proj_fp8, gate_proj_scale_inv = _quant_weight_per_expert(gate_proj_real)
         up_proj_fp8, up_proj_scale_inv = _quant_weight_per_expert(up_proj_real)
         down_proj_fp8, down_proj_scale_inv = _quant_weight_per_expert(down_proj_real)
@@ -272,15 +296,9 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         return True
 
     def _routing_weights(self, x: torch.Tensor) -> torch.Tensor:
-        """Sparse routing override — softmax-over-top_k + gather-mix.
-
-        Mathematically identical to the base's masked-softmax + dense
-        matmul, but skips materializing the [T, num_experts] sparse mask
-        and does (top_k * top_n) multiplies in the redirect instead of
-        (num_experts * top_n). On Qwen3-30B (num_experts=128, top_k=8,
-        top_n≈32) that's ~16× less compute on the redirect step plus
-        fewer kernel launches (7 → 4 in the routing chain).
-
+        """
+        Sparse routing override — softmax-over-top_k + gather-mix.
+        Mathematically identical to the base's masked-softmax + dense matmul
         Pipeline:
           1. Router GEMM (unchanged — memory-bound on full_gate_weight).
           2. top_k on fp32 logits.
@@ -301,7 +319,7 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
             topk_probs = torch.gather(global_softmax, -1, topk_indices)
             
         topk_probs = topk_probs.to(x.dtype)
-        # gathered_P = self.redirect_P[topk_idx]                        # [T, top_k, top_n]
+
         gathered_P = F.embedding(topk_indices, self.redirect_P)         # [T, top_k, top_n]
         return (topk_probs.unsqueeze(-1) * gathered_P).sum(dim=1)       # [T, top_n]
     
@@ -336,7 +354,6 @@ class PackedTopNFP8MoeBlock(PackedTopNMoeBlock):
         # 4. Requant interm (scale by expert)
         # ================================================
         interm_fp8, interm_scale_inv = _quant_act_per_expert(interm)    # scale_inv: [top_n]
-        interm_fp8 = interm_fp8.contiguous()
 
         # ================================================
         # 5. Fused down packed bmm + reduction -> [T, hidden]
@@ -371,12 +388,19 @@ def apply_packed_topn_fp8_structure(
 
     Returns the number of blocks replaced.
     """
+    # ==========================================
+    # 1. Collect targets (avoids iterator mutation while replacing)
+    # ==========================================
+    block_to_be_replaced = [
+        (name, module)
+        for name, module in list(model.named_modules())
+        if _is_qwen3_moe_block(module)
+    ]
+
+    # ==========================================
+    # 2. Replace each block with an (empty) FP8 packed top-N block
+    # ==========================================
     replaced = 0
-    block_to_be_replaced = []
-    for name, module in list(model.named_modules()):
-        if _is_qwen3_moe_block(module):
-            block_to_be_replaced.append((name, module))
-    
     for name, module in tqdm(block_to_be_replaced, desc="Constructing Draft FP8 MoE Blocks"):
         target_top_k = int(getattr(module, "top_k"))
         block_dtype = dtype if dtype is not None else next(module.parameters()).dtype

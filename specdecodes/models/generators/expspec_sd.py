@@ -1,45 +1,23 @@
-"""Generator for ExpSpec — top-N expert subset speculative decoding (no SVD).
+"""
+Generator for ExpSpec — top-N expert subset speculative decoding.
 
-The draft runs only `top_n` experts per MoE layer (full rank). The kept
-subset is **dynamic**: it's repicked from the target's tracked routing
-mass at the start of each prompt (after prefill) and again after every
-verification round, so it follows the current generation's hot experts
-instead of being fixed at build time. Mass that the target would have
-spent on dropped experts is redistributed onto the kept set via a soft
-top-K weight-space redirect.
+The draft runs only `top_n` experts per MoE layer. 
+The kept subset is **dynamic**, updated at following timings:
+    - After prefill, before the first SD round. 
+    - After every verification round
+This makes it follow the current generation's hot experts instead of being fixed at build time. 
+Mass that the target would have spent on dropped experts is redistributed onto the kept set via a top-K weight-space redirect.
 
-Build time: the draft's MoE blocks are swapped for `PackedTopNMoeBlock`
-instances (random init). The FP8 sibling registers `PackedTopNFP8MoeBlock`
-via the same `_block_cls` isinstance walk, since it subclasses the base.
+Build time: 
+    - Draft's MoE blocks are swapped for `PackedTopNMoeBlock` or `SharedTopNMoeBlock` (for shared-weight / ids-only variants).
 
 Generate time:
-  1. Install the mass-weighted tracker on the target's MoE blocks. It
-     scatter-adds the actual top-k softmax weights into a per-expert
-     mass accumulator (not bincount hit counts), so an expert that
-     handled a few high-confidence tokens outranks one that scraped many
-     low-confidence top-k slots. Mass accumulates across the whole
-     generation — *not* reset between rounds — so picks come from a
-     dense, stable distribution.
-  2. After prefill, and again after every verification round, pick the
-     top-N highest-mass experts per layer, then refresh each draft
-     block's packed tensors + routing buffers from the target's matching
-     experts. The per-block fill is cached on the kept set, so layers
-     whose pick didn't change pay nothing.
-
-Optional per-round expert-usage logging (gated by `log_expert_usage` in
-the recipe's config — `topn_subset_config` here): each verification
-round, snapshot the cumulative tracker delta (= what experts the target
-activated *for this round's tree*), compare against the kept set the
-draft was using, and report coverage / churn / top experts. A single-line
-console summary fires per round; a richer per-round record is appended
-to `expert_usage_log_path` (JSONL, one record per `_generate` call) for
-offline analysis.
+    - Install the mass-weighted tracker on the target's MoE blocks (top-k softmax weights)
+    - After prefill, and again after every verification round, pick the top-N highest-mass experts per layer
+    - Refresh each draft block's packed tensors (if needed) or selected experts + routing buffers from the target's matching experts. 
 """
 
-import json
-import os
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import torch
 from transformers.generation.logits_process import LogitsProcessorList
@@ -54,33 +32,16 @@ from specdecodes.models.utils.moe.base.qwen3_moe_topn import (
     reset_expert_usage,
 )
 from specdecodes.models.utils.moe.shared.qwen3_moe_topn_shared import SharedTopNMoeBlock
+from specdecodes.models.utils.moe.expert_usage_logger import ExpertUsageLogger
 
 from .classic_sd import ClassicSDGeneratorBase
 from ..utils.mixin import SDProfilingMixin
 
 
 _TRACKER_INSTALLED = "_moe_topn_tracker_installed"
-# Cap on how many round-local top experts to record per layer in the JSONL
-# dump. Keeps file size bounded for long generations on wide MoEs.
-_MAX_TOP_LOG = 16
 
 
 class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
-    """Top-N expert subset speculative-decoding generator (full-rank base).
-
-    Subclasses (e.g. an FP8 storage variant) inherit the picker / tracker /
-    refresh / logging machinery as-is. The only thing they typically swap is
-    the draft block class — but because the FP8 block subclasses the
-    full-rank block, isinstance walks here transparently match both.
-    """
-
-    # Block classes used by `_snapshot_kept_ids` to walk the draft's MoE
-    # layers. The FP8/INT4 blocks subclass `PackedTopNMoeBlock`, so isinstance
-    # matches them; `SharedTopNMoeBlock` does NOT inherit (shared-weight /
-    # ids-only variant) so it is listed explicitly. All expose a
-    # `materialize_from_target` method + a selected-ids buffer
-    # (`kept_expert_ids` on the packed family, `selected_expert_ids` on the
-    # shared block).
     _block_cls = (PackedTopNMoeBlock, SharedTopNMoeBlock)
 
     # Attribute on the draft model where the recipe stashes its config dict.
@@ -132,6 +93,16 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
     def _topn(self) -> int:
         return int(self._config().get("top_n", 32))
 
+    def _usage_logger(self) -> ExpertUsageLogger:
+        """Lazily build the per-round expert-usage logger (target/draft set)."""
+        logger = getattr(self, "_usage_logger_obj", None)
+        if logger is None:
+            logger = ExpertUsageLogger(
+                self.target_model, self.draft_model, self._block_cls, self._config()
+            )
+            self._usage_logger_obj = logger
+        return logger
+
     def _pick_and_update_kept(self) -> None:
         """Pick top-N per layer from cumulative tracker counts, then refresh
         the draft's packed tensors + routing buffers from the target's
@@ -151,193 +122,15 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
             self.target_model, kept, **self._materialize_kwargs(),
         )
 
-    # ------------------------------------------------------------------
-    # Per-verification expert-usage logging
-    # ------------------------------------------------------------------
-
-    def _expert_log_enabled(self) -> bool:
-        return bool(self._config().get("log_expert_usage", False))
-
-    def _expert_log_path(self) -> Optional[str]:
-        path = self._config().get("expert_usage_log_path")
-        return str(path) if path else None
-
-    def _snapshot_kept_ids(self) -> Dict[str, List[int]]:
-        # Iterate the *inner* transformer (`self.draft_model.model`) so the
-        # module paths match the keys produced by `get_expert_usage` against
-        # `self.target_model` — otherwise every name gets a stray `model.`
-        # prefix from the draft wrapper, the lookup misses, and coverage
-        # collapses to 0 across the board.
-        out: Dict[str, List[int]] = {}
-        for name, mod in self.draft_model.model.named_modules():
-            if isinstance(mod, self._block_cls):
-                # Packed/FP8/INT4 blocks expose `kept_expert_ids`; the
-                # shared-weight block renames it `selected_expert_ids`. Accept
-                # whichever the block carries.
-                ids = getattr(mod, "selected_expert_ids", None)
-                if ids is None:
-                    ids = mod.kept_expert_ids
-                out[name] = ids.detach().cpu().tolist()
-        return out
-
-    def _reset_usage_log(self) -> None:
-        self._usage_log: List[Dict[str, Any]] = []
-        self._usage_pre_cum: Dict[str, torch.Tensor] = {}
-        self._usage_pre_kept: Dict[str, List[int]] = {}
-        self._usage_prev_picks: Dict[str, List[int]] = {}
-        self._usage_round_idx = 0
-
-    def _record_round_delta(self) -> None:
-        """Compute the per-layer cumulative delta from the snapshot taken
-        before the just-finished target forward. Logs a one-line console
-        summary and appends a per-round record to `self._usage_log`.
-        """
-        curr = get_expert_usage(self.target_model)
-        if not curr:
-            return
-
-        kept_during = self._usage_pre_kept  # in use during this round's tree
-
-        # Sanity: target and draft must agree on module paths, otherwise the
-        # kept-id lookup misses every layer and coverage silently reports 0.
-        if self._usage_round_idx == 0 and kept_during:
-            unmatched = [n for n in curr if n not in kept_during]
-            if unmatched:
-                print(
-                    f"[expert-usage WARNING] {len(unmatched)}/{len(curr)} target "
-                    f"MoE layer paths have no matching draft kept-id entry — "
-                    f"e.g. target='{unmatched[0]}', "
-                    f"draft keys sample={list(kept_during.keys())[:1]}. "
-                    f"Coverage numbers will be wrong."
-                )
-
-        layers: Dict[str, Dict[str, Any]] = {}
-        agg_total = 0
-        agg_in_kept = 0
-        coverages: List[float] = []
-        churns: List[int] = []
-        round_idx = self._usage_round_idx
-
-        for name, c_curr in curr.items():
-            prev = self._usage_pre_cum.get(name)
-            delta = (c_curr - prev) if prev is not None else c_curr
-            delta_cpu = delta.detach().cpu().tolist()
-            total = int(sum(delta_cpu))
-            if total == 0:
-                continue
-
-            kept_ids = kept_during.get(name, [])
-            kept_set = set(kept_ids)
-            in_kept = int(sum(delta_cpu[i] for i in kept_ids if 0 <= i < len(delta_cpu)))
-            coverage = in_kept / total
-
-            # round-local top-K experts (id, count), descending by count.
-            top_pairs = sorted(
-                ((eid, cnt) for eid, cnt in enumerate(delta_cpu) if cnt > 0),
-                key=lambda p: -p[1],
-            )[:_MAX_TOP_LOG]
-
-            # churn: how many of last round's picks are *not* in this round's
-            # currently-active picks. Only meaningful from round 1 onwards.
-            prev_picks = self._usage_prev_picks.get(name)
-            if prev_picks is None:
-                churn: Optional[int] = None
-            else:
-                churn = len(set(prev_picks) - kept_set)
-
-            layers[name] = {
-                "tot": total,
-                "in_kept": in_kept,
-                "cov": round(coverage, 4),
-                "kept": kept_ids,
-                "top": top_pairs,
-                "churn": churn,
-            }
-            agg_total += total
-            agg_in_kept += in_kept
-            coverages.append(coverage)
-            if churn is not None:
-                churns.append(churn)
-
-        if not layers:
-            return
-
-        agg_cov = agg_in_kept / agg_total if agg_total else 0.0
-        mean_cov = sum(coverages) / len(coverages)
-        min_cov = min(coverages)
-        below_50 = sum(1 for c in coverages if c < 0.5)
-        max_churn = max(churns) if churns else None
-        mean_churn = (sum(churns) / len(churns)) if churns else None
-
-        print(
-            f"[expert-usage round {round_idx:>3}] "
-            f"agg_cov={agg_cov:.3f} mean_cov={mean_cov:.3f} min_cov={min_cov:.3f} "
-            f"layers<50%={below_50}/{len(coverages)} "
-            f"max_churn={max_churn if max_churn is not None else '-'} "
-            f"mean_churn={f'{mean_churn:.2f}' if mean_churn is not None else '-'}"
-        )
-
-        self._usage_log.append({
-            "round": round_idx,
-            "agg_total": agg_total,
-            "agg_cov": round(agg_cov, 4),
-            "mean_cov": round(mean_cov, 4),
-            "min_cov": round(min_cov, 4),
-            "layers_below_50pct": below_50,
-            "n_layers": len(coverages),
-            "max_churn": max_churn,
-            "mean_churn": round(mean_churn, 4) if mean_churn is not None else None,
-            "accept_len": None,  # filled in post-verify
-            "layers": layers,
-        })
-
-        # Stash the kept-set snapshot from *during* this round so the next
-        # round can compute churn against it. Picks for the *next* round are
-        # made by `_pick_and_update_kept` immediately after this method.
-        self._usage_prev_picks = kept_during
-        self._usage_round_idx += 1
-
-    def _set_last_round_accept_len(self, accept_len: int) -> None:
-        if not self._usage_log:
-            return
-        self._usage_log[-1]["accept_len"] = int(accept_len)
-
-    def _dump_usage_log(self) -> None:
-        path = self._expert_log_path()
-        if not path or not self._usage_log:
-            return
-        record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "config": self._config(),
-            "n_rounds": len(self._usage_log),
-            "rounds": self._usage_log,
-        }
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
-        # End-of-generation aggregate summary.
-        covs = [r["mean_cov"] for r in self._usage_log]
-        accs = [r["accept_len"] for r in self._usage_log if r["accept_len"] is not None]
-        if covs:
-            print(
-                f"[expert-usage summary] rounds={len(self._usage_log)} "
-                f"mean_cov_over_rounds={sum(covs)/len(covs):.3f} "
-                f"mean_accept_len={(sum(accs)/len(accs)):.2f} "
-                f"-> appended to {path}"
-            )
-
     def _tree_decoding(self, tree, past_key_values, position_offset, cache_position, device):
         # Counts are *not* reset here: we let them accumulate across the
         # whole generation so picks are drawn from a dense, stable
         # distribution rather than a single tree's worth of tokens.
-        if self._expert_log_enabled():
+        logger = self._usage_logger()
+        if logger.enabled:
             # Snapshot pre-round state so we can compute the round-local
             # delta after the target forward completes.
-            self._usage_pre_cum = get_expert_usage(self.target_model)
-            self._usage_pre_kept = self._snapshot_kept_ids()
+            logger.snapshot_pre_round()
 
         outputs = super()._tree_decoding(
             tree=tree,
@@ -347,9 +140,9 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
             device=device,
         )
 
-        if self._expert_log_enabled():
+        if logger.enabled:
             with nvtx.annotate("expert_usage_log", color="yellow"):
-                self._record_round_delta()
+                logger.record_round_delta()
 
         with nvtx.annotate("topn_pick", color="purple"):
             self._pick_and_update_kept()
@@ -392,8 +185,9 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
             # point on they accumulate across prefill + every SD round.
             reset_expert_usage(self.target_model)
 
-        if self._expert_log_enabled():
-            self._reset_usage_log()
+        logger = self._usage_logger()
+        if logger.enabled:
+            logger.reset()
 
         with nvtx.annotate("prefill_chunked", color="orange"):
             self._init_tree_mask(
@@ -408,9 +202,7 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
             next_token_logits = outputs.logits
             del outputs
 
-        # Step 2: initial top-N pick from prefill counts. This seeds each
-        # draft block's `kept_expert_ids` before the SD loop starts; per-round
-        # picks inside `_tree_decoding` will keep refreshing it.
+        # Init / Refresh selected expert set
         with nvtx.annotate("topn_pick_initial", color="purple"):
             self._pick_and_update_kept()
 
@@ -460,8 +252,8 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     sampled_tokens = sampled_tokens.to(input_ids.device)
                     del next_token_logits
 
-                if self._expert_log_enabled():
-                    self._set_last_round_accept_len(int(accept_len))
+                if logger.enabled:
+                    logger.set_last_round_accept_len(int(accept_len))
 
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
@@ -490,8 +282,8 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     if finished:
                         past_key_values.seq_len -= prune_tokens
 
-        if self._expert_log_enabled():
-            self._dump_usage_log()
+        if logger.enabled:
+            logger.dump()
 
         return input_ids
 

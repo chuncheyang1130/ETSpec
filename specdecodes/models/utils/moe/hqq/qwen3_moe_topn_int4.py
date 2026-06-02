@@ -1,12 +1,9 @@
-"""Packed top-N MoE block with **W4A16** experts (INT4 weights, bf16 activations).
+"""
+Packed top-N MoE block with **W4A16** experts (INT4 weights, bf16 activations).
 
-Sibling of the FP8 block (`qwen3_moe_topn_fp8.py`). Same routing / materialize-
-cache / soft top-K redirect plumbing inherited from `PackedTopNMoeBlock`; only
-the expert storage and `_expert_forward` differ. Here the kept experts' gate /
-up / down weights are quantized to 4 bits with **HQQ** (Half-Quadratic
-Quantization) and stored packed 2-per-byte; activations are never quantized
-(A16). The two Triton kernels dequantize the int4 weights to bf16 on the fly
-and run bf16 tensor-core matmuls.
+Kept experts' gate / up / down weights are quantized to 4 bits with **HQQ** (Half-Quadratic Quantization)
+Weights are packed 2-per-byte & activations are never quantized (A16). 
+The two Triton kernels dequantize the int4 weights to bf16 on the fly and run bf16 tensor-core matmuls.
 
 HQQ (Badri & Shaji, mobiusml/hqq) is calibration-free affine quant:
 
@@ -27,7 +24,7 @@ That's algebraically `(W_q − zero) / hqq_scale` (= `(W_q − zero) · scale`),
 but pre-folding `zero` into `zero_scaled` at materialize time turns the
 in-kernel dequant into a single FMA per element — same trick GemLite uses.
 
-Layout (per kept-expert slot):
+Attributes:
     gate_proj_packed_int4 : [top_n, IM, H // 2]   uint8 (2 int4 / byte along H)
     up_proj_packed_int4   : [top_n, IM, H // 2]   uint8
     down_proj_packed_int4 : [top_n, H, IM // 2]   uint8
@@ -67,13 +64,8 @@ __all__ = [
 # W4A16 packed top-N block
 # ---------------------------------------------------------------------------
 class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
-    """Packed top-N block with HQQ-INT4 weights and bf16 activations (W4A16).
-
-    Inherits routing / materialize-cache / redirect plumbing from
-    `PackedTopNMoeBlock`. Overrides expert storage (`_init_expert_weights`),
-    the HQQ quantize+pack fill (`_materialize_expert_weights`), and the forward
-    (`_routing_weights` reused from the FP8 sibling's sparse form, expert math
-    via the two int4 kernels).
+    """
+    Packed top-N block with HQQ-INT4 weights and bf16 activations (W4A16).
     """
 
     def __init__(
@@ -88,15 +80,21 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
         group_size: int = 128,
         nbits: int = 4,
     ):
-        # bf16/fp16 compute dtype for activations + the silu/output path.
+        # ==========================================
+        # BF16 compute dtype for activations + the silu/output path
+        # ==========================================
         self._compute_dtype = dtype
         self.nbits = int(nbits)
         if self.nbits != 4:
             raise ValueError(f"PackedTopNINT4MoeBlock is W4A16 only (got nbits={nbits}).")
-        # group_size must be set before super().__init__ → it sizes the buffers.
+        
+        # ==========================================
+        # group_size must be set before super().__init__ → it sizes the buffers
+        # ==========================================
         self.group_size = int(group_size)
         h = int(config.hidden_size)
         im = int(config.moe_intermediate_size)
+        
         if h % self.group_size != 0 or im % self.group_size != 0:
             raise ValueError(
                 f"group_size ({self.group_size}) must divide both hidden_size "
@@ -117,9 +115,9 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
     # ----- overrides -----
     def _init_expert_weights(self, dtype: torch.dtype, device: torch.device | str) -> None:
         """Allocate packed int4 weight buffers + per-group HQQ scale/zero."""
-        del dtype  # storage is uint8; compute dtype tracked via _compute_dtype
-        ng_h = self.hidden_size // self.group_size      # groups along H (gate/up contraction)
-        ng_im = self.intermediate_size // self.group_size    # groups along IM (down contraction)
+        del dtype                                           # storage is uint8; compute dtype tracked via _compute_dtype
+        ng_h = self.hidden_size // self.group_size          # groups along H (gate/up contraction)
+        ng_im = self.intermediate_size // self.group_size   # groups along IM (down contraction)
 
         # Packed 4-bit weights (2 codes per byte along the contraction dim).
         self.register_buffer(
@@ -152,12 +150,13 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
             ),
             persistent=False,
         )
+        
+        # ===========================================
+        # Per-group quantization parameters for dequant in the kernels
         # Per-group dequant scale (= 1/hqq_scale) and FMA-folded zero
         # (zero_scaled = -hqq_zero * scale), stored in the activation/compute
         # dtype (typically bf16) — matches HQQ/GemLite's default and halves
-        # metadata HBM traffic vs fp32. The BMM kernels load these and
-        # immediately `.to(tl.float32)`, so internal dequant arithmetic stays
-        # at full precision.
+        # ===========================================
         for name, n_out, ng in (
             ("gate_proj", self.intermediate_size, ng_h),
             ("up_proj",   self.intermediate_size, ng_h),
@@ -173,8 +172,11 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
                 torch.zeros(self.top_n, n_out, ng, dtype=self._compute_dtype, device=device),
                 persistent=False,
             )
-        # bf16 probe so the inherited `materialize_from_target` reads the right
+            
+        # ===========================================
+        # BF16 probe so the inherited `materialize_from_target` reads the right
         # (float) dtype/device for the router buffers — NOT the uint8 storage.
+        # ===========================================
         self.register_buffer(
             "_dtype_probe",
             torch.zeros(1, dtype=self._compute_dtype, device=device),
@@ -231,11 +233,10 @@ class PackedTopNINT4MoeBlock(PackedTopNMoeBlock):
             up_proj_real[slot].copy_(w_up.to(device=target_device, dtype=self._compute_dtype))
             down_proj_real[slot].copy_(w_down.to(device=target_device, dtype=self._compute_dtype))
 
-        # Fused HQQ-INT4 quantize + 2-per-byte pack. Dispatches to a fused
-        # Triton kernel on CUDA (registers-only, no per-iteration transients)
-        # and falls back to the plain-torch reference on CPU. Output is in
-        # FMA-folded form: (packed, scale, zero_scaled) where
-        # `zero_scaled = -hqq_zero * scale`.
+        # ==========================================
+        # Fused HQQ-INT4 quantize + 2-per-byte pack
+        # FMA-folded form: (packed, scale, zero_scaled) where `zero_scaled = -hqq_zero * scale`.
+        # ==========================================
         gate_packed, gs, gz = hqq_quantize_and_pack_int4(gate_proj_real, self.group_size)
         up_packed,   us, uz = hqq_quantize_and_pack_int4(up_proj_real,   self.group_size)
         down_packed, ds, dz = hqq_quantize_and_pack_int4(down_proj_real, self.group_size)
@@ -296,12 +297,19 @@ def apply_packed_topn_int4_structure(
     Int4 buffers are left zero-filled; the real HQQ fill happens at generate
     time via `materialize_from_target` once the kept set is picked.
     """
-    replaced = 0
-    block_to_be_replaced = []
-    for name, module in list(model.named_modules()):
-        if _is_qwen3_moe_block(module):
-            block_to_be_replaced.append((name, module))
+    # ==========================================
+    # 1. Collect targets (avoids iterator mutation while replacing)
+    # ==========================================
+    block_to_be_replaced = [
+        (name, module)
+        for name, module in list(model.named_modules())
+        if _is_qwen3_moe_block(module)
+    ]
 
+    # ==========================================
+    # 2. Replace each block with an (empty) INT4 packed top-N block
+    # ==========================================
+    replaced = 0
     for name, module in tqdm(block_to_be_replaced, desc="Constructing Draft INT4 MoE Blocks"):
         target_top_k = int(getattr(module, "top_k"))
         block_dtype = dtype if dtype is not None else next(module.parameters()).dtype

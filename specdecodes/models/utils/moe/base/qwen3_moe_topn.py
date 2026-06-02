@@ -1,4 +1,5 @@
-"""Packed TopN-Expert MoE block + mass-weighted expert-usage tracker.
+"""
+Packed TopN-Expert MoE block + mass-weighted expert-usage tracker.
 
 This module is the **base** for the MoE top-N family (used by the
 ExpSpec speculative-decoding methods). It ships:
@@ -12,9 +13,9 @@ ExpSpec speculative-decoding methods). It ships:
      importance.
 
   2. `PackedTopNMoeBlock` — a drop-in replacement for `Qwen3MoeSparseMoeBlock`
-     that holds **only `top_n` kept experts at full rank** (gate / up / down
+     that holds **only `top_n` kept expertsk** (gate / up / down
      weights copied verbatim from the target's experts at the kept ids) and
-     routes via the target's *full* router with a **soft top-K**
+     routes via the target's *full* router with a **top-K**
      weight-space redirect from dropped experts onto the kept set.
 
 The block is split into three template hooks so subclasses (e.g. the
@@ -26,11 +27,11 @@ plumbing:
     _materialize_expert_weights(target_block, kept_ids, ...)
     _expert_forward(x, kept_weights)
 
-Layout (per layer, full-rank base):
+Attributes:
     gate_up_proj_packed : [top_n, 2 * intermediate, hidden]  # gate rows stacked over up rows
     down_proj_packed    : [top_n, hidden, intermediate]
     full_gate_weight    : [num_experts, hidden]              # copied from target.gate
-    redirect_P          : [num_experts, top_n]               # soft top-K redirect
+    redirect_P          : [num_experts, top_n]               # top-K redirect
     kept_expert_ids     : [top_n]                            # local-slot -> original-id
 
 Forward (top_k matches target's `top_k`):
@@ -47,7 +48,7 @@ Forward (top_k matches target's `top_k`):
     w      = kept_w^T.unsqueeze(-1)                          # [top_n, T, 1]
     out    = (w * proj).sum(dim=0)                           # [T, hidden]
 
-Soft top-K redirect (vs the old argmax-one-hot redirect):
+Top-K redirect (vs the old argmax-one-hot redirect):
     For each non-kept expert, distribute its routing mass across the
     top-K most similar kept experts (cosine similarity in expert
     *weight* space, not router-row space, since weight-space captures
@@ -93,22 +94,18 @@ def _is_qwen3_moe_block(module: nn.Module) -> bool:
 
 def _compute_router_logits(module: nn.Module, flat: torch.Tensor) -> torch.Tensor:
     """Apply the block's router to flat hidden states, regardless of block type."""
-    if hasattr(module, "router_weights"):  # Qwen3MoeContiguousMoeBlock
+    if hasattr(module, "router_weights"):       # Qwen3MoeContiguousMoeBlock
         return F.linear(flat, module.router_weights)
-    return module.gate(flat)                # HF Qwen3MoeSparseMoeBlock
+    return module.gate(flat)                    # HF Qwen3MoeSparseMoeBlock
 
 
 # ---------------------------------------------------------------------------
-# Target-block accessors
-#
-# Materialize-from-target paths read per-expert and router weights from the
-# target block. The target can be either:
-#   * HF `Qwen3MoeSparseMoeBlock` — per-expert `nn.Linear`s under `.experts[eid]`.
-#   * `Qwen3MoeContiguousMoeBlock` — stacked weight `nn.Parameter`s with the
-#     expert axis at dim 0 (`gate_proj_contiguous[eid]`, etc.).
+# Materialize-from-target paths read per-expert and router weights from the target block
+# The target can be either:
+#   - HF `Qwen3MoeSparseMoeBlock` — per-expert `nn.Linear`s under `.experts[eid]`
+#   - `Qwen3MoeContiguousMoeBlock` — stacked weight `nn.Parameter`s with the expert axis at dim 0 (`gate_proj_contiguous[eid]`, etc.)
 # These helpers hide the difference so the materialize code stays one path.
 # ---------------------------------------------------------------------------
-
 
 def _read_target_expert_weight(target_block: nn.Module, eid: int):
     """Return (gate_w, up_w, down_w) for expert `eid`.
@@ -152,8 +149,6 @@ def _read_target_num_experts(target_block: nn.Module) -> int:
 # ---------------------------------------------------------------------------
 # Mass-weighted expert-usage tracker (forward-hook based)
 # ---------------------------------------------------------------------------
-
-
 def _make_tracker_hook(block: nn.Module):
     """Forward pre-hook that accumulates per-expert routing MASS.
 
@@ -175,8 +170,10 @@ def _make_tracker_hook(block: nn.Module):
         router_logits = _compute_router_logits(module, flat)
         weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         topk_vals, topk_idx = torch.topk(weights, module.top_k, dim=-1)
-        # Match Qwen3's `norm_topk_prob=True`: renormalize so each token's
-        # kept routing weights sum to 1.
+        
+        # ==========================================
+        # Match Qwen3's `norm_topk_prob=True`: renormalize so each token's kept routing weights sum to 1.
+        # ==========================================
         topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-9)
 
         buf = getattr(module, _TRACKER_BUFFER)
@@ -268,12 +265,11 @@ def pick_top_n_per_layer(
 
 
 # ---------------------------------------------------------------------------
-# Packed TopN MoE block (full rank, no SVD)
+# Packed TopN MoE block
 # ---------------------------------------------------------------------------
-
-
 class PackedTopNMoeBlock(nn.Module):
-    """Compile-friendly top-N expert subset block — full rank, no SVD.
+    """
+    Compile-friendly top-N expert subset block.
 
     Runs **all** `top_n` kept experts in parallel via broadcasted matmuls
     (no per-token expert dispatch loop). The target's full router decides
@@ -319,16 +315,19 @@ class PackedTopNMoeBlock(nn.Module):
         
         self._init_expert_weights(dtype=dtype, device=device)
         self._init_routing_buffers(dtype=dtype, device=device)
-        # Per-expert weight-space footprint cache. Filled lazily on the
-        # first materialize_from_target (target weights don't change between
-        # rounds, so it's reused across all kept-set changes).
+        
+        # ===========================================
+        # Per-expert weight-space footprint cache. 
+        # Filled lazily on the first materialize_from_target 
+        # ===========================================
         self._cached_expert_sigs: Optional[torch.Tensor] = None  # [num_experts, 3*hidden] fp32, L2-normalized
         self.reset_random_()
 
     # ----- template hooks (overridable) -----
 
     def _init_expert_weights(self, dtype: torch.dtype, device: torch.device | str) -> None:
-        """Allocate the per-expert weight Parameters. Override for FP8/SVD/etc.
+        """
+        Allocate the per-expert weight Parameters. Override for FP8/INT4/etc.
 
         Gate and up are packed into a single `[top_n, 2*intermediate, hidden]`
         tensor (gate rows over up rows) so the forward can fuse them into one
@@ -351,7 +350,8 @@ class PackedTopNMoeBlock(nn.Module):
         )
 
     def reset_random_(self) -> None:
-        """Re-seed packed tensors with small random values (placeholder fill).
+        """
+        Re-seed packed tensors with small random values (placeholder fill).
 
         Routing buffers (`full_gate_weight`, `redirect_P`) intentionally stay
         zero-initialized: forward called before `materialize_from_target`
@@ -374,20 +374,16 @@ class PackedTopNMoeBlock(nn.Module):
         kept_ids: torch.Tensor,
         target_device: torch.device,
         target_dtype: torch.dtype,
-        svd_device: torch.device | str,
     ) -> bool:
-        """Fill the per-expert weights from `target_block` at `kept_ids`.
-
-        Default: full-rank verbatim copy. Override for FP8/SVD/etc.
-
+        """
+        Fill the per-expert weights from `target_block` at `kept_ids`.
         Returns True on success, False on failure (caller will skip the
         rest of the materialize and report False so the picker can retry).
         """
-        del svd_device  # unused on the no-SVD path
         im = self.intermediate_size
         for slot, eid in enumerate(kept_ids.tolist()):
             gate_w, up_w, down_w = _read_target_expert_weight(target_block, int(eid))
-            # gate rows occupy [0, im); up rows occupy [im, 2*im).
+            
             self.gate_up_proj_packed.data[slot, :im].copy_(
                 gate_w.to(device=target_device, dtype=target_dtype)
             )
@@ -400,37 +396,41 @@ class PackedTopNMoeBlock(nn.Module):
         return True
 
     def _expert_forward(self, x: torch.Tensor, kept_weights: torch.Tensor) -> torch.Tensor:
-        """Apply the kept experts to `x`, weighted by `kept_weights`.
-
-        Default: full-rank packed matmul. Override for FP8/SVD/etc.
+        """
+        Apply the kept experts to `x`, weighted by `kept_weights`.
         """
         # Fused gate+up: one batched GEMM reads `x` from HBM once.
-        gate_up = torch.matmul(x, self.gate_up_proj_packed.transpose(-2, -1))  # [top_n, T, 2*im]
-        gate, up = gate_up.chunk(2, dim=-1)                              # each [top_n, T, im]
-        interm = self.act_fn(gate) * up                                  # [top_n, T, im]
+        gate_up = torch.matmul(x, self.gate_up_proj_packed.transpose(-2, -1))   # [top_n, T, 2*im]
+        gate, up = gate_up.chunk(2, dim=-1)                                     # each [top_n, T, im]
+        interm = self.act_fn(gate) * up                                         # [top_n, T, im]
 
-        proj = torch.matmul(interm, self.down_proj_packed.transpose(-2, -1))  # [top_n, T, hidden]
-        w = kept_weights.transpose(0, 1).unsqueeze(-1)                   # [top_n, T, 1]
-        return (w * proj).sum(dim=0)                                     # [T, hidden]
+        proj = torch.matmul(interm, self.down_proj_packed.transpose(-2, -1))    # [top_n, T, hidden]
+        w = kept_weights.transpose(0, 1).unsqueeze(-1)                          # [top_n, T, 1]
+        return (w * proj).sum(dim=0)                                            # [T, hidden]
 
     # ----- shared routing / materialize plumbing (not overridden) -----
 
     def _init_routing_buffers(self, dtype: torch.dtype, device: torch.device | str) -> None:
+        # ================================================
         # Routing buffers — copied from the target at materialize time.
+        # ================================================
         self.register_buffer(
             "full_gate_weight",
             torch.zeros(self.num_experts, self.hidden_size, dtype=dtype, device=device),
             persistent=False,
         )
-        # Soft top-K redirect: each of `num_experts` rows distributes its
-        # mass across at most `redirect_topk` kept-cluster slots. Kept
-        # experts route 100% to their own slot.
+        # ================================================
+        # Top-K redirect: each of `num_experts` rows distributes its mass across k kept experts
+        # Kept experts route 100% to themselves
+        # ================================================
         self.register_buffer(
             "redirect_P",
             torch.zeros(self.num_experts, self.top_n, dtype=dtype, device=device),
             persistent=False,
         )
+        # ================================================
         # Bookkeeping: local-kept-id -> original-expert-id. Identity init.
+        # ================================================
         self.register_buffer(
             "kept_expert_ids",
             torch.arange(self.top_n, dtype=torch.long, device=device),
@@ -439,7 +439,8 @@ class PackedTopNMoeBlock(nn.Module):
 
     @torch.no_grad()
     def _ensure_expert_sigs(self, target_block: nn.Module, target_device: torch.device) -> None:
-        """Compute and cache per-expert weight-space footprints from the target.
+        """
+        Compute and cache per-expert weight-space footprints from the target.
 
         Footprint = cat([|gate|.sum(dim=0), |up|.sum(dim=0), |down|.sum(dim=1)])
         per expert; resulting [num_experts, 3*hidden] tensor is L2-normalized
@@ -470,7 +471,8 @@ class PackedTopNMoeBlock(nn.Module):
         full_gate_f32: torch.Tensor,
         kept_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Soft top-K redirect using cached expert-weight-space cosine.
+        """
+        Top-K redirect using cached expert-weight-space cosine.
 
         `full_gate_f32` (the target router rows) is accepted for signature
         parity with potential router-row variants but **not used here** —
@@ -486,9 +488,10 @@ class PackedTopNMoeBlock(nn.Module):
 
         sigs_norm = self._cached_expert_sigs
         if sigs_norm is None:
-            # Defensive: shouldn't happen because materialize_from_target
-            # always caches sigs before this runs. Return identity-on-kept
-            # zeros-elsewhere so the block stays functional.
+            # ================================
+            # Defensive: shouldn't happen because materialize_from_target always caches sigs before this runs
+            # Return identity-on-kept zeros-elsewhere so the block stays functional.
+            # ================================
             num_experts = int(self.num_experts)
             top_n = int(self.top_n)
             device = self.redirect_P.device
@@ -504,19 +507,23 @@ class PackedTopNMoeBlock(nn.Module):
 
         sim = sigs_norm @ sigs_norm[kept_ids].T          # [num_experts, top_n]
 
-        # Top-K most-similar kept experts per row (including kept rows
-        # themselves, which we override to one-hot below).
+        # ================================================
+        # Top-K most-similar kept experts per row
+        # ================================================
         top_vals, top_idx = torch.topk(sim, k=K, dim=-1)  # both [num_experts, K]
-        # ReLU drops anti-correlated entries; eps avoids div-by-zero rows.
+        
+        # ================================================
+        # ReLU drops anti-correlated entries; eps avoids div-by-zero rows
+        # ================================================
         top_vals = F.relu(top_vals) + 1e-8
         top_vals = top_vals / top_vals.sum(dim=-1, keepdim=True)  # rows sum to 1
 
         P = torch.zeros(num_experts, top_n, dtype=torch.float32, device=device)
         P.scatter_(1, top_idx, top_vals)
 
-        # Kept experts route 100% to their own slot — overrides the soft
-        # redirect for the kept rows so kept-expert mass passes through
-        # undiluted.
+        # ================================================
+        # Kept experts route 100% to their own slot
+        # ================================================
         kept_pos = torch.arange(top_n, device=device, dtype=torch.long)
         P[kept_ids] = 0
         P[kept_ids, kept_pos] = 1.0
@@ -528,16 +535,12 @@ class PackedTopNMoeBlock(nn.Module):
         self,
         target_block: nn.Module,
         kept_ids: torch.Tensor,
-        svd_device: torch.device | str = "cuda:0",
     ) -> bool:
-        """Refill packed expert tensors + routing buffers from `target_block`.
+        """
+        Refill packed expert tensors + routing buffers from `target_block`.
 
         Per-block calls are cached on the kept set; layers whose kept set
         matched the previous call are no-ops.
-
-        `svd_device` is forwarded to `_materialize_expert_weights` (used by
-        SVD subclasses; ignored on the no-SVD path). Routing tensors live
-        on the same device as the kept experts.
 
         Returns True iff the packed tensors were actually rebuilt.
         """
@@ -560,11 +563,13 @@ class PackedTopNMoeBlock(nn.Module):
         target_device = ref.device
 
         if not self._materialize_expert_weights(
-            target_block, kept_ids, target_device, target_dtype, svd_device
+            target_block, kept_ids, target_device, target_dtype
         ):
             return False
 
-        # Routing: full target gate (copy) + soft top-K redirect.
+        # ===============================================
+        # Routing: full target gate (copy) + Top-K redirect
+        # ===============================================
         full_gate = _read_target_router_weight(target_block).detach()
         full_gate_f32 = full_gate.to(device=target_device, dtype=torch.float32)
         kept_ids_dev = kept_ids.to(target_device)
@@ -572,8 +577,11 @@ class PackedTopNMoeBlock(nn.Module):
         self.full_gate_weight.data.copy_(
             full_gate.to(device=target_device, dtype=target_dtype)
         )
+
+        # ================================================
         # Cache per-expert footprints (idempotent — no-op if already cached).
         # MUST run before `_build_redirect_P` since that reads from the cache.
+        # ================================================
         self._ensure_expert_sigs(target_block, target_device)
         P = self._build_redirect_P(full_gate_f32, kept_ids_dev)
         self.redirect_P.data.copy_(P.to(device=target_device, dtype=target_dtype))
@@ -585,7 +593,12 @@ class PackedTopNMoeBlock(nn.Module):
         return True
 
     def _routing_weights(self, x: torch.Tensor) -> torch.Tensor:
-        # Done in fp32 to match Qwen3's reference router (numerical parity).
+        """Dense masked-softmax routing -> [T, top_n] kept-slot weights.
+
+        Router GEMM -> top_k mask (non-top_k logits set to -inf) -> softmax
+        over the full row (zeros outside top_k) -> dense matmul with the
+        redirect matrix. Done in fp32 to match Qwen3's reference router.
+        """
         all_logits = F.linear(x, self.full_gate_weight)                  # [T, num_experts]
         all_logits_f32 = all_logits.to(torch.float32)
         topk_vals, topk_idx = torch.topk(all_logits_f32, k=self.target_top_k, dim=-1)
@@ -595,19 +608,28 @@ class PackedTopNMoeBlock(nn.Module):
         return all_weights @ self.redirect_P                             # [T, top_n]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # ================================================
+        # Flatten leading dims to [T, H]
+        # ================================================
         bsz, seq_len, hidden = hidden_states.shape
-        x = hidden_states.view(-1, hidden)  # [T, hidden]
+        x = hidden_states.view(-1, hidden)                               # [T, hidden]
 
-        topn_routing_weights = self._routing_weights(x)
-        out = self._expert_forward(x, topn_routing_weights)
+        # ================================================
+        # 1. Sparse routing -> kept-slot weights (full router + redirect)
+        # ================================================
+        topn_routing_weights = self._routing_weights(x)                  # [T, top_n]
+
+        # ================================================
+        # 2. Run the kept experts (template hook: BF16 / FP8 / INT4)
+        # ================================================
+        out = self._expert_forward(x, topn_routing_weights)              # [T, hidden]
+
         return out.view(bsz, seq_len, hidden)
 
 
 # ---------------------------------------------------------------------------
-# Build-time replacement: full Qwen3MoeSparseMoeBlock -> PackedTopNMoeBlock
+# Build-time replacement
 # ---------------------------------------------------------------------------
-
-
 def _set_module_by_name(model: nn.Module, name: str, new_module: nn.Module) -> None:
     parts = name.split(".")
     parent = model
@@ -631,11 +653,20 @@ def apply_packed_topn_structure(
 
     Returns the number of blocks replaced.
     """
-    replaced = 0
-    for name, module in list(model.named_modules()):
-        if not _is_qwen3_moe_block(module):
-            continue
+    # ==========================================
+    # 1. Collect targets (avoids iterator mutation while replacing)
+    # ==========================================
+    block_to_be_replaced = [
+        (name, module)
+        for name, module in list(model.named_modules())
+        if _is_qwen3_moe_block(module)
+    ]
 
+    # ==========================================
+    # 2. Replace each block with a (random-init) packed top-N block
+    # ==========================================
+    replaced = 0
+    for name, module in block_to_be_replaced:
         sample_expert = module.experts[0]
         hidden_size = int(
             getattr(sample_expert, "hidden_size", sample_expert.gate_proj.in_features)
