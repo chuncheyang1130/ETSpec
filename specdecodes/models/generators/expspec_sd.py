@@ -46,13 +46,14 @@ from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteria
 import nvtx
 
-from specdecodes.models.utils.moe.qwen3_moe_topn import (
+from specdecodes.models.utils.moe.base.qwen3_moe_topn import (
     PackedTopNMoeBlock,
     get_expert_usage,
     install_expert_usage_tracker,
     pick_top_n_per_layer,
     reset_expert_usage,
 )
+from specdecodes.models.utils.moe.shared.qwen3_moe_topn_shared import SharedTopNMoeBlock
 
 from .classic_sd import ClassicSDGeneratorBase
 from ..utils.mixin import SDProfilingMixin
@@ -73,10 +74,14 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
     full-rank block, isinstance walks here transparently match both.
     """
 
-    # Block class used by `_snapshot_kept_ids` to walk the draft's MoE
-    # layers. FP8 subclass keeps this — `PackedTopNFP8MoeBlock` is a
-    # subclass, so isinstance matches both flavors.
-    _block_cls = PackedTopNMoeBlock
+    # Block classes used by `_snapshot_kept_ids` to walk the draft's MoE
+    # layers. The FP8/INT4 blocks subclass `PackedTopNMoeBlock`, so isinstance
+    # matches them; `SharedTopNMoeBlock` does NOT inherit (shared-weight /
+    # ids-only variant) so it is listed explicitly. All expose a
+    # `materialize_from_target` method + a selected-ids buffer
+    # (`kept_expert_ids` on the packed family, `selected_expert_ids` on the
+    # shared block).
+    _block_cls = (PackedTopNMoeBlock, SharedTopNMoeBlock)
 
     # Attribute on the draft model where the recipe stashes its config dict.
     _config_attr: str = "topn_subset_config"
@@ -98,6 +103,20 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
             return
         install_expert_usage_tracker(self.target_model)
         setattr(self, _TRACKER_INSTALLED, True)
+
+    def bind_draft_weights(self) -> None:
+        """Bind shared-weight draft blocks to the target once, before generation.
+
+        Called by the builder after the target is contiguous and before the
+        draft is compiled (so the compiled graph captures the bound weight
+        pointers). Idempotent and outside the per-prompt `_generate` path.
+
+        No-op for drafts without `bind_target_weights` (e.g. the packed/FP8/INT4
+        family, which copy weights per kept set at materialize time).
+        """
+        fn = getattr(self.draft_model, "bind_target_weights", None)
+        if callable(fn):
+            fn(self.target_model)
 
     def init_cuda_graph_runner(self, device, kvCachePool=None):
         """Forward CUDA-graph capture to the draft, if it supports one.
@@ -152,7 +171,13 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
         out: Dict[str, List[int]] = {}
         for name, mod in self.draft_model.model.named_modules():
             if isinstance(mod, self._block_cls):
-                out[name] = mod.kept_expert_ids.detach().cpu().tolist()
+                # Packed/FP8/INT4 blocks expose `kept_expert_ids`; the
+                # shared-weight block renames it `selected_expert_ids`. Accept
+                # whichever the block carries.
+                ids = getattr(mod, "selected_expert_ids", None)
+                if ids is None:
+                    ids = mod.kept_expert_ids
+                out[name] = ids.detach().cpu().tolist()
         return out
 
     def _reset_usage_log(self) -> None:

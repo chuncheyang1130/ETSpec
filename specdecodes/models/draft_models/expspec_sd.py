@@ -21,9 +21,16 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from specdecodes.models.utils.moe.qwen3_moe_topn import PackedTopNMoeBlock
+from specdecodes.models.utils.moe.base.qwen3_moe_topn import PackedTopNMoeBlock
+from specdecodes.models.utils.moe.shared.qwen3_moe_topn_shared import SharedTopNMoeBlock
 
 from .subspec_sd import SubSpecSDDraftModel
+
+# Top-N MoE blocks the picker can materialize. The FP8/INT4 blocks subclass
+# `PackedTopNMoeBlock`; `SharedTopNMoeBlock` is a non-inheriting sibling
+# (shared-weight / ids-only) exposing the same `materialize_from_target` +
+# `kept_expert_ids` interface, so it is listed explicitly.
+_TOPN_BLOCK_CLASSES = (PackedTopNMoeBlock, SharedTopNMoeBlock)
 
 
 def share_param_deepcopy(model: torch.nn.Module) -> torch.nn.Module:
@@ -73,6 +80,34 @@ class ExpSpecSDDraftModel(SubSpecSDDraftModel):
         )
 
     @torch.no_grad()
+    def bind_target_weights(self, target_model: torch.nn.Module) -> int:
+        """One-time bind of each shared block to its target contiguous block.
+
+        Walks the draft's MoE blocks and, for any that support `bind_target`
+        (the shared-weight block), points it at the same-named target block's
+        stacked weights + router and caches its footprints. Called once before
+        generation, after the target has been swapped to the contiguous block.
+
+        Packed/FP8/INT4 blocks don't expose `bind_target` (they copy weights
+        per kept set in `materialize_from_target`), so they are skipped here.
+
+        Returns the number of blocks bound this call (0 after the first, since
+        `bind_target` is idempotent).
+        """
+        bound = 0
+        for name, dmod in self.model.named_modules():
+            bind = getattr(dmod, "bind_target", None)
+            if not callable(bind):
+                continue
+            try:
+                tmod = target_model.get_submodule(name)
+            except AttributeError:
+                continue
+            if bind(tmod):
+                bound += 1
+        return bound
+
+    @torch.no_grad()
     def materialize_kept_from_target(
         self,
         target_model: torch.nn.Module,
@@ -92,7 +127,7 @@ class ExpSpecSDDraftModel(SubSpecSDDraftModel):
         """
         rebuilt = 0
         for name, dmod in self.model.named_modules():
-            if not isinstance(dmod, PackedTopNMoeBlock):
+            if not isinstance(dmod, _TOPN_BLOCK_CLASSES):
                 continue
             kept = kept_ids_per_layer.get(name)
             if kept is None:
