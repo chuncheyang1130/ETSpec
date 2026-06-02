@@ -45,8 +45,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specdecodes.models.utils.moe.qwen3_moe_topn import PackedTopNMoeBlock
-from specdecodes.models.utils.moe.qwen3_moe_topn_fp8 import PackedTopNFP8MoeBlock
+from specdecodes.models.utils.moe.base.qwen3_moe_topn import PackedTopNMoeBlock
+from specdecodes.models.utils.moe.fp8.qwen3_moe_topn_fp8 import PackedTopNFP8MoeBlock
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ def _fp8_expert_stages(block: PackedTopNFP8MoeBlock, x: torch.Tensor) -> dict:
 
     Uses the same helpers as the production forward so any bug is captured.
     """
-    from specdecodes.models.utils.moe.qwen3_moe_topn_fp8 import (
+    from specdecodes.models.utils.moe.fp8.qwen3_moe_topn_fp8 import (
         _quant_act_per_tensor,
         _quant_act_per_expert,
     )

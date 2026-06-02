@@ -33,11 +33,11 @@ except ImportError:
 import torch
 import torch.nn.functional as F
 
-from specdecodes.models.utils.moe.qwen3_moe_contiguous import get_grouped_matmul_metadata
-from specdecodes.models.utils.moe.triton_fused_gate_up_gmm_silu import (
+from specdecodes.models.utils.moe.base.qwen3_moe_contiguous import get_grouped_matmul_metadata
+from specdecodes.models.utils.moe.base.triton_fused_gate_up_gmm_silu import (
     triton_fused_gate_up_gmm_silu,
 )
-from specdecodes.models.utils.moe.triton_fused_down_gmm_reduction import (
+from specdecodes.models.utils.moe.base.triton_fused_down_gmm_reduction import (
     triton_fused_down_gmm_reduction,
 )
 
