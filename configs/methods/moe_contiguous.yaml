@@ -1,0 +1,24 @@
+# Naive generation (no draft model)
+method: vanilla
+
+llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+dtype: bfloat16
+recipe: 
+  class_path: specdecodes.helpers.recipes.moe.moe_contiguous:Recipe
+
+max_length: 2048
+cache_implementation: static
+warmup_iter: 1
+compile_mode: max-autotune
+
+# Target sampling settings (defaults)
+do_sample: false
+temperature: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 2048
+  verify_method: exact
+  verify_kwargs: {}
