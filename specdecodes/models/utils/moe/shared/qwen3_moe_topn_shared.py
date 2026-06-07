@@ -65,7 +65,15 @@ __all__ = [
 
 def _read_target_stacked_weights(target_block: nn.Module):
     """
-    Return (gate, up, down) full stacked expert weight tensors from the target.
+    Return (gate, up, down) stacked expert weight tensors from the target.
+
+    Two supported targets:
+      * `Qwen3MoeContiguousMoeBlock` — full `[E, ...]` stacked weights, indexed
+        by *global* expert id (`selected_expert_ids` holds global ids).
+      * `Qwen3MoeCachedMoeBlock` — the `[C, ...]` GPU *pool*, indexed by *slot*.
+        The draft aliases the pool and reads its pinned tier (slots 0..top_n-1),
+        so `selected_expert_ids` stays the identity arange and the cached block's
+        `set_hot_tier` keeps slot j holding the j-th kept expert.
     """
     if hasattr(target_block, "gate_proj_contiguous"):
         return (
@@ -73,11 +81,15 @@ def _read_target_stacked_weights(target_block: nn.Module):
             target_block.up_proj_contiguous,
             target_block.down_proj_contiguous,
         )
+    if hasattr(target_block, "pool_tensors"):
+        return target_block.pool_tensors()
     raise TypeError(
         "SharedTopNMoeBlock requires a contiguous-weight target block "
-        "(Qwen3MoeContiguousMoeBlock) exposing `gate_proj_contiguous` etc.; "
+        "(Qwen3MoeContiguousMoeBlock) or a cached pool target "
+        "(Qwen3MoeCachedMoeBlock); "
         f"got {type(target_block).__name__}. Swap the target with "
-        "`apply_contiguous_moe_block_to_qwen_moe` first."
+        "`apply_contiguous_moe_block_to_qwen_moe` / "
+        "`apply_cached_moe_block_to_qwen_moe` first."
     )
 
 
@@ -275,6 +287,7 @@ class SharedTopNMoeBlock(nn.Module):
 
         # ===========================================
         # Soft top-K redirect over the cached expert-weight footprints.
+        # Columns are aligned to `selected_ids` order (kept slot j <-> selected_ids[j]).
         # ===========================================
         selected_ids_dev = selected_ids.to(device)
         P = _build_redirect_P(
@@ -282,12 +295,24 @@ class SharedTopNMoeBlock(nn.Module):
         )
         self.redirect_P.data.copy_(P.to(device=device, dtype=self._compute_dtype))
 
-        # ===========================================
-        # Update the kept-id index in place (kernels read this every forward)
-        # ===========================================
-        self.selected_expert_ids.copy_(
-            selected_ids.to(device=self.selected_expert_ids.device, dtype=self.selected_expert_ids.dtype)
-        )
+        if hasattr(target_block, "set_hot_tier"):
+            # ===========================================
+            # Cached (offload) target: pin the kept experts into the pool's hot
+            # tier so slot j holds selected_ids[j]. The kernel reads slots
+            # 0..top_n-1, so `selected_expert_ids` stays the identity arange set
+            # at __init__ — only the pool *contents* change (in place, here,
+            # outside any captured region).
+            # ===========================================
+            target_block.set_hot_tier(selected_ids.tolist())
+        else:
+            # ===========================================
+            # Contiguous target: the kernel indexes global expert ids directly,
+            # so update the kept-id index in place.
+            # ===========================================
+            self.selected_expert_ids.copy_(
+                selected_ids.to(device=self.selected_expert_ids.device, dtype=self.selected_expert_ids.dtype)
+            )
+
         self._last_filled_ids = selected_ids.clone()
         return True
 

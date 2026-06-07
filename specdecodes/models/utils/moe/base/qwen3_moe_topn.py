@@ -121,6 +121,9 @@ def _read_target_expert_weight(target_block: nn.Module, eid: int):
             target_block.up_proj_contiguous[eid],
             target_block.down_proj_contiguous[eid],
         )
+    if hasattr(target_block, "get_expert_weight"):
+        # Cached (offload) target: read from its CPU expert master.
+        return target_block.get_expert_weight(int(eid))
     expert = target_block.experts[int(eid)]
     return (
         expert.gate_proj.weight,
@@ -667,22 +670,13 @@ def apply_packed_topn_structure(
     # ==========================================
     replaced = 0
     for name, module in block_to_be_replaced:
-        sample_expert = module.experts[0]
-        hidden_size = int(
-            getattr(sample_expert, "hidden_size", sample_expert.gate_proj.in_features)
-        )
-        intermediate_size = int(
-            getattr(sample_expert, "intermediate_size", sample_expert.gate_proj.out_features)
-        )
         target_top_k = int(getattr(module, "top_k"))
 
         block_dtype = dtype if dtype is not None else next(module.parameters()).dtype
         block_device = device if device is not None else next(module.parameters()).device
 
         new_block = PackedTopNMoeBlock(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=int(module.num_experts),
+            config=model.config,
             top_n=int(top_n),
             redirect_topk=int(redirect_topk),
             dtype=block_dtype,
