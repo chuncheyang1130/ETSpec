@@ -13,7 +13,7 @@ not on the hot forward path:
      per-group low/high-nibble split that matches the int4 kernels' decode.
 
 Together they produce the int4 weight buffers + `(step, zero_scaled)` group
-params consumed by the W4A16 Triton kernels for `PackedTopNINT4MoeBlock`.
+params consumed by the W4A16 Triton kernels for `Qwen3MoeStackedInt4Block`.
 The kernels' inner dequant is folded into a single FMA — see `kernel
 dequant` notes below.
 

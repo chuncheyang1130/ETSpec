@@ -1,13 +1,14 @@
-# ExpSpec SD — top-N expert subset draft for Qwen3-MoE (bf16, no SVD, no offload).
+# ExpSpec SD (Shared) — top-N expert subset draft for Qwen3-MoE, shared-weight.
 #
 # Behavior:
-#   - Mass-weighted tracker: picks top-N kept experts per layer by
-#     accumulated softmax routing mass, refreshed every round.
-#   - Soft top-K weight-space redirect: dropped experts distribute their
-#     mass across the top-K most-similar kept experts (cosine on a cheap
-#     expert-weight footprint), not one-hot to a single nearest neighbor.
-#   - Eager draft forward (use `expspec_sd_opt` for the CUDA-graph
-#     captured variant + FP8 storage).
+#   - Mass-weighted tracker + soft top-K weight-space redirect.
+#   - The draft MoE block (shared-weight `Qwen3MoeStackedBlock`,
+#     owns_store=False) copies NO expert weights: it keeps only the kept expert
+#     ids and aliases the target's stacked weights, which the bf16
+#     grouped-matmul kernels read by global expert id. Compute stays in the
+#     original weight dtype (no quantization). Target + draft are the SAME block
+#     class, differing only in `selected_expert_ids`.
+#   - Requires the stacked-weight target swap (handled by the recipe).
 method: expspec_sd
 
 llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
@@ -15,11 +16,8 @@ llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
 device: cuda:0
 dtype: bfloat16
 
-# Recipe takes no kwargs — fixed config (`top_n`, `redirect_topk`) lives
-# inline in `generate_configurations`. To tune, edit the recipe (or
-# subclass it).
 recipe:
-  class_path: specdecodes.helpers.recipes.moe.moe_topn_no_offload:Recipe
+  class_path: specdecodes.helpers.recipes.moe.moe_sd:Recipe
 
 max_length: 2048
 cache_implementation:
@@ -27,12 +25,15 @@ cache_implementation:
   draft: static
 
 warmup_iter: 1
-# `materialize_kept_from_target` swaps tensor values between rounds
-# (never shapes), so the draft's compile graph stays valid. The tracker
-# hook reruns the target router in eager mode, so leave target uncompiled.
+# The draft now uses the grouped-matmul (GMM) forward, whose metadata is
+# data-dependent (sort / bincount / nonzero) and therefore graph-breaks under
+# `fullgraph` compile (unlike the old dense-BMM draft). Run eager for correctness;
+# a compile path needs the INT4-style all-expert fullgraph metadata first.
+# `materialize_from_target` only updates `selected_expert_ids` + the redirect
+# matrix between rounds (the aliased weight tensors keep stable identity).
 compile_mode:
   target: null
-  draft: max-autotune
+  draft: null
 
 # Target sampling settings (defaults).
 do_sample: false
@@ -47,5 +48,5 @@ generator_kwargs:
 
 draft_params:
   temperature: 1.0
-  max_depth: 16
-  topk_len: 4
+  max_depth: 8
+  topk_len: 1

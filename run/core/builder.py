@@ -431,11 +431,11 @@ class GeneratorPipelineBuilder:
             # of the target, so its MoE blocks alias the target's original expert
             # Parameters. Restructuring the draft first swaps in pointer-less blocks
             # and drops those aliases, so when the target restructurer copies experts
-            # into contiguous storage and nulls the source, the originals are actually
+            # into stacked storage and nulls the source, the originals are actually
             # freed — instead of being pinned by the draft, which would roughly double
             # peak MoE memory. Safe because draft restructure does NOT read the target;
             # the draft's weight pointers are materialized lazily at generate time
-            # (`materialize_from_target`), well after the target is contiguous.
+            # (`materialize_from_target`), well after the target is stacked.
             if draft_model and draft_config and draft_config.get("structure_config"):
                 self.recipe.apply_structure(draft_model.model, draft_config["structure_config"], self.dtype, self.device)
             if target_config and target_config.get("structure_config"):
@@ -470,7 +470,7 @@ class GeneratorPipelineBuilder:
         generator = self.load_generator(model, tokenizer, draft_model)
         generator.eval()
 
-        # Bind shared-weight draft MoE blocks to the (already-contiguous) target
+        # Bind shared-weight draft MoE blocks to the (already-stacked) target
         # ONCE here — outside the per-prompt `_generate` path and BEFORE compile,
         # so the compiled draft graph captures the bound weight pointers. Device
         # placement (incl. offloading) is already finalized at this point, so the

@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from .base.qwen3_moe_topn import get_expert_usage
+from .base.expert_usage_tracker import get_expert_usage
 
 
 # Cap on how many round-local top experts to record per layer in the JSONL

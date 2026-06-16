@@ -161,7 +161,7 @@ def triton_fused_down_gmm_reduction(
     out = torch.zeros((T, H), dtype=dtype, device=interm.device)
 
     # ==========================================
-    # 2. Ensure inputs are contiguous
+    # 2. Ensure inputs are stacked
     # ==========================================
     interm, w_down = interm.contiguous(), w_down.contiguous()
     active_experts, token_offsets, sorted_token_ids = active_experts.contiguous(), token_offsets.contiguous(), sorted_token_ids.contiguous()

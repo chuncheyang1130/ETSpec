@@ -179,7 +179,7 @@ def triton_fused_gate_up_gmm_silu(
     out = torch.zeros((N_total, IM), dtype=dtype, device=x.device)
 
     # ==========================================
-    # 2. Ensure inputs are contiguous
+    # 2. Ensure inputs are stacked
     # ==========================================
     x, w_gate, w_up = x.contiguous(), w_gate.contiguous(), w_up.contiguous()
     active_experts, token_offsets, sorted_token_ids = active_experts.contiguous(), token_offsets.contiguous(), sorted_token_ids.contiguous()

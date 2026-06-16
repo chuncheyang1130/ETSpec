@@ -2,18 +2,18 @@
 
 Build time: the draft is constructed as a `share_param_deepcopy` of the
 target so that all non-MoE submodules (attention, embeddings, layernorms,
-lm_head) reuse the target's parameters directly. The recipe's
-`MoETopNRestructurer` (or `MoETopNFP8Restructurer` for FP8 storage)
-then runs via `BaseRecipe.apply_structure` and replaces every
-`Qwen3MoeSparseMoeBlock` with a `PackedTopNMoeBlock` (or
-`PackedTopNFP8MoeBlock`) — random / empty init for the packed tensors,
-zero init for the routing buffers.
+lm_head) reuse the target's parameters directly. The recipe's draft
+restructurer then runs via `BaseRecipe.apply_structure` and replaces every
+`Qwen3MoeSparseMoeBlock` with a shared-weight stacked draft block
+(`Qwen3MoeStackedBlock` bf16, or its `Qwen3MoeStackedInt4Block`
+subclass) — `owns_store=False`, allocating no expert weights of its own.
 
-Generate time: the generator (`ExpSpecSDGenerator`) picks per-layer kept
-expert ids from the target's tracked routing mass and calls
-`materialize_kept_from_target`, which copies the kept experts' weights
-from the target and refreshes each block's full target router + soft
-top-K weight-space redirect.
+Generate time: `bind_target_weights` aliases each draft block to its target
+stacked block's stacked weights (no copy). The generator
+(`ExpSpecSDGenerator`) then picks per-layer kept expert ids from the target's
+tracked routing mass and calls `materialize_kept_from_target`, which refreshes
+each block's `selected_expert_ids` + soft top-K weight-space redirect (routing
+only; no weight copy / re-quant).
 """
 
 from copy import deepcopy
@@ -21,16 +21,15 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from specdecodes.models.utils.moe.base.qwen3_moe_topn import PackedTopNMoeBlock
-from specdecodes.models.utils.moe.shared.qwen3_moe_topn_shared import SharedTopNMoeBlock
+from specdecodes.models.utils.moe.base.qwen3_moe_stacked import Qwen3MoeStackedBlock
 
 from .subspec_sd import SubSpecSDDraftModel
 
-# Top-N MoE blocks the picker can materialize. The FP8/INT4 blocks subclass
-# `PackedTopNMoeBlock`; `SharedTopNMoeBlock` is a non-inheriting sibling
-# (shared-weight / ids-only) exposing the same `materialize_from_target` +
-# `kept_expert_ids` interface, so it is listed explicitly.
-_TOPN_BLOCK_CLASSES = (PackedTopNMoeBlock, SharedTopNMoeBlock)
+# Draft MoE blocks the picker can materialize. All shared-weight stacked drafts
+# are `Qwen3MoeStackedBlock` (bf16) or its `Qwen3MoeStackedInt4Block`
+# subclass (INT4), both exposing `bind_target` / `materialize_from_target`, so the
+# single base class covers them via `isinstance`.
+_TOPN_BLOCK_CLASSES = (Qwen3MoeStackedBlock,)
 
 
 def share_param_deepcopy(model: torch.nn.Module) -> torch.nn.Module:
@@ -44,8 +43,9 @@ def share_param_deepcopy(model: torch.nn.Module) -> torch.nn.Module:
 
 
 class ExpSpecSDDraftModel(SubSpecSDDraftModel):
-    """Draft that shares params with the target and has its MoE blocks
-    replaced (at build time) by `PackedTopNMoeBlock` instances."""
+    """Draft that shares params with the target and has its MoE blocks replaced (at
+    build time) by shared-weight stacked draft blocks (`Qwen3MoeStackedBlock`,
+    `owns_store=False`)."""
 
     @classmethod
     def from_pretrained(
@@ -72,7 +72,7 @@ class ExpSpecSDDraftModel(SubSpecSDDraftModel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Filled in by the recipe (`recipes.moe.moe_topn_no_offload.Recipe`)
+        # Filled in by the draft recipe (e.g. `recipes.moe.moe_sd.Recipe`)
         # via setattr after construction. Default to None so the matching
         # generator's `_config()` getattr lookup never AttributeError's.
         self.topn_subset_config: Optional[Dict[str, Any]] = getattr(
@@ -81,12 +81,12 @@ class ExpSpecSDDraftModel(SubSpecSDDraftModel):
 
     @torch.no_grad()
     def bind_target_weights(self, target_model: torch.nn.Module) -> int:
-        """One-time bind of each shared block to its target contiguous block.
+        """One-time bind of each shared block to its target stacked block.
 
         Walks the draft's MoE blocks and, for any that support `bind_target`
         (the shared-weight block), points it at the same-named target block's
         stacked weights + router and caches its footprints. Called once before
-        generation, after the target has been swapped to the contiguous block.
+        generation, after the target has been swapped to the stacked block.
 
         Packed/FP8/INT4 blocks don't expose `bind_target` (they copy weights
         per kept set in `materialize_from_target`), so they are skipped here.
@@ -113,17 +113,18 @@ class ExpSpecSDDraftModel(SubSpecSDDraftModel):
         target_model: torch.nn.Module,
         kept_ids_per_layer: Dict[str, torch.Tensor],
     ) -> int:
-        """Copy kept experts from the target into each draft `PackedTopNMoeBlock`.
+        """Refresh each draft block's kept set from the target's tracked mass.
 
-        For each draft block whose name appears in `kept_ids_per_layer`, look
-        up the same-named module on `target_model`, take its experts at the
-        kept ids, and copy their full-rank gate / up / down weights into the
-        draft's packed tensors. Routing buffers are refreshed too.
+        For each draft block whose name appears in `kept_ids_per_layer`, look up
+        the same-named module on `target_model` and call `materialize_from_target`,
+        which rebuilds that block's `selected_expert_ids` + soft top-K redirect for
+        the new kept ids. The draft aliases the target's weights (bound once via
+        `bind_target_weights`), so this is routing-only — no weight copy / re-quant.
 
-        Per-block calls are cached on the kept set; layers whose kept set
-        matched the previous call are no-ops.
+        Per-block calls are cached on the kept set; layers whose kept set matched
+        the previous call are no-ops.
 
-        Returns the number of blocks that were actually rebuilt this call.
+        Returns the number of blocks that were actually refreshed this call.
         """
         rebuilt = 0
         for name, dmod in self.model.named_modules():

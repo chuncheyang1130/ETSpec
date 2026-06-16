@@ -1,0 +1,43 @@
+# Vanilla INT4 (HQQ) MoE — full Qwen3-MoE, ALL experts quantized to INT4, no draft / no SD.
+#
+# Target-only baseline (NaiveGenerator). Every expert is HQQ-INT4 quantized once
+# and kept resident; routing is standard top_k over the full INT4 expert set
+# (kept = num_experts, redirect_topk = 1 => identity redirect). Compute runs the
+# new INT4 grouped-matmul (GMM) Triton kernels. This is the INT4 counterpart of
+# `moe_stacked.yaml` (the bf16 vanilla MoE baseline) — use it to measure plain
+# INT4 quality/speed without speculative decoding.
+method: vanilla
+
+llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+dtype: bfloat16
+recipe:
+  class_path: specdecodes.helpers.recipes.moe.moe_int4_vanilla:Recipe
+
+max_length: 2048
+cache_implementation: static
+warmup_iter: 1
+
+# GMM metadata is static-shape (scatter_add + arange), so the INT4 block is
+# compile-safe; matches `moe_stacked.yaml`. Set to null if you want eager.
+compile_mode: max-autotune
+
+# Target sampling settings (defaults)
+do_sample: false
+temperature: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 2048
+  verify_method: exact
+  verify_kwargs: {}
+  # Expert-activation locality recording (analysis only). Uncomment + set
+  # `compile_mode: null` above — the forward hook only fires reliably in eager
+  # mode. matplotlib needed for the .png plots (.npz always written).
+  # expert_activation:
+  #   layer: all          # int | [0, 24, 46] | all  (records every MoE layer in one pass)
+  #   window: 16
+  #   out_dir: ./expert_activation
+  #   name: gsm8k         # -> <name>_layer{i}.npz(+.png) and <name>_profile.npz/.png (depth profile)
+  #   # per_layer_plot: false   # default: per-layer heatmaps only when recording one layer

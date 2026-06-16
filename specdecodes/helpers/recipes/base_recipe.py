@@ -29,7 +29,7 @@ class BaseRecipe:
         self.quantizer.quantize_model(model, quant_config, dtype, device)
 
     def apply_structure(self, model: Any, structure_config: Dict[str, Any], dtype: Any, device: str):
-        """Swap submodules for a new structural form (e.g. Qwen3 MoE -> PackedTopN).
+        """Swap submodules for a new structural form (e.g. Qwen3 MoE -> stacked block).
 
         Distinct from `apply_svd`: this is a plain class-swap pass with no
         weight decomposition. Recipes that need it set `self.restructurer`.

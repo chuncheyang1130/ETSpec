@@ -4,8 +4,8 @@ Fused HQQ INT4 quantization + 2-per-byte packing kernel.
 Quantizes a [E, N, K] real-valued weight tensor to 4-bit codes group-wise
 along the last (contraction) dim, using HQQ's L_p-proximal half-quadratic
 solver to refine the zero-point. The quant codes are then packed two-per-byte
-with the **same per-group low/high-nibble split** that the W4A16 BMM kernels
-expect for `PackedTopNINT4MoeBlock`.
+with the **same per-group low/high-nibble split** that the W4A16 GMM kernels
+expect for `Qwen3MoeStackedInt4Block`.
 
 One Triton program per (expert, **output-channel block**, group): each program
 holds a `[BLOCK_N, GROUP_SIZE]` tile in registers, runs the full HQQ
@@ -84,7 +84,7 @@ def _fused_hqq_quantize_int4_kernel(
     zero_scaled_base = zero_scaled_ptr + pid_e * stride_zero_scaled_e
 
     # ==========================================
-    # Load this (N-block × group) tile as two contiguous HALF chunks along K.
+    # Load this (N-block × group) tile as two stacked HALF chunks along K.
     # Shape: [BLOCK_N, HALF].  fp32 internal regardless of input dtype.
     # ==========================================
     w_lo_tile_ptr = w_base + off_n[:, None] * stride_w_n + k_lo[None, :] * stride_w_k

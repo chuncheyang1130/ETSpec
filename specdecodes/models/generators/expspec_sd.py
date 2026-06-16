@@ -8,8 +8,8 @@ The kept subset is **dynamic**, updated at following timings:
 This makes it follow the current generation's hot experts instead of being fixed at build time. 
 Mass that the target would have spent on dropped experts is redistributed onto the kept set via a top-K weight-space redirect.
 
-Build time: 
-    - Draft's MoE blocks are swapped for `PackedTopNMoeBlock` or `SharedTopNMoeBlock` (for shared-weight / ids-only variants).
+Build time:
+    - Draft's MoE blocks are swapped for shared-weight stacked draft blocks (`Qwen3MoeStackedBlock`, `owns_store=False`) that alias the target's stacked weights.
 
 Generate time:
     - Install the mass-weighted tracker on the target's MoE blocks (top-k softmax weights)
@@ -24,14 +24,13 @@ from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteria
 import nvtx
 
-from specdecodes.models.utils.moe.base.qwen3_moe_topn import (
-    PackedTopNMoeBlock,
+from specdecodes.models.utils.moe.base.expert_usage_tracker import (
     get_expert_usage,
     install_expert_usage_tracker,
     pick_top_n_per_layer,
     reset_expert_usage,
 )
-from specdecodes.models.utils.moe.shared.qwen3_moe_topn_shared import SharedTopNMoeBlock
+from specdecodes.models.utils.moe.base.qwen3_moe_stacked import Qwen3MoeStackedBlock
 from specdecodes.models.utils.moe.expert_usage_logger import ExpertUsageLogger
 
 from .classic_sd import ClassicSDGeneratorBase
@@ -42,7 +41,7 @@ _TRACKER_INSTALLED = "_moe_topn_tracker_installed"
 
 
 class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
-    _block_cls = (PackedTopNMoeBlock, SharedTopNMoeBlock)
+    _block_cls = (Qwen3MoeStackedBlock,)
 
     # Attribute on the draft model where the recipe stashes its config dict.
     _config_attr: str = "topn_subset_config"
@@ -68,12 +67,11 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
     def bind_draft_weights(self) -> None:
         """Bind shared-weight draft blocks to the target once, before generation.
 
-        Called by the builder after the target is contiguous and before the
+        Called by the builder after the target is stacked and before the
         draft is compiled (so the compiled graph captures the bound weight
         pointers). Idempotent and outside the per-prompt `_generate` path.
 
-        No-op for drafts without `bind_target_weights` (e.g. the packed/FP8/INT4
-        family, which copy weights per kept set at materialize time).
+        No-op for drafts that don't expose `bind_target_weights`.
         """
         fn = getattr(self.draft_model, "bind_target_weights", None)
         if callable(fn):
@@ -102,6 +100,16 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
             )
             self._usage_logger_obj = logger
         return logger
+
+    def _defer_kept_update(self) -> bool:
+        """If True, skip the in-`_tree_decoding` kept-set pick.
+
+        Default False (the pick runs right after the target forward, before
+        verification — using all processed tree tokens). A subclass that wants
+        accept-aware tracking returns True here and instead picks *after*
+        `_verify`, once the accepted positions are known.
+        """
+        return False
 
     def _pick_and_update_kept(self) -> None:
         """Pick top-N per layer from cumulative tracker counts, then refresh
@@ -144,8 +152,9 @@ class ExpSpecSDGeneratorBase(ClassicSDGeneratorBase):
             with nvtx.annotate("expert_usage_log", color="yellow"):
                 logger.record_round_delta()
 
-        with nvtx.annotate("topn_pick", color="purple"):
-            self._pick_and_update_kept()
+        if not self._defer_kept_update():
+            with nvtx.annotate("topn_pick", color="purple"):
+                self._pick_and_update_kept()
         return outputs
 
     def _generate(

@@ -454,13 +454,17 @@ def register_presets():
     except ImportError:
         pass
 
-    # ExpSpec SD: top-N expert subset draft with mass-weighted picker +
-    # soft top-K weight-space redirect. 
+    # ExpSpec SD (bf16): mass-weighted tracker + soft top-K weight-space redirect.
+    # The draft MoE block copies no expert weights — it keeps only the kept expert
+    # ids and the bf16 grouped-matmul kernels read the target's stacked weights by
+    # global expert id (original dtype, no quantization). Shared-weight
+    # `Qwen3MoeStackedBlock` draft (owns_store=False); target + draft are the same
+    # block class, differing only in `selected_expert_ids`.
     try:
         from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
         from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
-        from specdecodes.helpers.recipes.moe.moe_topn_no_offload import (
-            Recipe as ExpSpecRecipe,
+        from specdecodes.helpers.recipes.moe.moe_sd import (
+            Recipe as ExpSpecSDRecipe,
         )
 
         ModelRegistry.register(
@@ -469,75 +473,33 @@ def register_presets():
             draft_model_cls=ExpSpecSDDraftModel,
             default_config={
                 "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "recipe": ExpSpecRecipe(),
+                "recipe": ExpSpecSDRecipe(),
             },
             needs_draft_kv_cache=False,
         )
     except ImportError:
         pass
 
-    # ExpSpec SD (Optimize): same draft as above plus a CUDA-graph captured
-    # per-step tree forward. Default recipe is FP8 (PackedTopNFP8MoeBlock);
-    # override `recipe.class_path` in the yaml to use the bf16 recipe if
-    # FP8 is unavailable on your stack.
+    # ExpSpec SD (INT4): both models are all-INT4 stacked blocks sharing one resident
+    # INT4 expert store; the draft routes to N experts and the reduced target to M
+    # (M > N). No per-round re-quant — only the redirect router's kept set changes.
+    # `Qwen3MoeStackedInt4Block` + INT4-GMM kernels.
     try:
-        from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
+        from specdecodes.models.generators.expspec_sd_int4 import (
+            ExpSpecSDInt4Generator,
+        )
         from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
-        from specdecodes.helpers.recipes.moe.moe_topn_no_offload import (
-            Recipe as ExpSpecOptRecipe,
+        from specdecodes.helpers.recipes.moe.moe_int4_sd import (
+            Recipe as ExpSpecSDInt4Recipe,
         )
 
         ModelRegistry.register(
-            name="expspec_sd_opt",
-            generator_cls=ExpSpecSDGenerator,
+            name="expspec_sd_int4",
+            generator_cls=ExpSpecSDInt4Generator,
             draft_model_cls=ExpSpecSDDraftModel,
             default_config={
                 "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "recipe": ExpSpecOptRecipe(),
-            },
-            needs_draft_kv_cache=False,
-        )
-    except ImportError:
-        pass
-    
-    try:
-        from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
-        from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
-        from specdecodes.helpers.recipes.moe.moe_topn_int4 import (
-            Recipe as ExpSpecINT4Recipe,
-        )
-
-        ModelRegistry.register(
-            name="expspec_sd_hqq",
-            generator_cls=ExpSpecSDGenerator,
-            draft_model_cls=ExpSpecSDDraftModel,
-            default_config={
-                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "recipe": ExpSpecINT4Recipe(),
-            },
-            needs_draft_kv_cache=False,
-        )
-    except ImportError:
-        pass
-
-    # ExpSpec SD (Shared): same draft picker/tracker, but the draft MoE block
-    # copies no expert weights — it keeps only the kept expert ids and the two
-    # indexed bf16 Triton kernels read the target's contiguous stacked weights
-    # directly (original dtype, no quantization). `SharedTopNMoeBlock`.
-    try:
-        from specdecodes.models.generators.expspec_sd import ExpSpecSDGenerator
-        from specdecodes.models.draft_models.expspec_sd import ExpSpecSDDraftModel
-        from specdecodes.helpers.recipes.moe.moe_topn_shared import (
-            Recipe as ExpSpecSharedRecipe,
-        )
-
-        ModelRegistry.register(
-            name="expspec_sd_shared",
-            generator_cls=ExpSpecSDGenerator,
-            draft_model_cls=ExpSpecSDDraftModel,
-            default_config={
-                "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "recipe": ExpSpecSharedRecipe(),
+                "recipe": ExpSpecSDInt4Recipe(),
             },
             needs_draft_kv_cache=False,
         )

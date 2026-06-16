@@ -272,7 +272,7 @@ class DraftModelBase(nn.Module):
         sample_k: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        with nvtx.annotate("topk_sampling/contiguous"):
+        with nvtx.annotate("topk_sampling/stacked"):
             sampled_probs = sampled_probs.contiguous()
             parent_probs = parent_probs.contiguous()
 
