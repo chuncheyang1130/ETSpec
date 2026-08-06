@@ -18,7 +18,7 @@ BENCHMARK_EVALUATORS = {
     "human-eval": run_code_eval,
     "mbpp": run_code_eval,
     "livecodebench": run_livecodebench_eval,
-    "mmlu_pro": run_mmlu_pro_eval,
+    "mmlu-pro": run_mmlu_pro_eval,
     "narrativeqa": run_longbench_eval,
     "qasper": run_longbench_eval,
     "multifieldqa_en": run_longbench_eval,

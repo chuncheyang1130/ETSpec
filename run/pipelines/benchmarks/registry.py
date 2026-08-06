@@ -42,6 +42,8 @@ AVAILABLE_BENCHMARKS = [
     "cnn-dm",
     "gpqa",
     "livecodebench",
+    "openhermes",
+    "mmlu-pro"
 ]
 
 _LOADER_CONFIG = {
@@ -51,6 +53,8 @@ _LOADER_CONFIG = {
     "cnn-dm":               (".cnndm", "load_cnndm_dataset"),
     "gpqa":                 (".gpqa", "load_gpqa_dataset"),
     "livecodebench":        (".livecodebench", "load_livecodebench_dataset"),
+    "openhermes":           (".openhermes", "load_openhermes_dataset"),
+    "mmlu-pro":             (".mmlu_pro", "load_mmlu_pro_dataset"),
     
     # math
     "gsm8k":                (".gsm8k", "load_gsm8k_dataset"),

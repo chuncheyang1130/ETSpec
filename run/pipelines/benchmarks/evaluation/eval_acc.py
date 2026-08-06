@@ -426,7 +426,7 @@ def run_code_eval(generator, tokenizer, past_key_values, draft_past_key_values, 
 
 def run_mmlu_pro_eval(generator, tokenizer,
                       past_key_values, draft_past_key_values,
-                      args, dataset, log_dir):
+                      args, dataset, log_dir, bench_name):
     """
     Evaluate MMLU‑Pro multiple‑choice accuracy + perf metrics.
     `dataset` should be the list from load_mmlu_pro_dataset_answer().
@@ -452,7 +452,7 @@ def run_mmlu_pro_eval(generator, tokenizer,
     total_q, correct_q = 0, 0
 
     for idx, sample in tqdm(enumerate(dataset), total=len(dataset), desc="Eval MMLU‑Pro"):
-        prompt, gt = sample["question"], sample["answer"]
+        prompt, gt = sample["query"], sample["answer"]
         tokenizer.use_default_system_prompt = True
         input_ids = tokenizer.apply_chat_template(
             [{"role":"user","content":prompt}],
