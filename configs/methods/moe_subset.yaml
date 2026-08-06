@@ -1,9 +1,8 @@
 # Manual expert-subset MoE — pure (naive) inference, NO calibration.
 #
 # You supply the kept experts directly; the recipe hands them to the restructurer,
-# which swaps each MoE block for a reduced "expert pool + redirect" block at
-# `precision` and installs the kept set via `set_kept` (dropped experts' routing
-# mass is redirected onto the kept ones). Runs under the NaiveGenerator.
+# which swaps each MoE block for a compact retained-expert block at `precision`.
+# Routing always takes top-k directly from the retained pool.
 #
 # Provide ONE of:
 #   * kept_path — per-layer JSON {layer_name: [global expert ids]} (e.g. produced by
@@ -11,32 +10,38 @@
 #   * kept_ids  — a single global list applied to EVERY MoE layer.
 method: vanilla
 
-llm_path: Qwen/Qwen3-30B-A3B-Instruct-2507
+llm_path: Qwen/Qwen3-30B-A3B
 
 dtype: bfloat16
 recipe:
   class_path: specdecodes.helpers.recipes.moe.moe_subset:Recipe
-  init_args:
+  kwargs:
     precision: bf16          # int4 (fast Triton GMM) | bf16 (exact GMM)
-    redirect_topk: 8         # redirect fan-out for dropped experts
     group_size: 128          # HQQ group size (int4 only)
     # --- choose ONE source of selected experts ---
     # Per-layer selection file (recommended): {layer_name: [ids]} JSON.
-    kept_path: ./expert_activation/kept_gsm8k.json
+    kept_path: ./expert_activation/kept_base_uniform64_balanced.json
     # Global subset applied to every layer (alternative to kept_path):
     # kept_ids: [0, 3, 7, 12, 19, 24, 31, 40, 55, 63]
 
 max_length: 2048
 cache_implementation: static
 warmup_iter: 1
-compile_mode: null
+compile_mode: max-autotune
 
 do_sample: false
 temperature: 0
 
-generator_profiling: true
+# Optional sampling parameters (ignored if do_sample is false):
+# do_sample: true
+# temperature: 0.7
+# top_p: 0.8
+# top_k: 20
+# min_p: 0
 
+generator_profiling: true
 generator_kwargs:
+  enable_thinking: false
   prefill_chunk_size: 2048
   verify_method: exact
   verify_kwargs: {}
