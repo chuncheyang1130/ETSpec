@@ -8,18 +8,16 @@ instead of running eager. The prefill / first-speculate forward
 (`input_len=1`) stays eager because its shape differs from the
 captured `[1, topk_len]` shape.
 
-The capture itself is block-agnostic: it just records `self(...)` once,
-so the packed top-N block's soft-redirect routing (via `redirect_P`) is
-captured along with the rest of the forward.
+The capture itself is block-agnostic: it just records `self(...)` once, so
+retained-expert top-k routing is captured along with the rest of the forward.
 
 Capture pre-conditions (caller's responsibility):
   * Draft `past_key_values` is set (`set_past_key_values`) and uses a
     **static** cache implementation with a known `max_cache_len`.
-  * The draft has been materialized at least once (kept_ids picked,
-    packed expert tensors filled, `redirect_P` built).
-    `materialize_from_target` later only does in-place copies into the
-    same Parameters (including `redirect_P`), so subsequent
-    re-materialization does **not** invalidate the captured graph.
+  * The draft has been materialized at least once (kept_ids picked and the
+    retained-id buffer filled). `materialize_from_target` updates that buffer
+    in place when its shape is unchanged, so subsequent kept-set changes do
+    **not** invalidate the captured graph.
 
 Out-of-scope / known limits:
   * Re-binding `past_key_values` to a different cache instance after

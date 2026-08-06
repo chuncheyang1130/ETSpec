@@ -12,8 +12,8 @@ Generate time: `bind_target_weights` aliases each draft block to its target
 stacked block's stacked weights (no copy). The generator
 (`ExpSpecSDGenerator`) then picks per-layer kept expert ids from the target's
 tracked routing mass and calls `materialize_kept_from_target`, which refreshes
-each block's `selected_expert_ids` + soft top-K weight-space redirect (routing
-only; no weight copy / re-quant).
+each block's `selected_expert_ids`. Routing then chooses top-k directly within
+that retained pool (no weight copy / re-quant).
 """
 
 from copy import deepcopy
@@ -117,8 +117,8 @@ class ExpSpecSDDraftModel(SubSpecSDDraftModel):
 
         For each draft block whose name appears in `kept_ids_per_layer`, look up
         the same-named module on `target_model` and call `materialize_from_target`,
-        which rebuilds that block's `selected_expert_ids` + soft top-K redirect for
-        the new kept ids. The draft aliases the target's weights (bound once via
+        which updates that block's `selected_expert_ids` for the new kept ids.
+        The draft aliases the target's weights (bound once via
         `bind_target_weights`), so this is routing-only — no weight copy / re-quant.
 
         Per-block calls are cached on the kept set; layers whose kept set matched

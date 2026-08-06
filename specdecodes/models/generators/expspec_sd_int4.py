@@ -1,7 +1,7 @@
 """
 Generator for the all-INT4 stacked ExpSpec family.
 
-Same mass-weighted tracker / soft top-K weight-space redirect as
+Same mass-weighted tracker and retained-pool top-k routing as
 `ExpSpecSDGenerator`, but **both** models are reduced INT4 blocks sharing one
 resident INT4 expert store (`Qwen3MoeStackedInt4Block`):
   * draft routes to its top-**N** experts,
@@ -9,7 +9,7 @@ resident INT4 expert store (`Qwen3MoeStackedInt4Block`):
 
 The kept sets are drawn from the same accumulated routing mass (top-N ⊆ top-M)
 and refresh:
-  * the target via `block.set_kept(M_ids)`  (redirect + selected ids; no re-quant),
+  * the target via `block.set_kept(M_ids)` (selected ids only; no re-quant),
   * the draft via `materialize_kept_from_target(target, N_ids)` (aliases the store).
 
 Because all experts are already INT4-resident, neither update re-quantizes — only

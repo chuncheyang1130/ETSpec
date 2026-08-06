@@ -6,7 +6,7 @@ The kept subset is **dynamic**, updated at following timings:
     - After prefill, before the first SD round. 
     - After every verification round
 This makes it follow the current generation's hot experts instead of being fixed at build time. 
-Mass that the target would have spent on dropped experts is redistributed onto the kept set via a top-K weight-space redirect.
+Each token chooses exactly top-k experts directly from the retained pool.
 
 Build time:
     - Draft's MoE blocks are swapped for shared-weight stacked draft blocks (`Qwen3MoeStackedBlock`, `owns_store=False`) that alias the target's stacked weights.
@@ -14,7 +14,7 @@ Build time:
 Generate time:
     - Install the mass-weighted tracker on the target's MoE blocks (top-k softmax weights)
     - After prefill, and again after every verification round, pick the top-N highest-mass experts per layer
-    - Refresh each draft block's packed tensors (if needed) or selected experts + routing buffers from the target's matching experts. 
+    - Refresh each draft block's selected experts from the target's matching experts.
 """
 
 from typing import Any, Dict
