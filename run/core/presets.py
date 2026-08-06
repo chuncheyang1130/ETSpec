@@ -183,6 +183,18 @@ def register_presets():
         }
     )
 
+    # Target-only generator with per-prompt prefill-subset MoE orchestration
+    # (reset-before-prefill + select-on-first-decode). Dense models are unaffected.
+    ModelRegistry.register(
+        name="vanilla_moe",
+        generator_cls="specdecodes.models.generators.naive_moe:NaiveMoEGenerator",
+        draft_model_cls=None,
+        default_config={
+            "llm_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "recipe": None,
+        }
+    )
+
     # SubSpec SD V2
     try:
         from specdecodes.models.generators.subspec_sd_v2 import SubSpecSDGenerator as SubSpecSDGeneratorV2
@@ -454,7 +466,7 @@ def register_presets():
     except ImportError:
         pass
 
-    # ExpSpec SD (bf16): mass-weighted tracker + soft top-K weight-space redirect.
+    # ExpSpec SD (bf16): mass-weighted tracker + retained-pool top-k routing.
     # The draft MoE block copies no expert weights — it keeps only the kept expert
     # ids and the bf16 grouped-matmul kernels read the target's stacked weights by
     # global expert id (original dtype, no quantization). Shared-weight
@@ -482,7 +494,7 @@ def register_presets():
 
     # ExpSpec SD (INT4): both models are all-INT4 stacked blocks sharing one resident
     # INT4 expert store; the draft routes to N experts and the reduced target to M
-    # (M > N). No per-round re-quant — only the redirect router's kept set changes.
+    # (M > N). No per-round re-quant — only the router's retained set changes.
     # `Qwen3MoeStackedInt4Block` + INT4-GMM kernels.
     try:
         from specdecodes.models.generators.expspec_sd_int4 import (
