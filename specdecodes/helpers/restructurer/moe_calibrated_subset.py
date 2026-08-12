@@ -5,8 +5,8 @@ For each MoE block it builds a **compacted** subset block that physically stacks
 that layer's kept experts (chosen by `expert_calibration.select_kept_by_coverage`, or
 supplied manually) — a genuinely smaller model, not the full store with restricted
 routing. The kept set varies per layer (adaptive budget), so each block carries its own
-`[M, ...]` store. The full router is kept and the dropped experts' mass is redirected
-onto the kept ones (see `_StackedSubsetBase`). A layer whose kept set is the full set
+`[M, ...]` store. The full router is kept, but routing selects the original model
+top-`k` directly among the retained experts. A layer whose kept set is the full set
 stays a full block (no compaction).
 
 Two source paths (set by the recipe via ``structure_config["source"]``):
@@ -38,7 +38,7 @@ from specdecodes.models.utils.moe.base.expert_usage_tracker import _set_module_b
 
 
 class MoECalibratedSubsetRestructurer:
-    """Convert MoE blocks (HF or full-stacked) to reduced pool+redirect blocks."""
+    """Convert MoE blocks (HF or full-stacked) to compact retained-expert blocks."""
 
     @classmethod
     def restructure_model(
@@ -53,7 +53,6 @@ class MoECalibratedSubsetRestructurer:
         precision = str(structure_config.get("precision", "bf16")).lower()
         source = str(structure_config.get("source", "hf")).lower()
         kept_per_layer: Dict[str, List[int]] = structure_config.get("kept_per_layer", {}) or {}
-        redirect_topk = int(structure_config.get("redirect_topk", 8))
         group_size = int(structure_config.get("group_size", 128))
 
         if source == "stacked":
@@ -64,9 +63,9 @@ class MoECalibratedSubsetRestructurer:
             blocks = [(n, m) for n, m in list(model.named_modules()) if _is_hf_moe_block(m)]
 
         if precision in ("bf16", "bfloat16", "fp16", "float16"):
-            cls._apply_bf16(model, blocks, kept_per_layer, redirect_topk, source)
+            cls._apply_bf16(model, blocks, kept_per_layer, source)
         elif precision == "int4":
-            cls._apply_int4(model, blocks, kept_per_layer, redirect_topk, group_size,
+            cls._apply_int4(model, blocks, kept_per_layer, group_size,
                             source, device, compute_dtype)
         elif precision == "fp8":
             raise NotImplementedError(
@@ -79,9 +78,9 @@ class MoECalibratedSubsetRestructurer:
 
         n_reduced = sum(1 for n, _ in blocks if cls._kept_for(kept_per_layer, n, 10 ** 9) is not None)
         logging.info(
-            "[CalibratedSubset] converted %d MoE blocks (precision=%s, source=%s, redirect_topk=%d); "
+            "[CalibratedSubset] converted %d MoE blocks (precision=%s, source=%s); "
             "%d reduced, %d kept full.",
-            len(blocks), precision, source, redirect_topk, n_reduced, len(blocks) - n_reduced,
+            len(blocks), precision, source, n_reduced, len(blocks) - n_reduced,
         )
         return len(blocks)
 
@@ -97,7 +96,7 @@ class MoECalibratedSubsetRestructurer:
 
     # ------------------------------------------------------------------ bf16
     @classmethod
-    def _apply_bf16(cls, model, blocks, kept_per_layer, redirect_topk, source) -> None:
+    def _apply_bf16(cls, model, blocks, kept_per_layer, source) -> None:
         from specdecodes.models.utils.moe.base.qwen3_moe_subset import Qwen3MoeSubsetBlock
         for i, (name, blk) in enumerate(blocks):
             ids = cls._kept_for(kept_per_layer, name, int(blk.num_experts))
@@ -105,11 +104,11 @@ class MoECalibratedSubsetRestructurer:
                 # Full layer that's already a full stacked block — leave it live.
                 continue
             if ids is None:
-                new = Qwen3MoeStackedBlock.from_huggingface(blk, redirect_topk=redirect_topk)
+                new = Qwen3MoeStackedBlock.from_huggingface(blk)
             elif source == "stacked":
-                new = Qwen3MoeSubsetBlock.from_stacked(blk, kept_ids=ids, redirect_topk=redirect_topk)
+                new = Qwen3MoeSubsetBlock.from_stacked(blk, kept_ids=ids)
             else:
-                new = Qwen3MoeSubsetBlock.from_huggingface(blk, kept_ids=ids, redirect_topk=redirect_topk)
+                new = Qwen3MoeSubsetBlock.from_huggingface(blk, kept_ids=ids)
             _set_module_by_name(model, name, new)
             # Release the original: the model ref is gone (swapped), but `blocks` still
             # pins it — drop that too so the old [E, ...] weights free now, not at return.
@@ -120,7 +119,7 @@ class MoECalibratedSubsetRestructurer:
 
     # ------------------------------------------------------------------ int4
     @classmethod
-    def _apply_int4(cls, model, blocks, kept_per_layer, redirect_topk, group_size,
+    def _apply_int4(cls, model, blocks, kept_per_layer, group_size,
                     source, device, compute_dtype) -> None:
         from specdecodes.models.utils.moe.hqq.qwen3_moe_stacked_int4 import Qwen3MoeStackedInt4Block
         from specdecodes.models.utils.moe.hqq.qwen3_moe_subset_int4 import Qwen3MoeSubsetInt4Block
@@ -131,21 +130,21 @@ class MoECalibratedSubsetRestructurer:
                 dev = device if device is not None else blk.router_weights.device
                 if ids is None:                                  # full layer: full INT4 store
                     new = Qwen3MoeStackedInt4Block.from_stacked(
-                        blk, kept=E, redirect_topk=redirect_topk, group_size=group_size,
+                        blk, kept=E, group_size=group_size,
                         device=dev, compute_dtype=compute_dtype)
                 else:                                            # reduced: quantize only the kept M
                     new = Qwen3MoeSubsetInt4Block.from_stacked(
-                        blk, kept_ids=ids, redirect_topk=redirect_topk, group_size=group_size,
+                        blk, kept_ids=ids, group_size=group_size,
                         device=dev, compute_dtype=compute_dtype)
             else:
                 dev = device if device is not None else blk.experts[0].gate_proj.weight.device
                 if ids is None:
                     new = Qwen3MoeStackedInt4Block.from_huggingface(
-                        blk, kept=E, redirect_topk=redirect_topk, group_size=group_size,
+                        blk, kept=E, group_size=group_size,
                         device=dev, compute_dtype=compute_dtype)
                 else:
                     new = Qwen3MoeSubsetInt4Block.from_huggingface(
-                        blk, kept_ids=ids, redirect_topk=redirect_topk, group_size=group_size,
+                        blk, kept_ids=ids, group_size=group_size,
                         device=dev, compute_dtype=compute_dtype)
             _set_module_by_name(model, name, new)
             blocks[i] = (name, None)            # drop the list's pin so the original frees now

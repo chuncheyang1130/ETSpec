@@ -1,10 +1,8 @@
 """Recipe: vanilla all-INT4 Qwen3-MoE (no draft / no speculative decoding).
 
 Target-only baseline for the INT4 family: swaps every HF `Qwen3MoeSparseMoeBlock`
-for `Qwen3MoeStackedInt4Block` with `kept = num_experts` and `redirect_topk = 1`.
-With all experts kept the redirect matrix is the identity, so routing reduces to
-standard top_k over the full (INT4) expert set — i.e. a plain INT4 MoE forward,
-no subset, no redirect. Compute runs the INT4 grouped-matmul kernels.
+for `Qwen3MoeStackedInt4Block` with all experts retained. Routing is standard
+top-k over the full expert set.
 
 Pairs with `configs/methods/vanilla_int4_hqq.yaml` (method `vanilla` →
 `NaiveGenerator`, no draft). Use it as the INT4 counterpart of `moe_stacked`
@@ -18,10 +16,8 @@ from ...restructurer.moe_int4 import MoEStackedInt4TargetRestructurer
 
 
 class Recipe(BaseRecipe):
-    """Vanilla all-INT4 MoE recipe (target-only; all experts, identity redirect)."""
+    """Vanilla all-INT4 MoE recipe with all experts retained."""
 
-    # redirect_topk = 1 + kept = num_experts => identity redirect => standard top_k routing.
-    REDIRECT_TOPK = 1
     GROUP_SIZE = 128
 
     def __init__(self):
@@ -47,12 +43,11 @@ class Recipe(BaseRecipe):
         if draft_model is not None:
             setattr(draft_model, "topn_subset_config", draft_cfg)
 
-        # All experts kept (no subset). `kept = num_experts` + redirect_topk=1 => identity.
+        # All experts retained.
         num_experts = int(target_model.config.num_experts)
         target_cfg: Dict[str, Any] = {
             "kind": "target_stacked_int4",
             "top_m": num_experts,
-            "redirect_topk": self.REDIRECT_TOPK,
             "group_size": self.GROUP_SIZE,
         }
 

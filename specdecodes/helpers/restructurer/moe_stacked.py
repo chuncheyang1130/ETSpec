@@ -54,8 +54,8 @@ class MoEStackedDraftRestructurer:
 
     `compute_dtype` is the original compute dtype (bf16/fp16) used by both the router
     and the grouped-matmul kernels; no quantization is applied. The alias to the
-    target's weights + the soft top-K redirect are filled at generate time via
-    `materialize_kept_from_target`, after the picker decides which experts to keep.
+    target's weights are bound and retained ids are filled at generate time after
+    the picker decides which experts to keep.
     """
 
     @classmethod
@@ -72,7 +72,6 @@ class MoEStackedDraftRestructurer:
         return apply_stacked_draft(
             model=model,
             top_n=int(structure_config.get("top_n", 32)),
-            redirect_topk=int(structure_config.get("redirect_topk", 8)),
             device=device,
             dtype=compute_dtype,
         )

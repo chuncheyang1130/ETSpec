@@ -2,8 +2,8 @@
 
 Both models share the **same** block (`Qwen3MoeStackedInt4Block`): every
 expert is HQQ-INT4 quantized once and kept resident, and the draft aliases the
-target's INT4 store (no copy). The only difference is the redirecting router's
-kept set — draft N, target M. Both kept sets are re-picked after each round from
+target's INT4 store (no copy). The only difference is the router's retained
+set—draft N, target M. Both sets are re-picked after each round from
 the target's tracked routing mass (handled by the matching generator).
 
 Differs from `moe_topn_int4.py` (per-subset packed draft + full bf16 target):
@@ -26,11 +26,9 @@ from ...restructurer.moe_int4 import (
 class Recipe(BaseRecipe):
     """All-INT4 stacked recipe (shared INT4 store; draft N experts, target M experts)."""
 
-    # Draft kept experts (N), target verification experts (M, > N), redirect fan-out,
-    # and the HQQ group size along the contraction dim (must divide hidden & intermediate).
+    # Draft retained experts (N), target verification experts (M, > N), and HQQ group size.
     TOP_N = 32
     TOP_M = 96
-    REDIRECT_TOPK = 8
     GROUP_SIZE = 128
     # Accumulate prefill + accepted tokens only into the usage tracker (default),
     # vs. every processed tree token (rejected branches included). See the
@@ -67,7 +65,6 @@ class Recipe(BaseRecipe):
             "kind": "draft_stacked_int4",
             "top_n": self.TOP_N,
             "top_m": self.TOP_M,
-            "redirect_topk": self.REDIRECT_TOPK,
             "group_size": self.GROUP_SIZE,
             "track_accepted_only": self.TRACK_ACCEPTED_ONLY,
             "log_expert_usage": False,
@@ -79,7 +76,6 @@ class Recipe(BaseRecipe):
         target_cfg: Dict[str, Any] = {
             "kind": "target_stacked_int4",
             "top_m": self.TOP_M,
-            "redirect_topk": self.REDIRECT_TOPK,
             "group_size": self.GROUP_SIZE,
         }
 

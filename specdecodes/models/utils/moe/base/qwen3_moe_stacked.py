@@ -1,27 +1,24 @@
 """
-Stacked-weight Qwen3-MoE block — the single bf16 MoE block for the whole
-stacked family (full / subset / shared-weight draft).
+Stacked-weight Qwen3-MoE block for the full, subset, and shared-weight draft
+roles.
 
 ONE class, three roles, selected only by the kept-expert list:
 
   * **full**   — `set_full()` (or the `from_huggingface` default): standard top-k
     routing over all experts. Used by the target model and by calibration.
-  * **subset** — `set_kept(ids)`: route to only `ids` experts; the routing mass the
-    full router would have spent on dropped experts is redistributed onto the kept
-    set via a weight-footprint redirect. Used by the calibrated expert-pool path.
+  * **subset** — `set_kept(ids)`: restrict the router to `ids` and select top-k
+    directly among those retained experts.
   * **draft**  — constructed with `owns_store=False` then `bind_target(target)`:
     aliases the target block's stacked weights (no copy) and routes to its own
     (smaller) kept set. Used by self-speculative decoding (the draft and target
     share one weight store and differ only in `selected_expert_ids`).
 
-Forward is the Triton grouped-matmul (GMM) in every role. The full role takes the
-direct top-k path (no redirect overhead); the subset/draft roles take the redirect
-path (`redirect_P` + `selected_expert_ids` -> top `k_eff` global ids). Quantized
-variants (e.g. `Qwen3MoeStackedInt4Block`) inherit this routing/redirect/bind
-machinery verbatim and override only the storage + the two GMM kernel calls.
+Forward is the Triton grouped-matmul (GMM) in every role. Full mode selects top-k
+over all router rows; subset/draft mode selects top-k over the retained router rows
+and maps the local result back to global expert ids. Quantized variants inherit this
+routing/bind machinery and override only storage and the two GMM kernel calls.
 
-`sig` (per-expert weight footprint) and the re-routing (`_build_redirect_P`) are
-member functions here so every subclass shares one definition.
+Weight signatures remain available for offline expert-selection experiments.
 """
 
 import torch
@@ -94,8 +91,6 @@ class Qwen3MoeStackedBlock(nn.Module):
         norm_topk_prob: bool,
         *,
         kept: Optional[int] = None,
-        redirect_topk: int = 8,
-        redirect_mode: str = "cosine",
         sig_mode: str = "l1",
         owns_store: bool = True,
         dtype: Optional[torch.dtype] = None,
@@ -108,23 +103,25 @@ class Qwen3MoeStackedBlock(nn.Module):
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
         self.norm_topk_prob = bool(norm_topk_prob)
+        if not (0 < self.top_k <= self.num_experts):
+            raise ValueError(
+                f"top_k ({self.top_k}) must be in (0, num_experts={self.num_experts}]."
+            )
 
-        # --- routing / redirect configuration ---
+        # --- retained-expert routing configuration ---
         self.kept = int(kept) if kept is not None else int(num_experts)
+        if self.kept < self.top_k:
+            raise ValueError(
+                f"kept ({self.kept}) must be at least top_k ({self.top_k}) "
+                "so every token activates exactly top_k experts."
+            )
         if self.kept > self.num_experts:
             raise ValueError(f"kept ({self.kept}) cannot exceed num_experts ({self.num_experts}).")
-        self.k_eff = min(self.top_k, self.kept)          # experts each token actually activates
-        self.redirect_topk = int(redirect_topk)          # redirect fan-out for dropped experts
-        self.redirect_mode = str(redirect_mode)          # cosine | lsq | renorm
         self.sig_mode = str(sig_mode)                    # l1 | l1l2 | spectral | all
         self.owns_store = bool(owns_store)
 
-        # `redirect_P` is None in full mode (identity routing -> direct top-k fast
-        # path) and a [E, kept] tensor in subset/draft mode. `selected_expert_ids`
-        # maps kept slot -> global expert id (arange in full mode). Both are
-        # registered buffers so `nn.Module.__setattr__` routes (re)assignments into
-        # `_buffers` and in-place `copy_` updates stay visible to a compiled graph.
-        self.register_buffer("redirect_P", None, persistent=False)
+        # Maps retained local slot -> global expert id. It is a buffer so fixed-size
+        # draft updates can happen in place and remain visible to a compiled graph.
         self.register_buffer(
             "selected_expert_ids",
             torch.arange(self.kept, dtype=torch.long, device=device),
@@ -136,7 +133,7 @@ class Qwen3MoeStackedBlock(nn.Module):
         # --- storage ---
         # A draft (`owns_store=False`) carries no weights of its own: it registers
         # the weight attrs + router as aliasable buffers (filled in `bind_target`)
-        # and pre-allocates its fixed-shape redirect buffers (kept < num_experts).
+        # and pre-allocates its fixed-shape retained-id buffer.
         if not self.owns_store:
             if dtype is None or device is None:
                 raise ValueError("draft blocks (owns_store=False) require dtype and device.")
@@ -148,19 +145,13 @@ class Qwen3MoeStackedBlock(nn.Module):
             )
             for attr in self._WEIGHT_ATTRS:
                 self.register_buffer(attr, None, persistent=False)
-            self.redirect_P = torch.zeros(
-                self.num_experts, self.kept, dtype=dtype, device=device
-            )
         else:
             self._compute_dtype = dtype
             # The full target allocates its weights + router in `from_huggingface`.
-            # A subset target (kept < E) gets its redirect buffer on the first
-            # `set_kept`; full targets keep `redirect_P is None`.
 
     # ------------------------------------------------------------------ build
     @classmethod
-    def from_huggingface(cls, hf_block, *, redirect_topk: int = 8,
-                         redirect_mode: str = "cosine", sig_mode: str = "l1"):
+    def from_huggingface(cls, hf_block, *, sig_mode: str = "l1"):
         # ============================================
         # Hyperparameters from the original block
         # ============================================
@@ -175,8 +166,6 @@ class Qwen3MoeStackedBlock(nn.Module):
             num_experts=num_experts,
             top_k=top_k,
             norm_topk_prob=norm_topk_prob,
-            redirect_topk=redirect_topk,
-            redirect_mode=redirect_mode,
             sig_mode=sig_mode,
             owns_store=True,
         ).to(device=target_device, dtype=target_dtype)
@@ -226,7 +215,7 @@ class Qwen3MoeStackedBlock(nn.Module):
                 block.down_proj_stacked.data[e].copy_(expert.down_proj.weight.data)
                 expert.down_proj.weight = None  # Release source parameter to free memory
 
-            # full routing by default (selected = all experts, no redirect).
+            # Full routing by default.
             block.selected_expert_ids = torch.arange(num_experts, dtype=torch.long, device=target_device)
 
         return block
@@ -236,7 +225,7 @@ class Qwen3MoeStackedBlock(nn.Module):
     @torch.no_grad()
     def _compute_sigs(g: torch.Tensor, u: torch.Tensor, d: torch.Tensor,
                       mode: str = "l1", svd_rank: int = 32) -> torch.Tensor:
-        """Per-expert weight footprint used as the redirect / selection space.
+        """Per-expert weight footprint used by offline selection experiments.
 
         Permutation-invariant over the intermediate axis (the arbitrarily-ordered
         expert hidden units):
@@ -247,7 +236,7 @@ class Qwen3MoeStackedBlock(nn.Module):
         Modes (progressively richer descriptors of the same maps):
           * ``"l1"``       — per-channel L1 magnitude ``|W|.sum`` over IM, the three
             families concatenated and L2-normalized once -> [E, 3H]. This is the
-            footprint the serving redirect has always used.
+            original compact channel-magnitude descriptor.
           * ``"l1l2"``     — l1 + per-channel L2 energy ``(W**2).sum`` over IM.
           * ``"spectral"`` — l1 + the top-``svd_rank`` singular values of each matrix.
           * ``"all"``      — l1 + l2 + spectral.
@@ -273,59 +262,6 @@ class Qwen3MoeStackedBlock(nn.Module):
         fams = [F.normalize(f.float(), dim=-1) for f in fams]
         return F.normalize(torch.cat(fams, dim=-1), dim=-1)                      # [E, D]
 
-    @staticmethod
-    @torch.no_grad()
-    def _build_redirect_P(sigs_norm: torch.Tensor, selected_ids: torch.Tensor,
-                          num_experts: int, kept: int, redirect_topk: int,
-                          mode: str = "cosine") -> torch.Tensor:
-        """Build the `[num_experts, kept]` redirect matrix mapping each expert's
-        routing mass onto the kept slots.
-
-        Kept experts route one-hot to their own slot; each *dropped* expert spreads
-        its mass over the kept set by `mode`:
-
-          * ``"cosine"`` — ReLU(weight-footprint cosine) to the `redirect_topk` most
-            similar kept experts, normalized to sum to 1.
-          * ``"lsq"``    — non-negative least-squares reconstruction from the kept
-            basis (decorrelated via the kept-kept Gram), ReLU + sparsify + normalize.
-          * ``"renorm"`` — no redirect; dropped experts contribute nothing (rows stay
-            zero) and the surviving kept mass is renormalized in the forward.
-        """
-        device = sigs_norm.device
-        K = max(1, min(int(redirect_topk), int(kept)))
-        selected_ids = selected_ids.to(device=device, dtype=torch.long)
-
-        P = torch.zeros(num_experts, kept, dtype=torch.float32, device=device)
-
-        if mode == "renorm":
-            pass                                            # only the kept-identity block below
-        elif mode == "cosine":
-            sim = sigs_norm @ sigs_norm[selected_ids].T     # [num_experts, kept]
-            top_vals, top_idx = torch.topk(sim, k=K, dim=-1)
-            top_vals = F.relu(top_vals) + 1e-8
-            top_vals = top_vals / top_vals.sum(dim=-1, keepdim=True)
-            P.scatter_(1, top_idx, top_vals)
-        elif mode == "lsq":
-            S_k = sigs_norm[selected_ids]                   # [kept, d]
-            G_kk = S_k @ S_k.T                              # [kept, kept]
-            lam = 1e-3 * torch.diagonal(G_kk).mean().clamp_min(1e-8)
-            A = G_kk + lam * torch.eye(kept, device=device, dtype=G_kk.dtype)
-            B = sigs_norm @ S_k.T                           # [num_experts, kept]
-            beta = torch.linalg.solve(A, B.T).T
-            beta = F.relu(beta)
-            top_vals, top_idx = torch.topk(beta, k=K, dim=-1)
-            top_vals = top_vals + 1e-8
-            top_vals = top_vals / top_vals.sum(dim=-1, keepdim=True)
-            P.scatter_(1, top_idx, top_vals)
-        else:
-            raise ValueError(f"unknown redirect mode: {mode!r} (cosine|lsq|renorm)")
-
-        # Kept experts route 100% to their own slot (overrides the soft redirect).
-        kept_pos = torch.arange(kept, device=device, dtype=torch.long)
-        P[selected_ids] = 0
-        P[selected_ids, kept_pos] = 1.0
-        return P
-
     def _ensure_sigs(self) -> None:
         """Compute + cache the per-expert footprints from the (own/aliased) weights."""
         if self._cached_sigs is not None:
@@ -347,7 +283,7 @@ class Qwen3MoeStackedBlock(nn.Module):
         """Alias the target's stacked weights + router (draft only, no copy).
 
         No-op (returns False) for a block that owns its store or is already bound.
-        The per-round kept-set refresh lives in `materialize_from_target`.
+        The per-round retained-set refresh lives in `materialize_from_target`.
         """
         if self.owns_store:
             return False
@@ -359,31 +295,29 @@ class Qwen3MoeStackedBlock(nn.Module):
         self.router_weights.data.copy_(
             target_block.router_weights.to(device=self.router_weights.device, dtype=self._compute_dtype)
         )
-        # Footprints from the (now-aliased) weights.
+        # Signatures are computed lazily only if an offline selector requests them.
         self._cached_sigs = None
-        self._ensure_sigs()
         return True
 
     @torch.no_grad()
     def set_full(self) -> None:
         """Standard top-k routing over all experts (the full reference)."""
         self.kept = int(self.num_experts)
-        self.k_eff = min(self.top_k, self.kept)
         self.selected_expert_ids = torch.arange(
             self.num_experts, dtype=torch.long, device=self.selected_expert_ids.device
         )
-        self.redirect_P = None
 
     @torch.no_grad()
     def materialize_from_target(self, source_block: nn.Module, selected_ids: torch.Tensor) -> bool:
-        """Refresh the kept set: rebuild `redirect_P` + `selected_expert_ids`.
+        """Refresh the retained expert ids.
 
         For a draft, lazily binds to `source_block` (the target) on the first call.
         Never touches the weight store. Cached on the kept set (`_last_filled_ids`),
         so an unchanged kept set is a no-op.
         """
-        ids = selected_ids.to(torch.long).reshape(-1).cpu()
+        ids = torch.as_tensor(selected_ids, dtype=torch.long).reshape(-1).cpu()
         M = int(ids.numel())
+        self._validate_selected_ids(ids)
 
         prev = self._last_filled_ids
         if isinstance(prev, torch.Tensor) and prev.numel() == M and torch.equal(prev, ids):
@@ -391,8 +325,6 @@ class Qwen3MoeStackedBlock(nn.Module):
 
         if not self.owns_store and getattr(self, self._WEIGHT_ATTRS[0]) is None:
             self.bind_target(source_block)
-        self._ensure_sigs()
-
         if M >= self.num_experts:
             self.set_full()
             self._last_filled_ids = ids.clone()
@@ -400,45 +332,63 @@ class Qwen3MoeStackedBlock(nn.Module):
 
         device = self.router_weights.device
         ids_dev = ids.to(device)
-        P = self._build_redirect_P(
-            self._cached_sigs, ids_dev, self.num_experts, M, self.redirect_topk,
-            mode=self.redirect_mode,
-        )
-        self._set_redirect_buffers(M, P, ids_dev, device)
+        self._set_selected_experts(M, ids_dev, device)
         self._last_filled_ids = ids.clone()
         return True
 
     @torch.no_grad()
-    def _set_redirect_buffers(self, M: int, P: torch.Tensor, ids_dev: torch.Tensor,
+    def _set_selected_experts(self, M: int, ids_dev: torch.Tensor,
                               device: torch.device) -> None:
-        """Install the [E, M] redirect matrix + kept-id index for kept size M.
-
-        Pre-allocated drafts (fixed M) update in place (compile-friendly); a target
-        promoted from full (variable M) (re)allocates when the size first appears.
-        """
-        rdtype = self._compute_dtype or self.router_weights.dtype
-        if self.redirect_P is None or self.redirect_P.shape[1] != M:
-            self.redirect_P = torch.zeros(self.num_experts, M, dtype=rdtype, device=device)
+        """Install retained global ids, updating in place when shape is unchanged."""
+        if self.selected_expert_ids.numel() != M:
             self.selected_expert_ids = torch.zeros(M, dtype=torch.long, device=device)
-            self.kept = M
-            self.k_eff = min(self.top_k, M)
-        self.redirect_P.copy_(P.to(device=device, dtype=rdtype))
+        self.kept = M
         self.selected_expert_ids.copy_(ids_dev.to(self.selected_expert_ids.dtype))
+
+    def _validate_selected_ids(self, ids: torch.Tensor) -> None:
+        """Validate the retained pool needed for exactly-`top_k` routing."""
+        M = int(ids.numel())
+        if not (self.top_k <= M <= self.num_experts):
+            raise ValueError(
+                f"selected expert count ({M}) must be in "
+                f"[top_k={self.top_k}, num_experts={self.num_experts}]."
+            )
+        if bool(((ids < 0) | (ids >= self.num_experts)).any()):
+            raise ValueError(
+                f"selected expert ids must be in [0, {self.num_experts - 1}]."
+            )
+        if int(torch.unique(ids).numel()) != M:
+            raise ValueError("selected expert ids must be unique.")
 
     @torch.no_grad()
     def set_kept(self, ids: torch.Tensor) -> bool:
-        """Reduce to `ids` experts (self-sourced); route the full top-k mass onto them."""
+        """Restrict routing to `ids` experts."""
         return self.materialize_from_target(self, ids)
 
     # ------------------------------------------------------------------ forward
     def _routing_weights(self, x: torch.Tensor):
         """Routing -> (weights, global expert ids).
 
-        Full mode (`redirect_P is None`): standard top-k, `[T, top_k]` weights +
-        global ids. Subset/draft mode: redistribute the dropped experts' mass onto
-        the kept slots, then keep the `k_eff` strongest -> `[T, k_eff]` renormalized
-        weights + their global ids.
+        Full mode selects top-k over all router rows. Subset/draft mode selects
+        exactly top-k directly over retained rows and maps local slots back to global
+        expert ids.
         """
+        if self.kept < self.num_experts:
+            # Map local kept slots back to global ids only after top-k. This preserves
+            # the stacked full-store indexing used by the GMM kernels.
+            kept_router = self.router_weights.index_select(0, self.selected_expert_ids)
+            kept_logits = F.linear(x, kept_router)                          # [T, kept]
+            kept_vals, topk_slot = torch.topk(
+                kept_logits.to(torch.float32), k=self.top_k, dim=-1
+            )
+            if self.norm_topk_prob:
+                topk_w = F.softmax(kept_vals, dim=-1).to(x.dtype)
+            else:
+                kept_probs = F.softmax(kept_logits, dim=-1)
+                topk_w = torch.gather(kept_probs, -1, topk_slot).to(x.dtype)
+            topk_eid = self.selected_expert_ids[topk_slot]
+            return topk_w, topk_eid
+
         all_logits = F.linear(x, self.router_weights)                       # [T, E]
         topk_vals, topk_idx = torch.topk(all_logits.to(torch.float32), k=self.top_k, dim=-1)
         if self.norm_topk_prob:
@@ -446,17 +396,7 @@ class Qwen3MoeStackedBlock(nn.Module):
         else:
             topk_probs = torch.gather(F.softmax(all_logits, dim=-1), -1, topk_idx).to(x.dtype)
 
-        if self.redirect_P is None:
-            return topk_probs, topk_idx                                     # full: global ids directly
-
-        # Redistribute each routed expert's mass onto the kept slots, collapse over top_k.
-        gathered_P = F.embedding(topk_idx, self.redirect_P.to(x.dtype))     # [T, top_k, kept]
-        kept_w = (topk_probs.unsqueeze(-1) * gathered_P).sum(dim=1)         # [T, kept]
-        # Keep only the k_eff strongest kept slots per token (fixed-shape GMM); renormalize.
-        topk_w, topk_slot = torch.topk(kept_w, k=self.k_eff, dim=-1)        # [T, k_eff] local slots
-        topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-        topk_eid = self.selected_expert_ids[topk_slot]                      # [T, k_eff] global ids
-        return topk_w, topk_eid
+        return topk_probs, topk_idx                                         # full: global ids directly
 
     def _grouped_matmul_metadata(self, topk_eid: torch.Tensor):
         """Sort tokens by expert for the GMM kernels (active experts only)."""
@@ -487,7 +427,7 @@ class Qwen3MoeStackedBlock(nn.Module):
         T = x_flat.shape[0]
 
         # ================================================
-        # 1. Routing (full top-k, or redirected onto the kept set) -> global ids
+        # 1. Routing (full top-k, or top-k over retained experts) -> global ids
         # ================================================
         topk_weights, topk_eid = self._routing_weights(x_flat)
         k = topk_eid.shape[1]

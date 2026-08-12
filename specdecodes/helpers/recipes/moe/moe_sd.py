@@ -59,9 +59,6 @@ class Recipe(BaseRecipe):
         draft_cfg = {
             "kind": "draft_stacked",
             "top_n": 32,
-            # How many kept experts each dropped expert distributes its routing
-            # mass onto (soft top-K redirect in expert-weight-footprint space).
-            "redirect_topk": 8,
             "log_expert_usage": False,
             "expert_usage_log_path": None,
         }

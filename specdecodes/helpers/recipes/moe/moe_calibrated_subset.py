@@ -7,16 +7,16 @@ Pipeline (all at build time, on the FULL model before any swap):
   2. SELECT     — per layer, keep the fewest experts covering a fraction `tau`
      of routing mass (adaptive budget: diffuse layers keep more, concentrated
      layers fewer), then take those experts' global ids.
-  3. RESTRUCTURE — swap each MoE block for a reduced "expert pool + redirect"
-     block at the chosen precision (bf16 | int4 | fp8), routing the dropped
-     experts' mass onto the kept ones via the weight-footprint redirect.
+  3. RESTRUCTURE — swap each MoE block for a compact retained-expert block at
+     the chosen precision (bf16 | int4 | fp8). The original top-k is selected
+     directly among the retained experts.
 
 Precision-agnostic: the calibration + selection produce a precision-independent
 `{layer: kept_ids}`; the restructurer picks the block backend. Runs under the
 NAIVE generator (target-only, no speculative decoding) — set `method: vanilla`.
 
 Tune via the recipe's `init_args` in the method yaml (precision, coverage_tau,
-calibration dataset / size / gen tokens, redirect_topk, budget clamps).
+calibration dataset / size / gen tokens, budget clamps).
 """
 
 from __future__ import annotations
@@ -32,13 +32,12 @@ from ...restructurer.moe_calibrated_subset import MoECalibratedSubsetRestructure
 
 
 class Recipe(BaseRecipe):
-    """Calibrate -> select per-layer experts by coverage -> reduced pool+redirect blocks."""
+    """Calibrate, select experts by coverage, then compact each retained pool."""
 
     def __init__(
         self,
         precision: str = "int4",          # bf16 (exact, slow) | int4 (fast) | fp8 (todo)
         coverage_tau: float = 0.92,        # per-layer: keep fewest experts covering this mass
-        redirect_topk: int = 8,            # redirect fan-out for dropped experts
         group_size: int = 128,             # HQQ group size (int4 only)
         calib_dataset: str = "gsm8k",      # gsm8k | humaneval | mbpp | math500
         calib_n: int = 8,                  # number of calibration prompts
@@ -53,7 +52,6 @@ class Recipe(BaseRecipe):
         super().__init__()
         self.precision = str(precision).lower()
         self.coverage_tau = float(coverage_tau)
-        self.redirect_topk = int(redirect_topk)
         self.group_size = int(group_size)
         self.calib_dataset = str(calib_dataset)
         self.calib_n = int(calib_n)
@@ -122,7 +120,6 @@ class Recipe(BaseRecipe):
             "precision": self.precision,
             "source": source,
             "kept_per_layer": kept,
-            "redirect_topk": self.redirect_topk,
             "group_size": self.group_size,
         }
         return {"structure_config": target_cfg}, {"structure_config": {}}

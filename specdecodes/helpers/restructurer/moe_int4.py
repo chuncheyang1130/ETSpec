@@ -42,7 +42,6 @@ class MoEStackedInt4TargetRestructurer:
         return apply_stacked_int4_target(
             model=model,
             kept=int(structure_config.get("top_m", 96)),
-            redirect_topk=int(structure_config.get("redirect_topk", 4)),
             group_size=int(structure_config.get("group_size", 128)),
             device=device,
             dtype=compute_dtype,
@@ -65,7 +64,6 @@ class MoEStackedInt4DraftRestructurer:
         return apply_stacked_int4_draft(
             model=model,
             kept=int(structure_config.get("top_n", 32)),
-            redirect_topk=int(structure_config.get("redirect_topk", 4)),
             group_size=int(structure_config.get("group_size", 128)),
             device=device,
             dtype=compute_dtype,

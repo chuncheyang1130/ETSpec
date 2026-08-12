@@ -1,14 +1,11 @@
 """
-bf16 reduced-expert stacked MoE block — OFFLINE analysis only (the fidelity
-sweep: how lossy is an M-expert + redirect target vs. the full model?).
+bf16 reduced-expert stacked MoE block for offline subset-fidelity analysis.
 
-Thin subclass of `Qwen3MoeStackedBlock`: it inherits the whole subset /
-redirect machinery (`set_full` / `set_kept`, the weight-footprint `_compute_sigs`
-and `_build_redirect_P`) and differs from the serving block in **one** thing — the
-forward is **plain PyTorch** (no Triton GMM), for three reasons specific to a
-fidelity measurement:
+Thin subclass of `Qwen3MoeStackedBlock`: it inherits retained-expert routing,
+selection signatures, `set_full`, and `set_kept`, and differs from the serving
+block in one thing—the forward is plain PyTorch:
   * full mode and reduced mode share ONE code path, so kernel numerics cancel in the
-    KL — the metric isolates the *pruning + redirect* effect;
+    KL and the metric isolates pruning;
   * it runs on CPU and GPU (testable without a GPU);
   * `set_full()` reproduces standard Qwen3 top-k routing exactly, so it doubles as
     the reference.
@@ -29,7 +26,7 @@ from .qwen3_moe_stacked import Qwen3MoeStackedBlock
 
 
 class Qwen3MoeProfileBlock(Qwen3MoeStackedBlock):
-    """Reduced-expert (M + redirect) bf16 block with a plain-torch forward (analysis)."""
+    """Reduced-expert bf16 block with a plain-torch forward for analysis."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -38,15 +35,12 @@ class Qwen3MoeProfileBlock(Qwen3MoeStackedBlock):
 
     @classmethod
     @torch.no_grad()
-    def from_stacked(cls, full_block: Qwen3MoeStackedBlock, *, redirect_topk: int = 8,
-                        redirect_mode: str = "cosine", sig_mode: str = "l1"):
+    def from_stacked(cls, full_block: Qwen3MoeStackedBlock, *, sig_mode: str = "l1"):
         """Promote an already-built full `Qwen3MoeStackedBlock` IN-PLACE into an
         analysis subset block — reuses its stacked weights + router (no copy)."""
         if not isinstance(full_block, Qwen3MoeStackedBlock):
             raise TypeError(f"from_stacked expects Qwen3MoeStackedBlock, got {type(full_block).__name__}")
         full_block.__class__ = cls
-        full_block.redirect_topk = int(redirect_topk)
-        full_block.redirect_mode = str(redirect_mode)
         full_block.sig_mode = str(sig_mode)
         full_block._cached_sigs = None
         full_block._last_filled_ids = None
@@ -54,14 +48,6 @@ class Qwen3MoeProfileBlock(Qwen3MoeStackedBlock):
         full_block._last_probs = None
         full_block.set_full()
         return full_block
-
-    @torch.no_grad()
-    def set_kept(self, ids: torch.Tensor) -> bool:
-        """Always rebuild (no kept-set cache): the sweep flips `redirect_mode` /
-        `sig_mode` between calls on the *same* kept set, so the redirect must be
-        recomputed each time."""
-        self._last_filled_ids = None
-        return super().set_kept(ids)
 
     # ------------------------------------------------------------------ selection experiments
     @staticmethod
@@ -96,8 +82,7 @@ class Qwen3MoeProfileBlock(Qwen3MoeStackedBlock):
         """Greedy facility-location (k-medoids) subset selection over footprints.
 
         Picks the `M` experts minimizing total distance from every expert to its
-        nearest kept one — representative cluster *centers* (matches what the redirect
-        does, so it directly minimizes total redirect error). Returns `[M]` ids.
+        nearest retained one—representative cluster centers. Returns `[M]` ids.
         """
         E = sigs.shape[0]
         M = min(int(M), E)
@@ -157,28 +142,34 @@ class Qwen3MoeProfileBlock(Qwen3MoeStackedBlock):
 
     # ------------------------------------------------------------------ plain-torch forward
     def _routing_probs(self, x: torch.Tensor) -> torch.Tensor:
-        """Dense [T, num_experts] routing weights (full top-k, or redirected onto kept)."""
+        """Dense `[T, E]` routing weights.
+
+        Full mode uses standard top-k; subset mode takes top-k directly over retained
+        router rows.
+        """
         T = x.shape[0]
         logits = F.linear(x, self.router_weights).float()                 # [T, E]
-        topk_vals, topk_idx = torch.topk(logits, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            topk_probs = F.softmax(topk_vals, dim=-1)
-        else:
-            topk_probs = torch.gather(F.softmax(logits, dim=-1), -1, topk_idx)
-        topk_probs = topk_probs.to(x.dtype)
-
         probs = torch.zeros(T, self.num_experts, dtype=x.dtype, device=x.device)
-        if self.redirect_P is None:
-            probs.scatter_(1, topk_idx, topk_probs)                       # standard top-k
+        if self.kept < self.num_experts:
+            kept_logits = logits.index_select(1, self.selected_expert_ids)  # [T, kept]
+            kept_vals, topk_slot = torch.topk(kept_logits, self.top_k, dim=-1)
+            if self.norm_topk_prob:
+                kept_probs = F.softmax(kept_vals, dim=-1).to(x.dtype)
+            else:
+                kept_probs = torch.gather(
+                    F.softmax(kept_logits, dim=-1), -1, topk_slot
+                ).to(x.dtype)
+            topk_eid = self.selected_expert_ids[topk_slot]
+            probs.scatter_(1, topk_eid, kept_probs)
         else:
-            gathered = F.embedding(topk_idx, self.redirect_P.to(x.dtype))  # [T, top_k, kept]
-            kept_w = (topk_probs.unsqueeze(-1) * gathered).sum(dim=1)     # [T, kept]
-            if self.redirect_mode == "renorm":
-                # Dropped experts' mass was discarded (their P rows are zero); rescale
-                # the surviving kept mass back to the original top-k total.
-                orig = topk_probs.sum(dim=-1, keepdim=True)               # [T, 1]
-                kept_w = kept_w / kept_w.sum(dim=-1, keepdim=True).clamp_min(1e-9) * orig
-            probs.scatter_(1, self.selected_expert_ids.unsqueeze(0).expand(T, -1), kept_w)
+            topk_vals, topk_idx = torch.topk(logits, self.top_k, dim=-1)
+            if self.norm_topk_prob:
+                topk_probs = F.softmax(topk_vals, dim=-1).to(x.dtype)
+            else:
+                topk_probs = torch.gather(
+                    F.softmax(logits, dim=-1), -1, topk_idx
+                ).to(x.dtype)
+            probs.scatter_(1, topk_idx, topk_probs)
         if self._capture_probs:
             self._last_probs = probs.detach()             # [T, E] per-position routing mass
         return probs

@@ -11,10 +11,8 @@ benchmark prompts). Here you provide the selection directly, two ways:
     (convenience for a uniform subset).
 
 No model forward, no tokenizer, no benchmark — just read ids and hand them to the
-restructurer, which swaps each MoE block for a reduced "expert pool + redirect" block
-at the chosen precision (bf16 | int4) and installs the kept set via `set_kept`
-(dropped experts' routing mass redirected onto the kept ones). Runs under the NAIVE
-generator (`method: vanilla`). Set the inputs via the recipe `init_args` in the yaml.
+restructurer, which swaps each MoE block for a compact retained-expert block at the
+chosen precision. Routing then selects top-k directly from that retained pool.
 """
 
 from __future__ import annotations
@@ -34,14 +32,12 @@ class Recipe(BaseRecipe):
     def __init__(
         self,
         precision: str = "int4",            # bf16 (exact) | int4 (fast) | fp8 (todo)
-        redirect_topk: int = 8,             # redirect fan-out for dropped experts
         group_size: int = 128,              # HQQ group size (int4 only)
         kept_path: Optional[str] = None,    # per-layer JSON {layer_name: [global ids]}
         kept_ids: Optional[list] = None,    # global list applied to EVERY MoE layer
     ):
         super().__init__()
         self.precision = str(precision).lower()
-        self.redirect_topk = int(redirect_topk)
         self.group_size = int(group_size)
         self.kept_path = kept_path
         self.kept_ids = [int(i) for i in kept_ids] if kept_ids else None
@@ -85,7 +81,6 @@ class Recipe(BaseRecipe):
             "precision": self.precision,
             "source": "hf",                 # raw HF -> restructurer builds the reduced block from_huggingface
             "kept_per_layer": kept,
-            "redirect_topk": self.redirect_topk,
             "group_size": self.group_size,
         }
         return {"structure_config": target_cfg}, {"structure_config": {}}
