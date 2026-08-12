@@ -11,7 +11,7 @@ contribution to the shared `[T, H]` output — but the down weights are HQQ-INT4
 
 The full `[E, H, IM//2]` INT4 store is indexed by *global* expert id
 (`active_experts[pid_e]`), so the same kernel serves the draft (N experts) and
-the target (M experts); the redirect router decides which global ids appear.
+the target (M experts); retained-pool routing decides which global ids appear.
 
 Packing (must match `_pack_int4_grouped`): within each contraction group of
 GROUP_SIZE along IM, the first HALF codes are low nibbles and the next HALF high

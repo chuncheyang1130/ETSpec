@@ -4,21 +4,17 @@ INT4 (all-expert) stacked MoE block — the INT4 twin of
 
 HQQ-quantizes **all** experts to INT4 **once** at build time and keeps the full
 `[E, ...]` packed store resident; changing the kept set each round is then a pure
-routing change (`redirect_P` + `selected_expert_ids`) — no re-quantization, no CPU
-master. It is used in two roles by the INT4 self-speculative family:
+routing change (`selected_expert_ids`) — no re-quantization or CPU master. It is
+used in two roles by the INT4 self-speculative family:
   * **Target** — `from_huggingface` / `from_stacked` quantizes all experts (owns
     the store) and routes to its top-M kept set.
   * **Draft**  — constructed empty (`owns_store=False`), then `bind_target(...)`
-    aliases the target's INT4 store / router / footprints (no copy) and routes to
-    its top-N kept set.
+    aliases the target's INT4 store and router (no copy) and routes to its top-N
+    retained set.
 
-All routing/redirect/bind/materialize logic — the redirecting router, `set_kept`,
-`materialize_from_target`, `set_full`, the weight-footprint redirect (`_build_redirect_P`)
-— is inherited from `Qwen3MoeStackedBlock`. This block overrides **only** the
-storage (INT4 packed buffers + per-group HQQ scale/zero), the build/bind paths, the
-sig cache (footprints are computed from bf16 before quantization, not from the packed
-store), the GMM metadata helper (all-expert grid for `fullgraph=True`), and the two
-GMM kernel calls (INT4 dequant inner loop instead of bf16).
+Retained-expert routing, binding, and materialization are inherited from
+`Qwen3MoeStackedBlock`. This block overrides storage, build/bind paths, the GMM
+metadata helper, and the two INT4 kernel calls.
 
 Attributes (override the base `_WEIGHT_ATTRS`):
     gate_proj_packed_int4 : [E, IM, H//2]  uint8   (+ _scale / _zero_scaled per group)
@@ -53,7 +49,7 @@ _INT4_BUFFERS = (
 
 
 class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
-    """All-expert INT4 stacked block; routes to `kept` experts via the inherited redirect router."""
+    """All-expert INT4 stacked block routing top-k over retained experts."""
 
     # The draft aliases the INT4 store (not the bf16 stacked weights) from its target.
     _WEIGHT_ATTRS = _INT4_BUFFERS
@@ -66,7 +62,6 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
         top_k: int,
         norm_topk_prob: bool,
         kept: int,
-        redirect_topk: int,
         group_size: int,
         dtype: torch.dtype,
         device: torch.device | str,
@@ -87,7 +82,6 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
             top_k=top_k,
             norm_topk_prob=norm_topk_prob,
             kept=kept,
-            redirect_topk=redirect_topk,
             owns_store=owns_store,
             dtype=dtype,
             device=device,
@@ -131,16 +125,14 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
         hf_block,
         *,
         kept: int,
-        redirect_topk: int,
         group_size: int = 128,
         device: Optional[torch.device | str] = None,
         compute_dtype: torch.dtype = torch.bfloat16,
     ) -> "Qwen3MoeStackedInt4Block":
         """Build a target block: HQQ-INT4 quantize **all** experts once + copy router.
 
-        Streams each expert's bf16 weight into a temporary `[E, ...]` stack (releasing
-        the HF source), computes the redirect footprints from those bf16 weights, then
-        HQQ-quantizes the whole stack to the INT4 store and frees the bf16 stack.
+        Streams each expert's bf16 weight into a temporary `[E, ...]` stack,
+        HQQ-quantizes it, and frees the source weights.
         """
         sample_w = hf_block.experts[0].gate_proj.weight
         src_device, _ = sample_w.device, sample_w.dtype
@@ -157,7 +149,6 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
             top_k=top_k,
             norm_topk_prob=norm_topk_prob,
             kept=kept,
-            redirect_topk=redirect_topk,
             group_size=group_size,
             dtype=compute_dtype,
             device=dev,
@@ -182,9 +173,6 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
             expert.up_proj.weight = None
             expert.down_proj.weight = None
 
-        # Redirect footprints from bf16 (must precede quantization / freeing).
-        block._cached_sigs = cls._compute_sigs(gate, up, down, mode=block.sig_mode)
-
         # HQQ-INT4 quantize + pack all experts (FMA-folded scale/zero).
         block._quantize_into_store(gate, up, down, group_size)
 
@@ -206,7 +194,6 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
         full_block,
         *,
         kept: int,
-        redirect_topk: int,
         group_size: int = 128,
         device: Optional[torch.device | str] = None,
         compute_dtype: torch.dtype = torch.bfloat16,
@@ -224,7 +211,7 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
         block = cls(
             hidden_size=hidden_size, intermediate_size=intermediate_size, num_experts=num_experts,
             top_k=int(full_block.top_k), norm_topk_prob=bool(full_block.norm_topk_prob),
-            kept=kept, redirect_topk=redirect_topk, group_size=group_size,
+            kept=kept, group_size=group_size,
             dtype=compute_dtype, device=dev, owns_store=True,
         )
         block.router_weights.data.copy_(full_block.router_weights.to(device=dev, dtype=compute_dtype))
@@ -232,7 +219,6 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
         g = gate.to(device=dev, dtype=compute_dtype)
         u = up.to(device=dev, dtype=compute_dtype)
         d = down.to(device=dev, dtype=compute_dtype)
-        block._cached_sigs = cls._compute_sigs(g, u, d, mode=block.sig_mode)
         block._quantize_into_store(g, u, d, group_size)
 
         if torch.cuda.is_available():
@@ -251,15 +237,10 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
         self.up_proj_packed_int4.copy_(up_p); self.up_proj_scale.copy_(us); self.up_proj_zero_scaled.copy_(uz)
         self.down_proj_packed_int4.copy_(dp); self.down_proj_scale.copy_(ds); self.down_proj_zero_scaled.copy_(dz)
 
-    # ------------------------------------------------------------------ binding / sigs
+    # ------------------------------------------------------------------ binding
     @torch.no_grad()
     def bind_target(self, target_block: "Qwen3MoeStackedInt4Block") -> bool:
-        """Alias the target's INT4 store + router + footprints (draft, no copy).
-
-        Overrides the base bind (which aliases bf16 weights and recomputes sigs):
-        footprints can't be derived from the packed store, so we copy the target's
-        cached sigs.
-        """
+        """Alias the target's INT4 store and router (draft, no copy)."""
         if self.owns_store or self.gate_proj_packed_int4 is not None:
             return False
         for name in self._WEIGHT_ATTRS:
@@ -268,17 +249,11 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
         self.router_weights.data.copy_(
             target_block.router_weights.to(device=self.router_weights.device, dtype=self._compute_dtype)
         )
-        self._cached_sigs = target_block._cached_sigs
         return True
 
     def _ensure_sigs(self) -> None:
-        """Footprints are computed from bf16 at build (or copied from the target at
-        bind); they cannot be recovered from the packed store."""
-        if self._cached_sigs is None:
-            raise RuntimeError(
-                "INT4 block footprints are not cached — build via from_huggingface / "
-                "from_stacked, or bind_target a built target, before set_kept."
-            )
+        """Packed INT4 stores do not expose bf16 signatures for offline selection."""
+        raise RuntimeError("Expert signatures cannot be recovered from the packed INT4 store.")
 
     # ------------------------------------------------------------------ forward kernels
     def _grouped_matmul_metadata(self, topk_eid: torch.Tensor):
@@ -291,8 +266,8 @@ class Qwen3MoeStackedInt4Block(Qwen3MoeStackedBlock):
         """
         E = self.num_experts
         device = topk_eid.device
-        flat = topk_eid.reshape(-1).to(torch.long)                          # [T*k_eff]
-        expert_ids, sorted_token_ids = torch.sort(flat)                     # both [T*k_eff]
+        flat = topk_eid.reshape(-1).to(torch.long)                          # [T*top_k]
+        expert_ids, sorted_token_ids = torch.sort(flat)                     # both [T*top_k]
         n_per = torch.zeros(E, dtype=torch.long, device=device).scatter_add_(
             0, expert_ids, torch.ones_like(expert_ids)
         )                                                                   # [E]

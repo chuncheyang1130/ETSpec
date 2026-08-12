@@ -10,7 +10,7 @@ K-loop (FMA-folded `W ~= q*step + zero_scaled`).
 
 This is the kernel the INT4 stacked block (`Qwen3MoeStackedInt4Block`)
 runs: the full `[E, IM, H//2]` INT4 store is shared by the draft (routes to N
-experts) and the target (routes to M experts); only the redirect router decides
+experts) and the target (routes to M experts); retained-pool routing decides
 which global ids land in `active_experts`, so the same kernel serves both.
 
 Packing convention (must match `_pack_int4_grouped` in `hqq_quantize`): within
@@ -196,7 +196,7 @@ def triton_fused_gate_up_int4_gmm_silu(
     For each (token, expert) assignment:
         out[sorted_pos] = SiLU(x[token] @ deq(wq_gate[eid]).T) * (x[token] @ deq(wq_up[eid]).T)
     `wq_*` is the *full* stacked INT4 store; `active_experts` (global ids) restricts
-    work to the kept set chosen by the redirect router.
+    work to the router's retained expert pool.
     """
     T, H = x.shape
     E, IM, _ = wq_gate.shape

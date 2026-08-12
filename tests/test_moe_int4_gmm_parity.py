@@ -11,8 +11,7 @@ is a kernel bug, not HQQ error.
 Covers:
   - golden-path shapes, top_k=1, T=1, many experts / sparse routing
   - imbalanced routing (all tokens to one expert)
-  - end-to-end block forward through `from_huggingface` (kept = all experts,
-    redirect_topk=1 ⇒ identity redirect ⇒ standard top_k routing)
+  - end-to-end block forward through `from_huggingface` with all experts retained
 """
 
 import sys
@@ -207,9 +206,7 @@ def test_int4_gmm_imbalanced_routing():
 def test_int4_stacked_block_forward():
     """End-to-end block: from_huggingface (quantize all) + forward, kept=all experts.
 
-    With kept = num_experts and redirect_topk=1 the redirect is identity, so the
-    block reduces to standard top_k routing — compared against eager on the block's
-    own dequantized INT4 store.
+    With all experts retained, the block uses standard top-k routing.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -235,7 +232,7 @@ def test_int4_stacked_block_forward():
     )
 
     block = Qwen3MoeStackedInt4Block.from_huggingface(
-        hf_block, kept=E, redirect_topk=1, group_size=group_size, device=device, compute_dtype=dtype,
+        hf_block, kept=E, group_size=group_size, device=device, compute_dtype=dtype,
     )
     block.set_kept(torch.arange(E))
 
