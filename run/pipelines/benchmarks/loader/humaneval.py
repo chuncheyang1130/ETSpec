@@ -27,7 +27,7 @@ def load_humaneval_dataset(query_version: str = "llama"):
         raise ValueError(f"Unknown query_version: {query_version}")
     
     samples = []
-    dataset = load_dataset("openai/openai_humaneval", split="test")
+    dataset = load_dataset("evalplus/humanevalplus", split="test")
     
     for entry in dataset:
         samples.append({
