@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """
-MoE expert-subset *fidelity* sweep — how lossy is an M-expert + redirect target?
+MoE expert-subset fidelity sweep.
 
 Reframes "is lossy verification usable?" into the directly-measurable question
-"is the M-expert (redirect-pruned) MoE faithful to the full model?". For each M it
+"is an M-expert MoE faithful to the full model?". For each M it
 teacher-forces the same sequences through the full model and the reduced model and
 reports per-token KL(full || reduced) and top-1 agreement on the answer tokens.
 bf16 (no INT4 confound); both runs share one plain-torch MoE path
-(`Qwen3MoeStackedSubsetBlock`), so the metric isolates pruning + redirect.
+(`Qwen3MoeProfileBlock`), so the metric isolates expert selection.
 
 The kept set per layer is the top-M by accumulated routing mass over the same
 sequences (the deployable "static kept-set" — steady state of the dynamic picker),
@@ -44,7 +44,7 @@ from specdecodes.models.utils.moe.base.qwen3_moe_stacked import (
     _is_qwen3_moe_block as _is_hf_moe_block,
 )
 from specdecodes.models.utils.moe.base.qwen3_moe_profile import (
-    Qwen3MoeStackedSubsetBlock,
+    Qwen3MoeProfileBlock,
 )
 from specdecodes.models.utils.moe.base.expert_usage_tracker import (
     _set_module_by_name,
@@ -76,49 +76,36 @@ _DEFAULT_PROMPTS = [
 ]
 
 
-def swap_to_subset(model, redirect_topk: int) -> int:
+def swap_to_subset(model) -> int:
     blocks = [(n, m) for n, m in list(model.named_modules()) if _is_hf_moe_block(m)]
     for name, hf in blocks:
-        new = Qwen3MoeStackedSubsetBlock.from_huggingface(hf, redirect_topk=redirect_topk)
+        new = Qwen3MoeProfileBlock.from_huggingface(hf)
         _set_module_by_name(model, name, new)
-    logging.info("Swapped %d MoE blocks -> Qwen3MoeStackedSubsetBlock.", len(blocks))
+    logging.info("Swapped %d MoE blocks -> Qwen3MoeProfileBlock.", len(blocks))
     return len(blocks)
 
 
 def set_all_full(model) -> None:
     for m in model.modules():
-        if isinstance(m, Qwen3MoeStackedSubsetBlock):
+        if isinstance(m, Qwen3MoeProfileBlock):
             m.set_full()
 
 
 def apply_kept(model, kept_per_layer) -> None:
     for name, m in model.named_modules():
-        if isinstance(m, Qwen3MoeStackedSubsetBlock):
+        if isinstance(m, Qwen3MoeProfileBlock):
             ids = kept_per_layer.get(name)
             m.set_kept(ids) if ids is not None else m.set_full()
-
-
-def set_redirect_mode(model, mode: str) -> None:
-    """Set the redirect construction (cosine|lsq|renorm) on every subset block.
-
-    The kept set is mode-independent (picked by mass), so the next `apply_kept`
-    rebuilds `redirect_P` for the same subset under this mode — isolating the
-    *redirect construction* as the only variable.
-    """
-    for m in model.modules():
-        if isinstance(m, Qwen3MoeStackedSubsetBlock):
-            m.redirect_mode = str(mode)
 
 
 def set_sig_mode(model, mode: str) -> None:
     """Set the descriptor (l1|l1l2|spectral|all) on every subset block.
 
-    Invalidates each block's cached footprints; the next `apply_kept` recomputes
-    them under `mode` and rebuilds the redirect. Orthogonal to the kept set (which
-    is picked by mass), so it isolates the *descriptor* as the variable.
+    Invalidates each block's cached footprints. This affects weight-based subset
+    selection without changing retained-expert routing.
     """
     for m in model.modules():
-        if isinstance(m, Qwen3MoeStackedSubsetBlock):
+        if isinstance(m, Qwen3MoeProfileBlock):
             m.set_sig_mode(mode)
 
 
@@ -132,20 +119,20 @@ def pick_css_per_layer(model, M):
     return {
         name: m.css_kept(M)
         for name, m in model.named_modules()
-        if isinstance(m, Qwen3MoeStackedSubsetBlock)
+        if isinstance(m, Qwen3MoeProfileBlock)
     }
 
 
 def pick_cssfl_per_layer(model, M):
     """Offline (weight-only) kept set per layer via facility-location CSS.
 
-    Picks representative *centers* (minimize total distance-to-nearest), the right
-    objective for the redirect — vs `css` (pivoted-QR span, picks outliers).
+    Picks representative centers that minimize distance to the nearest retained
+    expert, versus pivoted-QR CSS which emphasizes spanning directions.
     """
     return {
         name: m.cssfl_kept(M)
         for name, m in model.named_modules()
-        if isinstance(m, Qwen3MoeStackedSubsetBlock)
+        if isinstance(m, Qwen3MoeProfileBlock)
     }
 
 
@@ -155,7 +142,7 @@ def pick_random_per_layer(model, M, seed: int = 1234):
     return {
         name: torch.randperm(m.num_experts, generator=g)[:M].to(torch.long)
         for name, m in model.named_modules()
-        if isinstance(m, Qwen3MoeStackedSubsetBlock)
+        if isinstance(m, Qwen3MoeProfileBlock)
     }
 
 
@@ -170,7 +157,7 @@ def pick_router_mc_per_layer(model, M, n_samples: int = 8192, use_gamma: bool = 
     mods = dict(model.named_modules())
     out = {}
     for name, m in mods.items():
-        if not isinstance(m, Qwen3MoeStackedSubsetBlock):
+        if not isinstance(m, Qwen3MoeProfileBlock):
             continue
         gamma = None
         if use_gamma:
@@ -250,10 +237,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-30B-A3B-Instruct-2507")
     ap.add_argument("--M", type=int, nargs="+", default=[16, 32, 48, 64, 96, 128])
-    ap.add_argument("--redirect-topk", type=int, default=8)
-    ap.add_argument("--redirect-modes", nargs="+", default=["cosine", "lsq", "renorm"],
-                    choices=["cosine", "lsq", "renorm"],
-                    help="redirect constructions to A/B at each M (subset fixed, redirect varies)")
     ap.add_argument("--sig-modes", nargs="+", default=["l1"],
                     choices=["l1", "l1l2", "spectral", "all"],
                     help="footprint descriptors to A/B (weight-only; isolates descriptor quality)")
@@ -319,7 +302,7 @@ def main():
     # THEN swap to the (slow, plain-torch) subset blocks for scoring.
     logging.info("Building %d sequences (score_on=%s) ...", len(prompts), args.score_on)
     seqs = build_sequences(model, tok, prompts, args, args.device)
-    swap_to_subset(model, args.redirect_topk)
+    swap_to_subset(model)
 
     n_ans_total = sum(ids.shape[1] - start for ids, start in seqs)
     logging.info("%d prompts, %d scored tokens.", len(seqs), n_ans_total)
@@ -416,7 +399,7 @@ def main():
         Ms_c = sorted(M for M in set(args.M) if M < E)
         set_all_full(model)
         blocks = [m for _, m in model.named_modules()
-                  if isinstance(m, Qwen3MoeStackedSubsetBlock)]
+                  if isinstance(m, Qwen3MoeProfileBlock)]
         for m in blocks:
             m._capture_probs = True
         maxT = max(ids.shape[1] for ids, _ in seqs)
@@ -553,8 +536,16 @@ def main():
     Ms = sorted(set(args.M))
     sig_modes = list(dict.fromkeys(args.sig_modes))         # dedup, keep order
     subset_modes = list(dict.fromkeys(args.subset_modes))
-    red_modes = list(dict.fromkeys(args.redirect_modes))
     E = model.config.num_experts
+    router_top_k = max(
+        m.top_k for m in model.modules() if isinstance(m, Qwen3MoeProfileBlock)
+    )
+    invalid_M = [M for M in Ms if M < router_top_k]
+    if invalid_M:
+        raise ValueError(
+            f"every retained pool must contain at least router top_k={router_top_k}; "
+            f"invalid --M values: {invalid_M}"
+        )
 
     # --- Mass calibration: ONLY if a mass-picked subset is requested. CSS/random
     #     need no data, so the experiment can run fully pre-benchmark without it. ---
@@ -630,15 +621,15 @@ def main():
         raise ValueError(f"unknown subset mode: {subset!r}")
 
     # Full (reference) logits per sequence, computed ONCE and held on CPU so no
-    # downstream axis (descriptor / subset / redirect) re-runs them.
+    # downstream descriptor/subset axes do not re-run them.
     logging.info("Computing full (reference) logits for %d sequences ...", len(seqs))
     set_all_full(model)
     full_logits = [logits_on_answer(model, ids, start).cpu() for ids, start in seqs]
     n_ans_list = [int(f.shape[0]) for f in full_logits]
     maxlen = max(n_ans_list) if n_ans_list else 0
 
-    # --- Sweep over (descriptor x subset x redirect x M) ---
-    kl_sum, top1_sum = {}, {}                               # (sig, subset, red, M) -> float
+    # --- Sweep over (descriptor x subset x M) ---
+    kl_sum, top1_sum = {}, {}                               # (sig, subset, M) -> float
     trend_sum, trend_cnt = {}, {}                           # per-position KL sums/counts (--trend)
     for sig in sig_modes:
         set_sig_mode(model, sig)                            # footprints recomputed once per descriptor
@@ -646,66 +637,62 @@ def main():
             is_own = (subset == "mass" and args.mass_calib == "own")   # kept set varies per sequence
             kept_by_M = ({} if is_own
                          else {M: compute_kept(subset, M) for M in Ms if M < E})  # css depends on `sig`
-            for red in red_modes:
-                set_redirect_mode(model, red)
-                for M in Ms:
-                    key = (sig, subset, red, M)
-                    if M >= E:                              # all experts kept -> == reference
-                        kl_sum[key] = 0.0
-                        top1_sum[key] = float(sum(n_ans_list))
-                        continue
-                    if args.trend:                          # per-position KL accumulators for this config
-                        trend_sum[key] = np.zeros(maxlen); trend_cnt[key] = np.zeros(maxlen)
-                    ksum = tsum = 0.0
-                    if is_own:
-                        # Per-sequence: kept set from THIS sequence's own prefill mass.
-                        for si, ((ids, start), full) in enumerate(zip(seqs, full_logits)):
-                            apply_kept(model, pick_top_n_per_layer(per_seq_mass[si], top_n=M))
-                            red_logits = logits_on_answer(model, ids, start).cpu()
-                            kl, t1 = kl_top1(full, red_logits)
-                            ksum += float(kl.sum()); tsum += float(t1.sum())
-                            if args.trend:
-                                a = kl.numpy(); trend_sum[key][:a.shape[0]] += a; trend_cnt[key][:a.shape[0]] += 1
-                    else:
-                        apply_kept(model, kept_by_M[M])     # one global kept + redirect_P under `red`
-                        for (ids, start), full in zip(seqs, full_logits):
-                            red_logits = logits_on_answer(model, ids, start).cpu()
-                            kl, t1 = kl_top1(full, red_logits)
-                            ksum += float(kl.sum()); tsum += float(t1.sum())
-                            if args.trend:
-                                a = kl.numpy(); trend_sum[key][:a.shape[0]] += a; trend_cnt[key][:a.shape[0]] += 1
-                    kl_sum[key] = ksum; top1_sum[key] = tsum
-                logging.info("  sig=%s subset=%s redirect=%s done", sig, subset, red)
+            for M in Ms:
+                key = (sig, subset, M)
+                if M >= E:                                  # all experts retained -> reference
+                    kl_sum[key] = 0.0
+                    top1_sum[key] = float(sum(n_ans_list))
+                    continue
+                if args.trend:
+                    trend_sum[key] = np.zeros(maxlen); trend_cnt[key] = np.zeros(maxlen)
+                ksum = tsum = 0.0
+                if is_own:
+                    for si, ((ids, start), full) in enumerate(zip(seqs, full_logits)):
+                        apply_kept(model, pick_top_n_per_layer(per_seq_mass[si], top_n=M))
+                        subset_logits = logits_on_answer(model, ids, start).cpu()
+                        kl, t1 = kl_top1(full, subset_logits)
+                        ksum += float(kl.sum()); tsum += float(t1.sum())
+                        if args.trend:
+                            a = kl.numpy(); trend_sum[key][:a.shape[0]] += a; trend_cnt[key][:a.shape[0]] += 1
+                else:
+                    apply_kept(model, kept_by_M[M])
+                    for (ids, start), full in zip(seqs, full_logits):
+                        subset_logits = logits_on_answer(model, ids, start).cpu()
+                        kl, t1 = kl_top1(full, subset_logits)
+                        ksum += float(kl.sum()); tsum += float(t1.sum())
+                        if args.trend:
+                            a = kl.numpy(); trend_sum[key][:a.shape[0]] += a; trend_cnt[key][:a.shape[0]] += 1
+                kl_sum[key] = ksum; top1_sum[key] = tsum
+            logging.info("  sig=%s subset=%s done", sig, subset)
 
     Ms_arr = np.array(Ms)
-    # [n_sig, n_subset, n_red, n_M]
-    kl_mat = np.array([[[[kl_sum[(s, sub, r, M)] / n_ans_total for M in Ms]
-                         for r in red_modes] for sub in subset_modes] for s in sig_modes])
-    t1_mat = np.array([[[[top1_sum[(s, sub, r, M)] / n_ans_total * 100 for M in Ms]
-                         for r in red_modes] for sub in subset_modes] for s in sig_modes])
+    # [n_sig, n_subset, n_M]
+    kl_mat = np.array([[[kl_sum[(s, sub, M)] / n_ans_total for M in Ms]
+                        for sub in subset_modes] for s in sig_modes])
+    t1_mat = np.array([[[top1_sum[(s, sub, M)] / n_ans_total * 100 for M in Ms]
+                        for sub in subset_modes] for s in sig_modes])
 
-    multi = {"sig": len(sig_modes) > 1, "subset": len(subset_modes) > 1, "red": len(red_modes) > 1}
-    def _label(s, sub, r):
-        parts = ([s] if multi["sig"] else []) + ([sub] if multi["subset"] else []) + ([r] if multi["red"] else [])
-        return "/".join(parts) if parts else f"{sub}/{r}"
+    multi = {"sig": len(sig_modes) > 1, "subset": len(subset_modes) > 1}
+    def _label(s, sub):
+        parts = ([s] if multi["sig"] else []) + ([sub] if multi["subset"] else [])
+        return "/".join(parts) if parts else sub
 
-    print("\n=== Expert-subset target fidelity vs full model (descriptor x subset x redirect) ===")
+    print("\n=== Expert-subset target fidelity vs full model ===")
     print(f"model={args.model}  prompts={len(seqs)}  answer_tokens={n_ans_total}  "
-          f"E={E}  top_k={model.config.num_experts_per_tok}  redirect_topk={args.redirect_topk}  "
+          f"E={E}  top_k={model.config.num_experts_per_tok}  "
           f"mass_calib={args.mass_calib}")
     for si_, s in enumerate(sig_modes):
         for ui_, sub in enumerate(subset_modes):
-            for ri_, r in enumerate(red_modes):
-                print(f"\n-- descriptor={s}  subset={sub}  redirect={r} --")
-                print(f"{'M':>5} | {'mean KL(full||red)':>18} | {'top-1 agree %':>13}")
-                for j, M in enumerate(Ms):
-                    print(f"{M:>5} | {kl_mat[si_, ui_, ri_, j]:>18.4f} | {t1_mat[si_, ui_, ri_, j]:>12.1f}%")
+            print(f"\n-- descriptor={s}  subset={sub} --")
+            print(f"{'M':>5} | {'mean KL(full||subset)':>21} | {'top-1 agree %':>13}")
+            for j, M in enumerate(Ms):
+                print(f"{M:>5} | {kl_mat[si_, ui_, j]:>21.4f} | {t1_mat[si_, ui_, j]:>12.1f}%")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     np.savez(args.out + ".npz", M=Ms_arr, sig_modes=np.array(sig_modes),
-             subset_modes=np.array(subset_modes), modes=np.array(red_modes),
+             subset_modes=np.array(subset_modes),
              kl=kl_mat, top1=t1_mat, num_experts=E, answer_tokens=n_ans_total,
-             n_prompts=len(seqs), redirect_topk=args.redirect_topk, mass_calib=args.mass_calib)
+             n_prompts=len(seqs), mass_calib=args.mass_calib)
     logging.info("saved -> %s.npz", args.out)
     try:
         import matplotlib
@@ -714,10 +701,9 @@ def main():
         fig, (a0, a1) = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
         for si_, s in enumerate(sig_modes):
             for ui_, sub in enumerate(subset_modes):
-                for ri_, r in enumerate(red_modes):
-                    lbl = _label(s, sub, r)
-                    a0.plot(Ms_arr, kl_mat[si_, ui_, ri_], marker="o", label=lbl)
-                    a1.plot(Ms_arr, t1_mat[si_, ui_, ri_], marker="o", label=lbl)
+                lbl = _label(s, sub)
+                a0.plot(Ms_arr, kl_mat[si_, ui_], marker="o", label=lbl)
+                a1.plot(Ms_arr, t1_mat[si_, ui_], marker="o", label=lbl)
         a0.set_xlabel("kept experts M"); a0.set_ylabel("mean KL(full || reduced)")
         a0.set_title("Verification loss vs M"); a0.grid(alpha=0.3); a0.legend()
         a1.set_xlabel("kept experts M"); a1.set_ylabel("top-1 agreement %")
@@ -737,7 +723,7 @@ def main():
         n_bins = (maxlen + W - 1) // W if maxlen else 0
         centers = np.arange(n_bins) * W + W / 2.0
         keys = list(trend_sum.keys())
-        labels = [f"{_label(s, sub, r)}·M{M}" for (s, sub, r, M) in keys]
+        labels = [f"{_label(s, sub)}·M{M}" for (s, sub, M) in keys]
         kl_trend = np.full((len(keys), n_bins), np.nan)            # [config, window] mean KL
         for i, k in enumerate(keys):
             ts, tc = trend_sum[k], trend_cnt[k]
