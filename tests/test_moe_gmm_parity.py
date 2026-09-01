@@ -147,7 +147,11 @@ def test_gmm_parity(T, H, IM, num_experts, top_k):
 @torch.no_grad()
 def test_gmm_imbalanced_routing():
     """All tokens routed to the same expert — exercises an expert with T tokens
-    and many other experts with zero (must be excluded from active_experts).
+    and many other experts with zero.
+
+    The metadata grids over EVERY expert (static shape, so the graph stays
+    CUDA-graph-capturable); an idle expert is expressed as a zero-width slice in
+    `token_offsets`, which the kernels early-exit on.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -165,13 +169,18 @@ def test_gmm_imbalanced_routing():
     topk_probs = torch.full((T, top_k), 0.5, dtype=dtype, device=device)
 
     ref = moe_eager_reference(x, w_gate, w_up, w_down, topk_indices, topk_probs)
-    got, _, (active_experts, _, _) = run_gmm_pipeline(
+    got, _, (active_experts, token_offsets, _) = run_gmm_pipeline(
         x, w_gate, w_up, w_down, topk_indices, topk_probs, num_experts
     )
 
-    # Sanity: only experts 0 and 1 should appear in active_experts
-    assert active_experts.tolist() == [0, 1], (
-        f"Expected only experts 0,1 to be active, got {active_experts.tolist()}"
+    # The grid covers every expert...
+    assert active_experts.tolist() == list(range(num_experts)), (
+        f"Expected a static grid over all {num_experts} experts, got {active_experts.tolist()}"
+    )
+    # ...and only experts 0 and 1 own any tokens; the rest are zero-width.
+    widths = (token_offsets[1:] - token_offsets[:-1]).tolist()
+    assert widths == [T, T] + [0] * (num_experts - 2), (
+        f"Expected experts 0,1 to hold all {T} tokens each and the rest to be idle, got {widths}"
     )
     assert torch.allclose(got, ref, atol=5e-2, rtol=5e-2)
 
@@ -196,7 +205,8 @@ def test_gmm_metadata_shapes():
     assert sorted_token_ids.shape == (T * top_k,)
     assert token_offsets[0].item() == 0
     assert token_offsets[-1].item() == T * top_k
-    # active_experts is a subset of [0, num_experts) and is sorted ascending
+    # active_experts is the static [0, num_experts) grid, sorted ascending
+    assert active_experts.numel() == num_experts
     if active_experts.numel() > 0:
         assert active_experts.min().item() >= 0
         assert active_experts.max().item() < num_experts

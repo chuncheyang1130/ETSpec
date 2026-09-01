@@ -193,12 +193,15 @@ def test_int4_gmm_imbalanced_routing():
     down_deq = dequant_int4_grouped(dp, ds, dz, group_size)
 
     ref = moe_eager_reference(x, gate_deq, up_deq, down_deq, topk_indices, topk_probs)
-    got, (active_experts, _, _) = run_int4_gmm_pipeline(
+    got, (active_experts, token_offsets, _) = run_int4_gmm_pipeline(
         x, gp, gs, gz, up_p, us, uz, dp, ds, dz,
         topk_indices, topk_probs, num_experts, group_size,
     )
 
-    assert active_experts.tolist() == [0, 1], active_experts.tolist()
+    # Static grid over every expert; idle ones are zero-width slices the kernel skips.
+    assert active_experts.tolist() == list(range(num_experts)), active_experts.tolist()
+    widths = (token_offsets[1:] - token_offsets[:-1]).tolist()
+    assert widths == [T, T] + [0] * (num_experts - 2), widths
     assert torch.allclose(got, ref, atol=5e-2, rtol=5e-2)
 
 
