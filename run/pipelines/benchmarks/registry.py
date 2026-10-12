@@ -9,6 +9,16 @@ import random
 
 
 AVAILABLE_BENCHMARKS = [    
+    # multiple choice, log-likelihood scored (REAP's MC suite)
+    "arc_challenge",
+    "arc_easy",
+    "boolq",
+    "hellaswag",
+    "mmlu",
+    "openbookqa",
+    "rte",
+    "winogrande",
+
     # math
     "gsm8k",
     "aime",
@@ -47,6 +57,16 @@ AVAILABLE_BENCHMARKS = [
 ]
 
 _LOADER_CONFIG = {
+    # multiple choice, log-likelihood scored (REAP's MC suite)
+    "arc_challenge":        (".arc", "load_arc_challenge_dataset"),
+    "arc_easy":             (".arc", "load_arc_easy_dataset"),
+    "boolq":                (".boolq", "load_boolq_dataset"),
+    "hellaswag":            (".hellaswag", "load_hellaswag_dataset"),
+    "mmlu":                 (".mmlu", "load_mmlu_dataset"),
+    "openbookqa":           (".openbookqa", "load_openbookqa_dataset"),
+    "rte":                  (".rte", "load_rte_dataset"),
+    "winogrande":           (".winogrande", "load_winogrande_dataset"),
+
     # TBD
     "mt-bench":             (".mtbench", "load_mtbench_dataset"),
     "alpaca":               (".alpaca", "load_alpaca_dataset"),

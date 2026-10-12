@@ -8,7 +8,7 @@ import logging
 from tqdm import tqdm
 
 from .benchmarks.registry import load_dataset, validate_benchmarks
-from .benchmarks.evaluation.eval_acc import run_math_eval, run_code_eval, run_livecodebench_eval, run_mmlu_pro_eval, run_longbench_eval
+from .benchmarks.evaluation.eval_acc import run_math_eval, run_code_eval, run_livecodebench_eval, run_mmlu_pro_eval, run_longbench_eval, run_loglikelihood_mc_eval
 from .utils.benchmark_utils import reset_seeds, cleanup_gpu, setup_benchmark_dir
 
 BENCHMARK_EVALUATORS = {
@@ -19,6 +19,15 @@ BENCHMARK_EVALUATORS = {
     "mbpp": run_code_eval,
     "livecodebench": run_livecodebench_eval,
     "mmlu-pro": run_mmlu_pro_eval,
+    # REAP's MC suite -- zero-shot log-likelihood, no generation
+    "arc_challenge": run_loglikelihood_mc_eval,
+    "arc_easy": run_loglikelihood_mc_eval,
+    "boolq": run_loglikelihood_mc_eval,
+    "hellaswag": run_loglikelihood_mc_eval,
+    "mmlu": run_loglikelihood_mc_eval,
+    "openbookqa": run_loglikelihood_mc_eval,
+    "rte": run_loglikelihood_mc_eval,
+    "winogrande": run_loglikelihood_mc_eval,
     "narrativeqa": run_longbench_eval,
     "qasper": run_longbench_eval,
     "multifieldqa_en": run_longbench_eval,
@@ -37,7 +46,13 @@ BENCHMARK_EVALUATORS = {
     "repobench_p": run_longbench_eval,
 }
 
-def main(builder, benchmarks=None, max_samples=None, query_version="llama"):
+def main(
+    builder,
+    benchmarks=None,
+    max_samples=None,
+    query_version="llama",
+    run_dir=None,
+):
     """Run accuracy benchmarks on specified datasets."""
     reset_seeds(0)
     logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO").upper())
@@ -59,7 +74,11 @@ def main(builder, benchmarks=None, max_samples=None, query_version="llama"):
         os.makedirs(args.out_dir, exist_ok=True)
         
     # Run benchmarks
-    log_dir_base = os.path.join(args.log_dir, time.strftime("%Y%m%d-%H%M%S"), "run_benchmark_acc")
+    log_dir_base = (
+        os.path.abspath(os.path.expanduser(run_dir))
+        if run_dir is not None
+        else os.path.join(args.log_dir, time.strftime("%Y%m%d-%H%M%S"), "run_benchmark_acc")
+    )
     for bench_name in tqdm(bench_list, desc="Running benchmarks"):
         reset_seeds(0)
         log_dir = setup_benchmark_dir(log_dir_base, bench_name, getattr(args, "settings_snapshot", None))
