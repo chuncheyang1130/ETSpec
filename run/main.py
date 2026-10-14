@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import argparse
 import os
+import copy
 import shutil
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, TYPE_CHECKING
@@ -148,7 +149,7 @@ def _build_settings_snapshot(
     return snapshot
 
 
-def _load_yaml_config(path: str) -> Dict[str, Any]:
+def _load_yaml_config(path: str, _seen: set[str] | None = None) -> Dict[str, Any]:
     try:
         import yaml
     except Exception as e:
@@ -162,7 +163,25 @@ def _load_yaml_config(path: str) -> Dict[str, Any]:
         return {}
     if not isinstance(data, dict):
         raise ValueError(f"YAML config must be a mapping/object at top-level, got {type(data).__name__}")
-    return dict(data)
+    data = dict(data)
+
+    # `extends: <path>` pulls in a base config and deep-merges this one over it,
+    # so a family of configs that differ only in plan_path is one base plus a
+    # few lines each. The path is relative to THIS file's directory. _seen
+    # breaks inheritance cycles, which would otherwise recurse until the stack
+    # runs out and report nothing useful.
+    parent = data.pop("extends", None)
+    if parent is not None:
+        here = os.path.abspath(path)
+        seen = _seen or set()
+        if here in seen:
+            raise ValueError(f"circular `extends` chain through {path}")
+        base_path = parent if os.path.isabs(parent) else os.path.join(os.path.dirname(here), parent)
+        if not os.path.exists(base_path):
+            raise ValueError(f"{path}: `extends` target not found: {base_path}")
+        base = _load_yaml_config(base_path, _seen=seen | {here})
+        data = _deep_merge_dict(base, data)
+    return data
 
 
 def _clean_path(path: str) -> str:
@@ -314,10 +333,176 @@ def _apply_yaml_overrides(default_config: Dict[str, Any], yaml_config: Dict[str,
     return _deep_merge_dict(default_config, cfg)
 
 
+
+
+def _eta_token(eta: Any) -> str:
+    """1.35 -> '135', 1.3 -> '13': the planner's tier price as it appears in plan filenames."""
+    s = str(eta).strip().lower().removeprefix("eta")
+    try:
+        float(s)
+    except ValueError:
+        raise ValueError(f"--eta must be a number like 1.3 or 1.35, got {eta!r}") from None
+    return s.replace(".", "")
+
+
+def _resolve_plan_variant(cfg: Dict[str, Any], variant: str | None, budget: str | None,
+                          eta: str | None = None, k: str | None = None) -> Dict[str, Any]:
+    """Turn `--variant ours --budget 30` into a concrete recipe.kwargs.plan_path.
+
+    A domain config carries a `plan_variants` map of templates, so one file
+    covers every method x budget arm for that domain instead of one file per
+    cell. Both the unknown-variant and missing-plan cases raise here rather
+    than at model-build time: a typo that silently ran the wrong plan, or ran
+    nothing after a 20-minute compile, is the expensive failure mode.
+
+    Templates may also use {eta} (tier price, `--eta 1.35` -> `135`) and {k}
+    (min retained experts, `--k 51`); unset ones fall back to the config's
+    `plan_defaults`.
+    """
+    variants = cfg.get("plan_variants")
+    defaults = cfg.pop("plan_defaults", None) or {}
+    if variant is None and budget is None:
+        if eta is not None or k is not None:
+            raise ValueError("--eta/--k need --budget")
+        cfg.pop("plan_variants", None); cfg.pop("default_variant", None)
+        return cfg
+    if not isinstance(variants, dict) or not variants:
+        raise ValueError(
+            "--variant/--budget need a `plan_variants:` map in the config; "
+            f"this one has none (keys: {sorted(cfg)[:8]})"
+        )
+    name = variant or cfg.get("default_variant")
+    if name is None:
+        raise ValueError(
+            f"--budget given without --variant and the config sets no "
+            f"`default_variant`. Pick one of: {sorted(variants)}"
+        )
+    if name not in variants:
+        raise ValueError(f"unknown --variant {name!r}; config offers {sorted(variants)}")
+    spec = variants[name]
+    # Shorthand: a bare string is just the plan_path template.
+    spec = {"plan_path": spec} if isinstance(spec, str) else dict(spec)
+    if budget is None:
+        raise ValueError(f"--variant {name} needs --budget (plan is {spec.get('plan_path')})")
+    try:
+        b = int(str(budget).lstrip("bB"))
+    except ValueError:
+        raise ValueError(f"--budget must be an integer percent, got {budget!r}") from None
+    fills = {"budget": str(b)}
+    for field, given in (("eta", eta), ("k", k)):
+        placeholder = "{" + field + "}"
+        if not any(isinstance(v, str) and placeholder in v for v in spec.values()):
+            if given is not None:
+                # Ignoring the flag would silently run some other plan.
+                raise ValueError(f"--{field} given, but variant {name!r} has no {placeholder} in its template")
+            continue
+        value = given if given is not None else defaults.get(field)
+        if value is None:
+            raise ValueError(f"variant {name!r} uses {placeholder}: pass --{field} or set plan_defaults.{field}")
+        if field == "eta":
+            fills[field] = _eta_token(value)
+        else:
+            try:
+                fills[field] = str(int(value))
+            except ValueError:
+                raise ValueError(f"--k must be an integer, got {value!r}") from None
+    kwargs = cfg.setdefault("recipe", {}).setdefault("kwargs", {})
+    for key, value in spec.items():
+        if value is None:
+            # An explicit null drops the field. REAP plans are removed/full with
+            # no low-rank experts, so they need no activation cache to build
+            # factors from -- and pointing them at one makes the recipe scan a
+            # cache it will not use.
+            kwargs.pop(key, None)
+            continue
+        if isinstance(value, str):
+            for field, fill in fills.items():
+                value = value.replace("{" + field + "}", fill)
+        kwargs[key] = value
+    path = kwargs.get("plan_path")
+    if not path or not os.path.exists(str(path)):
+        flags = " ".join(f"--{f} {v}" for f, v in (("eta", eta), ("k", k)) if v is not None)
+        raise ValueError(
+            f"--variant {name} --budget {b} {flags + ' ' if flags else ''}resolves to a plan that does not exist:\n  {path}"
+        )
+    cfg.pop("plan_variants", None); cfg.pop("default_variant", None)
+    return cfg
+
+def _apply_config_set_overrides(cfg: Dict[str, Any], overrides: list[str]) -> Dict[str, Any]:
+    """Apply `--set a.b.c=value` onto an already-loaded config.
+
+    This is what lets one config serve a whole family: the budget, plan or
+    length varies on the command line instead of in a copied file. Values go
+    through yaml.safe_load so 4096 is an int, true is a bool and a path stays
+    a string. Creating a new leaf is allowed (recipe kwargs are open-ended),
+    but walking THROUGH a non-dict is an error -- that means the dotted path
+    is wrong, and silently discarding the override is how a run ends up not
+    being the run you asked for.
+    """
+    if not overrides:
+        return cfg
+    import yaml
+
+    out = copy.deepcopy(cfg)
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
+        key, _, raw = item.partition("=")
+        parts = [p for p in key.strip().split(".") if p]
+        if not parts:
+            raise ValueError(f"--set has an empty key: {item!r}")
+        node = out
+        for p in parts[:-1]:
+            nxt = node.get(p)
+            if nxt is None:
+                nxt = {}
+                node[p] = nxt
+            elif not isinstance(nxt, dict):
+                raise ValueError(
+                    f"--set {key}: cannot descend into {p!r}, it is a "
+                    f"{type(nxt).__name__} not a mapping"
+                )
+            node = nxt
+        node[parts[-1]] = yaml.safe_load(raw)
+    return out
+
 def _build_base_parser() -> argparse.ArgumentParser:
     # Important: disable allow_abbrev so Typer subcommand flags like --d/--k
     # don't get parsed as abbreviations for top-level options (e.g., --device).
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument(
+        "--variant",
+        default=None,
+        help="Which plan family from the config's `plan_variants` map (e.g. ours, reap).",
+    )
+    parser.add_argument(
+        "--budget",
+        default=None,
+        help="Memory budget as an integer percent (e.g. 30). Fills {budget} in the "
+             "chosen plan_variants template.",
+    )
+    parser.add_argument(
+        "--eta",
+        default=None,
+        help="Planner tier price (e.g. 1.35). Fills {eta} in the plan template as it is "
+             "written in plan filenames (1.35 -> 135). Default: the config's plan_defaults.eta.",
+    )
+    parser.add_argument(
+        "--k",
+        default=None,
+        help="Minimum retained experts per layer (e.g. 51). Fills {k} in the plan template. "
+             "Default: the config's plan_defaults.k.",
+    )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override one config field, dotted path, repeatable. "
+             "e.g. --set recipe.kwargs.plan_path=./expert_activation/reap_mc256_budget30.json "
+             "Values are parsed as YAML, so 4096 is an int and true is a bool.",
+    )
     parser.add_argument(
         "--method",
         type=str,
@@ -570,6 +755,15 @@ def _load_yaml_and_method(args: argparse.Namespace) -> tuple[str, Dict[str, Any]
         sys.exit(1)
 
     yaml_config = _load_yaml_config(config_path)
+    try:
+        yaml_config = _resolve_plan_variant(
+            yaml_config, getattr(args, "variant", None), getattr(args, "budget", None),
+            eta=getattr(args, "eta", None), k=getattr(args, "k", None),
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
+    yaml_config = _apply_config_set_overrides(yaml_config, getattr(args, "overrides", []) or [])
 
     try:
         method = _resolve_method(args.method, yaml_config)
