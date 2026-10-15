@@ -1,0 +1,26 @@
+# Shared base for 135 configs that differ only in which plan /
+# moments / activation cache they point at. A child sets `extends:` plus
+# just those fields; run/main.py deep-merges the child over this file.
+# Edit a decoding or compile setting HERE and every child picks it up.
+method: vanilla
+llm_path: Qwen/Qwen3-30B-A3B
+dtype: bfloat16
+recipe:
+  class_path: specdecodes.helpers.recipes.moe.moe_routed_functional_svd:Recipe
+  kwargs:
+    seed: 0
+max_length: 2048
+cache_implementation: static
+warmup_iter: 2
+compile_mode: max-autotune
+do_sample: true
+temperature: 0.7
+top_p: 0.8
+top_k: 20
+min_p: 0
+generator_profiling: true
+generator_kwargs:
+  enable_thinking: false
+  prefill_chunk_size: 2048
+  verify_method: exact
+  verify_kwargs: {}

@@ -1,0 +1,24 @@
+# ===========================================================================
+#  reap_coding -- every budget for this method x domain. Pick the budget on the CLI:
+#
+#    python -m run.main --config configs/methods/reap_coding.yaml --budget 30 \
+#      run-benchmark-acc --benchmarks human-eval,mbpp --query-version qwen
+#
+#  --budget N     integer percent (fills {budget} below)
+#  --set k.p=v    override anything else, e.g. --set max_length=4096
+#
+#  Recipe class, decoding, compile and max_length live in
+#  moe_routed_svd.yaml -- change them there once, for everything.
+#  REAP prunes whole experts. No hidden_cache_dir: there are no low-rank
+#  experts, so there is no SVD basis to fit from activations.
+# ===========================================================================
+extends: moe_routed_svd.yaml
+
+recipe:
+  kwargs:
+    moments_path: ./expert_activation/activation_svd_coding_full256_allproj.moments.pt
+    category: coding
+
+default_variant: plan
+plan_variants:
+  plan: ./expert_activation/reap_coding256_budget{budget}.json

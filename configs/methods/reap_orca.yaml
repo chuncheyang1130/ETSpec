@@ -1,0 +1,30 @@
+# ===========================================================================
+#  reap_orca -- every budget for this method x domain. Pick the budget on the CLI:
+#
+#    python -m run.main --config configs/methods/reap_orca.yaml --budget 30 \
+#      run-benchmark-acc --benchmarks math-500,gsm8k --query-version qwen
+#
+#  --budget N     integer percent (fills {budget} below)
+#  --set k.p=v    override anything else, e.g. --set max_length=4096
+#
+#  Recipe class, decoding, compile and max_length live in
+#  moe_routed_svd.yaml -- change them there once, for everything.
+#  REAP prunes whole experts; no activation cache needed.
+# ===========================================================================
+extends: moe_routed_svd.yaml
+# MATH-500 needs the longer budget: max_length is TOTAL prompt+completion AND
+# sizes the static KV cache (run/core/presets.py:31). At 2048 the prompts leave
+# ~1933 completion tokens and 10.2% of problems hit the cap and score ~4%, while
+# everything shorter scores ~90%. At 4096 the cap-hit rate drops to 1.8% and the
+# full model goes 82.5% -> 86.4% for only +14% tokens (median is unchanged at
+# 556, so the cost is all in the tail). REAP uses 16384; 4096 leaves ~0.8 pts.
+max_length: 4096
+
+recipe:
+  kwargs:
+    moments_path: ./expert_activation/activation_svd_orca_full256_allproj.moments.pt
+    category: orca
+
+default_variant: plan
+plan_variants:
+  plan: ./expert_activation/reap_orca256_budget{budget}.json
