@@ -166,3 +166,80 @@ def hqq_quantize_and_pack_int4(
     zero_scaled = (-zero * step).to(w.dtype)
     step = step.to(w.dtype)
     return packed, step, zero_scaled
+
+
+# ---------------------------------------------------------------------------
+# INT2 (W2A16): four codes per byte, chunked packing
+# ---------------------------------------------------------------------------
+# Packing is in fixed 64-element chunks along the contraction dim, independent
+# of group size: element `c*64 + s*16 + j` of a row goes to bits [2s, 2s+2) of
+# byte `c*16 + j`. A kernel then decodes slice s of a chunk as one contiguous run
+# of 16 activations, and any group size that is a divisor of 64 (>= 16) or a
+# multiple of 64 keeps every 16-wide slice inside one group.
+INT2_CHUNK = 64
+INT2_SLICE = INT2_CHUNK // 4
+
+
+def check_int2_group_size(group_size: int) -> None:
+    if not (group_size % INT2_CHUNK == 0 or (group_size >= INT2_SLICE and INT2_CHUNK % group_size == 0)):
+        raise ValueError(f"INT2 group_size must be 16, 32 or a multiple of 64, got {group_size}")
+
+
+@torch.no_grad()
+def _pack_int2_chunked(w_q: torch.Tensor) -> torch.Tensor:
+    """Pack uint8 codes (0..3) four-per-byte in 64-element chunks.
+
+      w_q   : [E, N, K]      uint8 in [0, 3]
+      packed: [E, N, K // 4] uint8
+    """
+    E, N, K = w_q.shape
+    if K % INT2_CHUNK != 0:
+        raise ValueError(f"contraction dim {K} not divisible by {INT2_CHUNK}")
+    s = w_q.reshape(E, N, K // INT2_CHUNK, 4, INT2_SLICE)
+    packed = s[..., 0, :] | (s[..., 1, :] << 2) | (s[..., 2, :] << 4) | (s[..., 3, :] << 6)
+    return packed.to(torch.uint8).reshape(E, N, K // 4)
+
+
+@torch.no_grad()
+def unpack_int2_chunked(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of `_pack_int2_chunked`: [E, N, K // 4] uint8 -> [E, N, K] codes."""
+    E, N, KB = packed.shape
+    p = packed.reshape(E, N, KB // INT2_SLICE, 1, INT2_SLICE)
+    shifts = torch.arange(0, 8, 2, device=packed.device, dtype=torch.uint8).view(1, 1, 1, 4, 1)
+    return ((p >> shifts) & 0x3).reshape(E, N, KB * 4)
+
+
+@torch.no_grad()
+def hqq_quantize_and_pack_int2(
+    w: torch.Tensor,
+    group_size: int,
+    experts_per_chunk: int = 16,
+    iters: int = _HQQ_ITERS,
+    lp_norm: float = _HQQ_LP_NORM,
+    beta: float = _HQQ_BETA,
+    kappa: float = _HQQ_KAPPA,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """HQQ-INT2 quantize + 4-per-byte pack, a few experts at a time.
+
+    Same HQQ solver as INT4 (`_hqq_quantize_group`, nbits=2), in plain torch on
+    the weight's device; chunking over experts bounds the FP32 temporaries.
+
+    Returns: packed       [E, N, K // 4]            uint8
+             step         [E, N, K // group_size]   w.dtype
+             zero_scaled  [E, N, K // group_size]   w.dtype
+    """
+    check_int2_group_size(group_size)
+    E, N, K = w.shape
+    packed = torch.empty(E, N, K // 4, dtype=torch.uint8, device=w.device)
+    step = torch.empty(E, N, K // group_size, dtype=w.dtype, device=w.device)
+    zero_scaled = torch.empty_like(step)
+    for e0 in range(0, E, experts_per_chunk):
+        e1 = min(E, e0 + experts_per_chunk)
+        w_q, s, z = _hqq_quantize_group(
+            w[e0:e1], group_size, nbits=2,
+            iters=iters, lp_norm=lp_norm, beta=beta, kappa=kappa,
+        )
+        packed[e0:e1] = _pack_int2_chunked(w_q)
+        zero_scaled[e0:e1] = (-z * s).to(w.dtype)
+        step[e0:e1] = s.to(w.dtype)
+    return packed, step, zero_scaled

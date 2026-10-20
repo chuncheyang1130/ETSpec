@@ -28,9 +28,42 @@ import torch
 import triton
 import triton.language as tl
 
+from .triton_int4_moe_gemv import down_int4_gemv_reduction_into
+
 LIB_NAME = "expspec"
 
 
+# Tile shapes are autotuned, not fixed: the bf16 kernels' 16x128 tile is not
+# what an INT4 tile wants (each program reads 4x fewer weight bytes per tile),
+# and decode (one token per expert) and prefill want different tiles. The key
+# buckets the token count to a power of two so a new prompt length does not
+# re-tune. GROUP_SIZE / HALF are fixed by the packing format, never tuned.
+def _int4_gmm_configs(block_n_name):
+    return [
+        triton.Config({"BLOCK_T": block_t, block_n_name: block_n}, num_warps=warps, num_stages=stages)
+        for block_t in (16, 32, 64)
+        for block_n in (32, 64, 128, 256)
+        for warps in (4, 8)
+        for stages in (2, 3, 4)
+    ]
+
+
+def _prune_token_tile(configs, named_args, **kwargs):
+    """Decode never fills more than a 16-row tile; only prefill tries wider ones."""
+    bucket = int(named_args.get("T_BUCKET", kwargs.get("T_BUCKET", 1)))
+    widest = 16 if bucket <= 16 else (32 if bucket <= 128 else 64)
+    return [config for config in configs if config.kwargs["BLOCK_T"] <= widest]
+
+
+
+# restore_value: the kernel atomic-adds into `out`, so every autotune trial must
+# start from the caller's buffer, not from the previous trial's sum.
+@triton.autotune(
+    configs=_int4_gmm_configs("BLOCK_H"),
+    key=["IM", "H", "GROUP_SIZE", "T_BUCKET"],
+    prune_configs_by={"early_config_prune": _prune_token_tile},
+    restore_value=["out_ptr"],
+)
 @triton.jit
 def _fused_down_int4_gmm_reduction(
     # Pointers
@@ -46,6 +79,7 @@ def _fused_down_int4_gmm_reduction(
 
     # Metadata
     T, IM, H, top_k,
+    T_BUCKET,               # next_power_of_2(T): autotune key only
 
     # Strides
     stride_interm_t, stride_interm_im,
@@ -194,22 +228,30 @@ def triton_fused_down_int4_gmm_reduction(
     )
     routing_weights = routing_weights.contiguous()
 
-    BLOCK_T, BLOCK_H = 16, 128
+    if T == 1:
+        # Decode: a GEMV per routed expert, split-K, reduced in FP32.
+        acc = torch.zeros((T, H), dtype=torch.float32, device=interm.device)
+        down_int4_gemv_reduction_into(
+            acc, interm, wq_down, scale_down, zero_scaled_down,
+            active_experts, token_offsets, sorted_token_ids, routing_weights, top_k, group_size,
+        )
+        return acc.to(dtype)
+
     HALF = group_size // 2
 
-    grid = (num_active_experts, triton.cdiv(T, BLOCK_T), triton.cdiv(H, BLOCK_H))
+    grid = lambda meta: (
+        num_active_experts, triton.cdiv(T, meta["BLOCK_T"]), triton.cdiv(H, meta["BLOCK_H"])
+    )
     _fused_down_int4_gmm_reduction[grid](
         interm, wq_down, scale_down, zero_scaled_down,
         active_experts, token_offsets, sorted_token_ids, routing_weights,
         out,
-        T, IM, H, top_k,
+        T, IM, H, top_k, triton.next_power_of_2(T),
         interm.stride(0), interm.stride(1),
         wq_down.stride(0), wq_down.stride(1), wq_down.stride(2),
         scale_down.stride(0), scale_down.stride(1), scale_down.stride(2),
         zero_scaled_down.stride(0), zero_scaled_down.stride(1), zero_scaled_down.stride(2),
         out.stride(0), out.stride(1),
-        BLOCK_T=BLOCK_T,
-        BLOCK_H=BLOCK_H,
         GROUP_SIZE=group_size,
         HALF=HALF,
     )

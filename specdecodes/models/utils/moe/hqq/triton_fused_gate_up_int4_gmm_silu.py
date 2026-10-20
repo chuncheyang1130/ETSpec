@@ -31,9 +31,39 @@ import torch
 import triton
 import triton.language as tl
 
+from .triton_int4_moe_gemv import gate_up_int4_gemv_silu_into
+
 LIB_NAME = "expspec"
 
 
+# Tile shapes are autotuned, not fixed: the bf16 kernels' 16x128 tile is not
+# what an INT4 tile wants (each program reads 4x fewer weight bytes per tile),
+# and decode (one token per expert) and prefill want different tiles. The key
+# buckets the token count to a power of two so a new prompt length does not
+# re-tune. GROUP_SIZE / HALF are fixed by the packing format, never tuned.
+def _int4_gmm_configs(block_n_name):
+    return [
+        triton.Config({"BLOCK_T": block_t, block_n_name: block_n}, num_warps=warps, num_stages=stages)
+        for block_t in (16, 32, 64)
+        for block_n in (32, 64, 128, 256)
+        for warps in (4, 8)
+        for stages in (2, 3, 4)
+    ]
+
+
+def _prune_token_tile(configs, named_args, **kwargs):
+    """Decode never fills more than a 16-row tile; only prefill tries wider ones."""
+    bucket = int(named_args.get("T_BUCKET", kwargs.get("T_BUCKET", 1)))
+    widest = 16 if bucket <= 16 else (32 if bucket <= 128 else 64)
+    return [config for config in configs if config.kwargs["BLOCK_T"] <= widest]
+
+
+
+@triton.autotune(
+    configs=_int4_gmm_configs("BLOCK_IM"),
+    key=["IM", "H", "GROUP_SIZE", "T_BUCKET"],
+    prune_configs_by={"early_config_prune": _prune_token_tile},
+)
 @triton.jit
 def _fused_gate_up_int4_gmm_silu(
     # Pointers
@@ -51,6 +81,7 @@ def _fused_gate_up_int4_gmm_silu(
 
     # Metadata
     T, IM, H, top_k,
+    T_BUCKET,               # next_power_of_2(T): autotune key only
 
     # Strides
     stride_x_t, stride_x_h,
@@ -220,16 +251,25 @@ def triton_fused_gate_up_int4_gmm_silu(
         active_experts.contiguous(), token_offsets.contiguous(), sorted_token_ids.contiguous()
     )
 
-    BLOCK_T, BLOCK_IM = 16, 128
+    if T == 1:
+        # Decode: each routed expert holds one row -- a GEMV, not a GEMM.
+        gate_up_int4_gemv_silu_into(
+            out, x, wq_gate, wq_up, scale_gate, zero_scaled_gate, scale_up, zero_scaled_up,
+            active_experts, token_offsets, sorted_token_ids, top_k, group_size,
+        )
+        return out
+
     HALF = group_size // 2
 
-    grid = (num_active_experts, triton.cdiv(T, BLOCK_T), triton.cdiv(IM, BLOCK_IM))
+    grid = lambda meta: (
+        num_active_experts, triton.cdiv(T, meta["BLOCK_T"]), triton.cdiv(IM, meta["BLOCK_IM"])
+    )
     _fused_gate_up_int4_gmm_silu[grid](
         x, wq_gate, wq_up,
         scale_gate, zero_scaled_gate, scale_up, zero_scaled_up,
         active_experts, token_offsets, sorted_token_ids,
         out,
-        T, IM, H, top_k,
+        T, IM, H, top_k, triton.next_power_of_2(T),
         x.stride(0), x.stride(1),
         wq_gate.stride(0), wq_gate.stride(1), wq_gate.stride(2),
         wq_up.stride(0), wq_up.stride(1), wq_up.stride(2),
@@ -238,8 +278,6 @@ def triton_fused_gate_up_int4_gmm_silu(
         scale_up.stride(0), scale_up.stride(1), scale_up.stride(2),
         zero_scaled_up.stride(0), zero_scaled_up.stride(1), zero_scaled_up.stride(2),
         out.stride(0), out.stride(1),
-        BLOCK_T=BLOCK_T,
-        BLOCK_IM=BLOCK_IM,
         GROUP_SIZE=group_size,
         HALF=HALF,
     )
