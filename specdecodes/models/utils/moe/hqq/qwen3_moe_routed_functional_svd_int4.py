@@ -42,9 +42,9 @@ from .hqq_quantize import hqq_quantize_and_pack_int4
 from .triton_fused_down_int4_gmm_reduction import triton_fused_down_int4_gmm_reduction
 from .triton_fused_gate_up_int4_gmm_silu import triton_fused_gate_up_int4_gmm_silu
 from .triton_hybrid_svd_int4_gmm import (
-    fused_ragged_down_int4_gmm_reduction_into,
-    fused_ragged_gate_up_int4_gmm_silu_into,
-    fused_ragged_projection_int4_gmm_into,
+    fused_ragged_down_int4_gmm_reduction_accumulate,
+    fused_ragged_gate_up_int4_gmm_silu_store,
+    fused_ragged_projection_int4_gmm_store,
 )
 
 
@@ -174,14 +174,14 @@ class Qwen3MoeRoutedFunctionalSVDInt4Block(Qwen3MoeRoutedFunctionalSVDSubsetBloc
         self, intermediate, flat, token_offsets, sorted_token_ids, tokens, assignments
     ) -> None:
         latent = flat.new_empty((assignments, self.max_gate_up_rank))
-        fused_ragged_projection_int4_gmm_into(
+        fused_ragged_projection_int4_gmm_store(
             latent, flat,
             self.gu_input_store_packed, self.gu_input_store_scale,
             self.gu_input_store_zero_scaled,
             self.gu_input_base, self.gate_up_ranks, token_offsets, sorted_token_ids,
             self.top_k, self.full_experts, self.hidden_size, False, self.group_size,
         )
-        fused_ragged_gate_up_int4_gmm_silu_into(
+        fused_ragged_gate_up_int4_gmm_silu_store(
             intermediate, latent,
             self.gate_output_store_packed, self.gate_output_store_scale,
             self.gate_output_store_zero_scaled,
@@ -196,7 +196,7 @@ class Qwen3MoeRoutedFunctionalSVDInt4Block(Qwen3MoeRoutedFunctionalSVDSubsetBloc
         flat_weights, assignments,
     ) -> None:
         down_latent = intermediate.new_empty((assignments, self.max_down_rank))
-        fused_ragged_projection_int4_gmm_into(
+        fused_ragged_projection_int4_gmm_store(
             down_latent, intermediate,
             self.down_input_store_packed, self.down_input_store_scale,
             self.down_input_store_zero_scaled,
@@ -204,7 +204,7 @@ class Qwen3MoeRoutedFunctionalSVDInt4Block(Qwen3MoeRoutedFunctionalSVDSubsetBloc
             self.top_k, self.full_experts, self.intermediate_size, True,
             self.group_size,
         )
-        fused_ragged_down_int4_gmm_reduction_into(
+        fused_ragged_down_int4_gmm_reduction_accumulate(
             output, down_latent,
             self.down_output_store_packed, self.down_output_store_scale,
             self.down_output_store_zero_scaled,

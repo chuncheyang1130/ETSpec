@@ -31,7 +31,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .triton_int4_moe_gemv import gate_up_int4_gemv_silu_into
+from .triton_int4_moe_gemv import gate_up_int4_gemv_silu_store
 
 LIB_NAME = "expspec"
 
@@ -253,7 +253,7 @@ def triton_fused_gate_up_int4_gmm_silu(
 
     if T == 1:
         # Decode: each routed expert holds one row -- a GEMV, not a GEMM.
-        gate_up_int4_gemv_silu_into(
+        gate_up_int4_gemv_silu_store(
             out, x, wq_gate, wq_up, scale_gate, zero_scaled_gate, scale_up, zero_scaled_up,
             active_experts, token_offsets, sorted_token_ids, top_k, group_size,
         )

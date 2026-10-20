@@ -28,7 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .triton_int4_moe_gemv import down_int4_gemv_reduction_into
+from .triton_int4_moe_gemv import down_int4_gemv_reduction_accumulate
 
 LIB_NAME = "expspec"
 
@@ -231,7 +231,7 @@ def triton_fused_down_int4_gmm_reduction(
     if T == 1:
         # Decode: a GEMV per routed expert, split-K, reduced in FP32.
         acc = torch.zeros((T, H), dtype=torch.float32, device=interm.device)
-        down_int4_gemv_reduction_into(
+        down_int4_gemv_reduction_accumulate(
             acc, interm, wq_down, scale_down, zero_scaled_down,
             active_experts, token_offsets, sorted_token_ids, routing_weights, top_k, group_size,
         )

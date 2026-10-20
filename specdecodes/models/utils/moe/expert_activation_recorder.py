@@ -4,7 +4,7 @@ MoE expert usage over a single generation (e.g. vanilla GSM8K decoding).
 
 Hooks ONE MoE layer (default layer 0) and, every `window` generated tokens,
 snapshots the cumulative per-expert routing **mass** (the same top-k softmax mass
-the usage tracker uses — full router, original / un-redirected). Diffing
+the usage tracker uses from the original full router). Diffing
 consecutive snapshots gives the per-window expert distribution, which reveals
 whether the hot experts stay put (high locality) or drift across the sequence.
 

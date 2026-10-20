@@ -377,7 +377,7 @@ def _check_shapes(k: int, group_size: int) -> None:
         raise ValueError(f"contraction dim {k} not divisible by window {_window(group_size)}")
 
 
-def gate_up_int2_gemv_silu_into(
+def gate_up_int2_gemv_silu_store(
     out, x, wq_gate, wq_up, scale_gate, zero_scaled_gate, scale_up, zero_scaled_up,
     active_experts, token_offsets, sorted_token_ids, group_size, **override,
 ):
@@ -406,7 +406,7 @@ def gate_up_int2_gemv_silu_into(
     )
 
 
-def down_int2_gemv_reduction_into(
+def down_int2_gemv_reduction_accumulate(
     out, interm, wq_down, scale_down, zero_scaled_down,
     active_experts, token_offsets, sorted_token_ids, routing_weights, group_size, **override,
 ):
@@ -470,7 +470,7 @@ def triton_fused_gate_up_int2_gmm_silu(
         active_experts.contiguous(), token_offsets.contiguous(), sorted_token_ids.contiguous()
     )
     if T == 1:
-        gate_up_int2_gemv_silu_into(
+        gate_up_int2_gemv_silu_store(
             out, x, wq_gate, wq_up, scale_gate, zero_scaled_gate, scale_up, zero_scaled_up,
             active_experts, token_offsets, sorted_token_ids, group_size,
         )
@@ -533,7 +533,7 @@ def triton_fused_down_int2_gmm_reduction(
     )
     routing_weights = routing_weights.contiguous()
     if T == 1:
-        down_int2_gemv_reduction_into(
+        down_int2_gemv_reduction_accumulate(
             acc, interm, wq_down, scale_down, zero_scaled_down,
             active_experts, token_offsets, sorted_token_ids, routing_weights, group_size,
         )

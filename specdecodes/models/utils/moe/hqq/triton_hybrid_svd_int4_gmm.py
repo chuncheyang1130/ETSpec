@@ -5,12 +5,13 @@ INT4 siblings of the three ragged kernels in `base/triton_hybrid_svd_gmm.py`
 that run every low-rank expert of a heterogeneous routed-functional SVD block
 in one launch per stage:
 
-  * `fused_ragged_projection_int4_gmm_into`   x @ R^T,       R = [rank, in]
-  * `fused_ragged_gate_up_int4_gmm_silu_into` SiLU(l @ G) * (l @ U), [rank, IM]
-  * `fused_ragged_down_int4_gmm_reduction_into` acc += w * (l @ D),  [rank, H]
+  * `fused_ragged_projection_int4_gmm_store`   x @ R^T,       R = [rank, in]
+  * `fused_ragged_gate_up_int4_gmm_silu_store` SiLU(l @ G) * (l @ U), [rank, IM]
+  * `fused_ragged_down_int4_gmm_reduction_accumulate` acc += w * (l @ D),  [rank, H]
 
 Grid, early exits, ragged per-expert ranks and base tables, token-tile ladder
-and the caller-buffer (`_into`) contract are the bf16 kernels', unchanged. What
+and the caller-buffer (`_store` / `_accumulate`) contract are the bf16 kernels',
+unchanged. What
 changes is the weight load: each factor is HQQ-INT4 packed and dequantized
 in-register inside the K-loop, exactly as the stacked INT4 kernels
 (`triton_fused_{gate_up,down}_int4_gmm_*`) do it:
@@ -158,9 +159,9 @@ def _fused_ragged_projection_int4_gmm_kernel(
 
 
 @torch.library.custom_op(
-    f"{LIB_NAME}::fused_ragged_projection_int4_gmm_into", mutates_args={"out"}
+    f"{LIB_NAME}::fused_ragged_projection_int4_gmm_store", mutates_args={"out"}
 )
-def fused_ragged_projection_int4_gmm_into(
+def fused_ragged_projection_int4_gmm_store(
     out: torch.Tensor,
     inputs: torch.Tensor,
     packed: torch.Tensor,
@@ -176,7 +177,7 @@ def fused_ragged_projection_int4_gmm_into(
     source_is_sorted: bool,
     group_size: int,
 ) -> None:
-    """INT4 `fused_ragged_projection_gmm_into`: rows -> shared [rows, MAX_RANK]."""
+    """INT4 `fused_ragged_projection_gmm_store`: rows -> shared [rows, MAX_RANK]."""
 
     rows = int(inputs.shape[0])
     assignments = int(sorted_token_ids.shape[0])
@@ -233,8 +234,8 @@ def fused_ragged_projection_int4_gmm_into(
     )
 
 
-@fused_ragged_projection_int4_gmm_into.register_fake
-def _fused_ragged_projection_int4_gmm_into_fake(
+@fused_ragged_projection_int4_gmm_store.register_fake
+def _fused_ragged_projection_int4_gmm_store_fake(
     out, inputs, packed, scale, zero_scaled, factor_base, ranks, token_offsets,
     sorted_token_ids, top_k: int, expert_offset: int, input_size: int,
     source_is_sorted: bool, group_size: int,
@@ -334,9 +335,9 @@ def _fused_ragged_gate_up_int4_gmm_silu_kernel(
 
 
 @torch.library.custom_op(
-    f"{LIB_NAME}::fused_ragged_gate_up_int4_gmm_silu_into", mutates_args={"out"}
+    f"{LIB_NAME}::fused_ragged_gate_up_int4_gmm_silu_store", mutates_args={"out"}
 )
-def fused_ragged_gate_up_int4_gmm_silu_into(
+def fused_ragged_gate_up_int4_gmm_silu_store(
     out: torch.Tensor,
     latent: torch.Tensor,
     gate_packed: torch.Tensor,
@@ -352,7 +353,7 @@ def fused_ragged_gate_up_int4_gmm_silu_into(
     expert_offset: int,
     group_size: int,
 ) -> None:
-    """INT4 `fused_ragged_gate_up_gmm_silu_into`: low-rank rows of the intermediate."""
+    """INT4 `fused_ragged_gate_up_gmm_silu_store`: low-rank rows of the intermediate."""
 
     assignments = int(latent.shape[0])
     experts = int(ranks.numel())
@@ -397,8 +398,8 @@ def fused_ragged_gate_up_int4_gmm_silu_into(
     )
 
 
-@fused_ragged_gate_up_int4_gmm_silu_into.register_fake
-def _fused_ragged_gate_up_int4_gmm_silu_into_fake(
+@fused_ragged_gate_up_int4_gmm_silu_store.register_fake
+def _fused_ragged_gate_up_int4_gmm_silu_store_fake(
     out, latent, gate_packed, gate_scale, gate_zero_scaled, up_packed, up_scale,
     up_zero_scaled, factor_base, ranks, token_offsets, tokens: int,
     expert_offset: int, group_size: int,
@@ -490,9 +491,9 @@ def _fused_ragged_down_int4_gmm_reduction_kernel(
 
 
 @torch.library.custom_op(
-    f"{LIB_NAME}::fused_ragged_down_int4_gmm_reduction_into", mutates_args={"acc"}
+    f"{LIB_NAME}::fused_ragged_down_int4_gmm_reduction_accumulate", mutates_args={"acc"}
 )
-def fused_ragged_down_int4_gmm_reduction_into(
+def fused_ragged_down_int4_gmm_reduction_accumulate(
     acc: torch.Tensor,
     latent: torch.Tensor,
     packed: torch.Tensor,
@@ -507,7 +508,7 @@ def fused_ragged_down_int4_gmm_reduction_into(
     expert_offset: int,
     group_size: int,
 ) -> None:
-    """INT4 `fused_ragged_down_gmm_reduction_into`: atomic-add into FP32 ``acc``."""
+    """INT4 `fused_ragged_down_gmm_reduction_accumulate`: atomic-add into FP32 ``acc``."""
 
     assignments = int(latent.shape[0])
     experts = int(ranks.numel())
@@ -553,8 +554,8 @@ def fused_ragged_down_int4_gmm_reduction_into(
     )
 
 
-@fused_ragged_down_int4_gmm_reduction_into.register_fake
-def _fused_ragged_down_int4_gmm_reduction_into_fake(
+@fused_ragged_down_int4_gmm_reduction_accumulate.register_fake
+def _fused_ragged_down_int4_gmm_reduction_accumulate_fake(
     acc, latent, packed, scale, zero_scaled, factor_base, ranks, token_offsets,
     sorted_token_ids, routing_weights, top_k: int, expert_offset: int,
     group_size: int,

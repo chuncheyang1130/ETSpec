@@ -205,7 +205,7 @@ def _fused_down_int4_gemv_reduction(
     tl.atomic_add(out_ptr + off_n * stride_out_h, acc * routing, mask=n_mask)
 
 
-def gate_up_int4_gemv_silu_into(
+def gate_up_int4_gemv_silu_store(
     out, x, wq_gate, wq_up, scale_gate, zero_scaled_gate, scale_up, zero_scaled_up,
     active_experts, token_offsets, sorted_token_ids, top_k, group_size,
 ):
@@ -233,7 +233,7 @@ def gate_up_int4_gemv_silu_into(
     )
 
 
-def down_int4_gemv_reduction_into(
+def down_int4_gemv_reduction_accumulate(
     out, interm, wq_down, scale_down, zero_scaled_down,
     active_experts, token_offsets, sorted_token_ids, routing_weights, top_k, group_size,
 ):
