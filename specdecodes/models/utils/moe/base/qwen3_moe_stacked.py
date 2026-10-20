@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .grouped_moe import GroupedMoEForward
 from .triton_fused_gate_up_gmm_silu import triton_fused_gate_up_gmm_silu
 from .triton_fused_down_gmm_reduction import triton_fused_down_gmm_reduction
 
@@ -44,11 +45,24 @@ def _is_qwen3_moe_block(module: nn.Module) -> bool:
 def get_grouped_matmul_metadata(topk_indices: torch.Tensor, num_experts: int):
     """
     Sorts tokens by their assigned expert so Triton can process them in stacked blocks.
+
+    Every tensor produced here has a **static** shape — no `bincount`, no `nonzero`.
+    Both of those have data-dependent output shapes, which forces Inductor to carry
+    unbacked symints; `get_first_incompatible_cudagraph_node` then rejects the whole
+    graph, so `compile_mode: max-autotune` silently loses CUDA graphs for the entire
+    model and each MoE layer pays a device->host sync to materialise its grid.
+
+    Instead: count with a fixed-shape `scatter_add_`, and grid over **all** experts.
+    Experts with no routed tokens get `token_offsets[e] == token_offsets[e + 1]`, and
+    the kernels early-exit on them (`pid_t * BLOCK_T >= end - start`), so the extra
+    tiles cost two scalar loads and a return.
     """
+    device = topk_indices.device
+
     # ==========================================
     # 1. Flatten indices. Shape: [Tokens * top_k]
     # ==========================================
-    flat_indices = topk_indices.view(-1)
+    flat_indices = topk_indices.reshape(-1).to(torch.long)
 
     # ==========================================
     # 2. Sort the tokens by expert ID -> sorted_token_ids tells us the original position for each token
@@ -56,26 +70,32 @@ def get_grouped_matmul_metadata(topk_indices: torch.Tensor, num_experts: int):
     expert_ids, sorted_token_ids = torch.sort(flat_indices)
 
     # ==========================================
-    # 3. Find the boundaries (offsets) for each expert -> We use bincount to count how many tokens each expert got
+    # 3. Count tokens per expert with a fixed-shape scatter (bincount would sync).
     # =========================================
-    n_tokens_per_expert = torch.bincount(expert_ids, minlength=num_experts)
+    n_tokens_per_expert = torch.zeros(
+        num_experts, dtype=torch.long, device=device
+    ).scatter_add_(0, expert_ids, torch.ones_like(expert_ids))
 
     # ==========================================
     # 4. Cumulative sum gives us the start/end offsets -> DP vector
     # ==========================================
-    zero_tensor = torch.zeros(1, dtype=torch.long, device=topk_indices.device)
+    zero_tensor = torch.zeros(1, dtype=torch.long, device=device)
     token_offsets = torch.cat([zero_tensor, torch.cumsum(n_tokens_per_expert, dim=0)])
 
     # ==========================================
-    # 5. Find which experts actually have work to do
-    # =q========================================
-    active_experts = torch.nonzero(n_tokens_per_expert).squeeze(-1)
+    # 5. Grid over every expert; empty ones early-exit inside the kernel.
+    # =========================================
+    active_experts = torch.arange(num_experts, dtype=torch.long, device=device)
 
     return active_experts, token_offsets, sorted_token_ids
 
 
-class Qwen3MoeStackedBlock(nn.Module):
-    """Stacked-weight bf16 MoE block (full / subset / shared-weight draft)."""
+class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
+    """Stacked-weight bf16 MoE block (full / subset / shared-weight draft).
+
+    `forward` comes from `GroupedMoEForward`; this class supplies the four hooks,
+    routing in GLOBAL expert ids over the resident `[E, ...]` store.
+    """
 
     # Names of the stacked weight tensors a draft aliases from its target (see
     # `bind_target`). Subclasses with a different storage layout (e.g. the INT4
@@ -417,39 +437,3 @@ class Qwen3MoeStackedBlock(nn.Module):
             active_experts, token_offsets, sorted_token_ids,
             routing_weights=routing_weights, T=T, top_k=k,
         )
-
-    def forward(self, x):
-        # ================================================
-        # Flatten leading dims to [T, H]
-        # ================================================
-        bsz, seq_len, hidden = x.shape
-        x_flat = x.view(-1, hidden)
-        T = x_flat.shape[0]
-
-        # ================================================
-        # 1. Routing (full top-k, or top-k over retained experts) -> global ids
-        # ================================================
-        topk_weights, topk_eid = self._routing_weights(x_flat)
-        k = topk_eid.shape[1]
-
-        # ================================================
-        # 2. Grouped-matmul metadata (sort tokens by expert)
-        # ================================================
-        active_experts, token_offsets, sorted_token_ids = self._grouped_matmul_metadata(topk_eid)
-
-        # ================================================
-        # 3. Fused gate + up + SiLU (GMM): [T*k, IM] in sorted-by-expert order
-        # ================================================
-        interm = self._gmm_gate_up_silu(
-            x_flat, active_experts, token_offsets, sorted_token_ids, k,
-        )
-
-        # ================================================
-        # 4. Fused down + weighted reduction (GMM): [T, H]
-        # ================================================
-        out = self._gmm_down_reduce(
-            interm, active_experts, token_offsets, sorted_token_ids,
-            topk_weights.reshape(-1), T, k,
-        )
-
-        return out.view(bsz, seq_len, hidden)

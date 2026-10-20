@@ -9,9 +9,8 @@ one batched matmul instead of per-expert dispatch). They differ only in the role
   * `MoEStackedDraftRestructurer`  — the shared-weight DRAFT swap: an `owns_store=False`
     block that copies no weights and aliases the target's stacked weights at generate
     time, routing to `top_n` experts (`apply_stacked_draft`).
-
-A recipe wires both via the single `apply_structure` channel on `BaseRecipe`,
-disambiguated by `structure_config["kind"]` ("target_stacked" vs "draft_stacked").
+A recipe wires them via the single `apply_structure` channel on `BaseRecipe`,
+disambiguated by `structure_config["kind"]` ("target_stacked", "draft_stacked").
 """
 
 from __future__ import annotations

@@ -18,7 +18,7 @@ def _fused_down_gmm_reduction(
     token_offsets_ptr,      # [E + 1] (cumulative boundaries into sorted_token_ids per expert)
     sorted_token_ids_ptr,   # [T*top_k] (original flat positions, sorted by expert)
     routing_weights_ptr,    # [T*top_k] (BF16 per-assignment routing weights, original order)
-    out_ptr,                # [T, H] (BF16 FFN output activations)
+    out_ptr,                # [T, H] (FP32 FFN output accumulator)
 
     # Metadata
     T, IM, H, top_k,
@@ -119,6 +119,12 @@ def _fused_down_gmm_reduction(
     # ==========================================
     # 6. Atomic-add to output [T, H] at original token positions
     #    (multiple experts contribute to the same token; needs atomic)
+    #
+    #    `out_ptr` is FP32. Atomic ordering across the top_k contributing experts is
+    #    nondeterministic, so accumulating in BF16 would round to 8 mantissa bits after
+    #    every add and make the layer output depend on which expert happened to land
+    #    first -- ~1% relative jitter per hidden unit, enough to flip token choices and
+    #    make a benchmark unreproducible across identical runs. FP32 drops that to ~1e-7.
     # ==========================================
     out_ptr_base = (
         out_ptr
@@ -127,7 +133,7 @@ def _fused_down_gmm_reduction(
     )
     out_mask = (off_t[:, None] < off_t_end) & (off_h[None, :] < H)
 
-    tl.atomic_add(out_ptr_base, out.to(tl.bfloat16), mask=out_mask)
+    tl.atomic_add(out_ptr_base, out, mask=out_mask)
 
 
 # ==========================================
@@ -156,9 +162,10 @@ def triton_fused_down_gmm_reduction(
     num_active_experts = active_experts.shape[0]
 
     # ==========================================
-    # 1. Allocate output: [T, H] (BF16, zero-initialized for atomic_add)
+    # 1. Allocate output: [T, H] (FP32 accumulator, zero-initialized for atomic_add;
+    #    cast down to `dtype` once the reduction is complete)
     # ==========================================
-    out = torch.zeros((T, H), dtype=dtype, device=interm.device)
+    acc = torch.zeros((T, H), dtype=torch.float32, device=interm.device)
 
     # ==========================================
     # 2. Ensure inputs are stacked
@@ -171,12 +178,14 @@ def triton_fused_down_gmm_reduction(
     # 3. Early exit
     # ==========================================
     if num_active_experts == 0 or T == 0 or H == 0 or IM == 0:
-        return out
+        return acc.to(dtype)
 
     # ==========================================
     # 4. Launch Triton kernel
     # ==========================================
-    BLOCK_T, BLOCK_H, BLOCK_IM = 4, 256, 128
+    # Triton 3.x NVIDIA backends require tl.dot's M dimension to be at least
+    # 16. Masks preserve correctness for experts receiving fewer than 16 rows.
+    BLOCK_T, BLOCK_H, BLOCK_IM = 16, 256, 128
     grid = (
         num_active_experts,
         triton.cdiv(T, BLOCK_T),
@@ -186,15 +195,15 @@ def triton_fused_down_gmm_reduction(
     _fused_down_gmm_reduction[grid](
         interm, w_down,
         active_experts, token_offsets, sorted_token_ids, routing_weights,
-        out,
+        acc,
         T, IM, H, top_k,
         interm.stride(0), interm.stride(1),
         w_down.stride(0), w_down.stride(1), w_down.stride(2),
-        out.stride(0), out.stride(1),
+        acc.stride(0), acc.stride(1),
         BLOCK_T=BLOCK_T, BLOCK_H=BLOCK_H, BLOCK_IM=BLOCK_IM,
     )
 
-    return out
+    return acc.to(dtype)
 
 
 # ==========================================

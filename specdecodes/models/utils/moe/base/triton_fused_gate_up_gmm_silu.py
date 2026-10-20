@@ -193,7 +193,9 @@ def triton_fused_gate_up_gmm_silu(
     # ==========================================
     # 4. Launch Triton kernel
     # ==========================================
-    BLOCK_T, BLOCK_IM, BLOCK_H = 4, 128, 128
+    # Triton 3.x NVIDIA backends require tl.dot's M dimension to be at least
+    # 16. Masks preserve correctness for experts receiving fewer than 16 rows.
+    BLOCK_T, BLOCK_IM, BLOCK_H = 16, 128, 128
     grid = (
         num_active_experts,
         triton.cdiv(T, BLOCK_T),
