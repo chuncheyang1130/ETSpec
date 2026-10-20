@@ -7,7 +7,7 @@ layer's kept experts by a coverage target (the diffuse layers keep more experts,
 the concentrated layers fewer). The resulting `{layer_name: kept_ids}` is handed
 to a precision-specific restructurer that swaps in reduced expert-pool blocks.
 
-Used by `recipes/moe/moe_calibrated_subset.py`. Reuses the routing-mass tracker
+Used by `tools/calibrate_experts.py`. Reuses the routing-mass tracker
 (`install_expert_usage_tracker` / `get_expert_usage`) which reruns the full
 router, so it works on the raw HF MoE blocks before any swap.
 """
