@@ -1,0 +1,30 @@
+# Vanilla W2A16 (HQQ INT2, group 32) MoE: all 128 experts quantized, attention bf16, no draft.
+method: vanilla
+
+llm_path: Qwen/Qwen3-30B-A3B
+
+dtype: bfloat16
+recipe: 
+  class_path: specdecodes.helpers.recipes.moe.moe_int2_vanilla:Recipe
+  kwargs:
+    group_size: 32
+
+max_length: 2048
+cache_implementation: static
+warmup_iter: 1
+compile_mode: max-autotune
+
+# Target sampling settings (defaults)
+do_sample: true
+temperature: 0.7
+top_p: 0.8
+top_k: 20
+min_p: 0
+
+generator_profiling: true
+
+generator_kwargs:
+  prefill_chunk_size: 2048
+  enable_thinking: false
+  verify_method: exact
+  verify_kwargs: {}
