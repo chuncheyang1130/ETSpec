@@ -26,6 +26,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -47,9 +48,11 @@ from specdecodes.models.utils.moe.base.routed_functional_compression import (
     FunctionalCompressionPlan,
     LayerFunctionalTrace,
     LayerIndependentActionTrace,
+    DAMAGE_UNITS,
     build_distortion_risk_traces,
     build_factorized_risk_traces,
     build_importance_compressibility_traces,
+    build_mean_loss_traces,
     build_posterior_distortion_traces,
     build_propagated_risk_traces,
     cached_greedy_global_downgrade,
@@ -59,7 +62,10 @@ from specdecodes.models.utils.moe.base.routed_functional_compression import (
 from specdecodes.models.utils.moe.base.qwen3_moe_routed_functional_svd import (
     Qwen3MoeRoutedFunctionalSVDSubsetBlock,
     apply_deployed_expert_factors,
+    FACTOR_CALIBRATIONS,
     build_deployed_expert_factors,
+    FACTOR_OUTPUT_METRICS,
+    factor_calibration_selection,
 )
 from tools.analyze_activation_svd import (
     _generate_category_sequences,
@@ -397,7 +403,14 @@ def _pool_router_logits(module, hidden: torch.Tensor, *, device: str, batch_size
     return torch.cat(values), selected.cpu()
 
 
-def _factor_calibration_scope(trace_mode: str, factor_metric: str) -> str | None:
+def _factor_calibration_scope(
+    trace_mode: str,
+    factor_metric: str,
+    factor_shrink: str = "diagonal",
+    down_compensation: bool = False,
+    factor_calibration: str = "shortlist",
+    factor_output_metric: str = "none",
+) -> str | None:
     """Identity of the factor calibration, used to gate trace reuse.
 
     The metric is part of it: reusing a diagonal-calibrated trace under a Gram
@@ -409,10 +422,29 @@ def _factor_calibration_scope(trace_mode: str, factor_metric: str) -> str | None
         return None
     if str(factor_metric) == "gram":
         # v3: the Gram is now shrunk toward its diagonal by N_eff (see
-        # skipcat.gram_shrinkage_coefficient). Raw-Gram traces price factors the
+        # ordinary_svd.gram_shrinkage_coefficient). Raw-Gram traces price factors the
         # deployment no longer builds, so they must not be reusable.
-        return "router_top_l_all_tokens_gram_shrunk_v3"
-    return "router_top_l_all_tokens_v1"
+        # v4: the shrinkage TARGET changes the factors, so a v3 trace
+        # (shrunk toward the diagonal) must not be reused for a layer-
+        # shrunk plan. The mode is folded into the scope for that reason.
+        scope = f"router_top_l_all_tokens_gram_{factor_shrink}_v4"
+    else:
+        scope = "router_top_l_all_tokens_v1"
+    if str(factor_calibration) != "shortlist":
+        # The scopes above name the top-L shortlist. The top-k modes calibrate
+        # on other tokens with other weights and ignore the recorded moments, so
+        # they get their own name, while every existing shortlist scope keeps its
+        # exact string and its traces stay reusable.
+        scope = scope.replace(
+            "router_top_l_all_tokens", f"router_{factor_calibration}_tokens"
+        )
+    if str(factor_output_metric) != "none":
+        # The gate/up output metric changes the factors, so a trace priced
+        # without it must not be reused for a plan that deploys it.
+        scope = f"{scope}_out{factor_output_metric}"
+    # The compensated down target is a different matrix, so a trace priced
+    # without it cannot be reused for a run that deploys it, or vice versa.
+    return f"{scope}_downcomp" if down_compensation else scope
 
 
 def _calibration_moment_or_fallback(
@@ -508,8 +540,16 @@ def _deployed_factor_structural_error(
     up_weight: torch.Tensor,
     down_weight: torch.Tensor,
     factors: Mapping[str, torch.Tensor],
+    down_target: torch.Tensor | None = None,
 ) -> float:
-    """Relative projection-weight error of one exactly deployed SVD action."""
+    """Relative projection-weight error of one exactly deployed SVD action.
+
+    ``down_target`` is the matrix the down factors were actually fitted to. Under
+    down compensation that is not ``down_weight``, and scoring against
+    ``down_weight`` would inflate the structural error of exactly those actions
+    whose true damage fell -- an anti-correlated prior for the sparse experts
+    that depend on it most.
+    """
 
     gate_error, gate_energy = _factorized_frobenius_error(
         gate_weight,
@@ -522,7 +562,7 @@ def _deployed_factor_structural_error(
         factors["gu_input_factor"],
     )
     down_error, down_energy = _factorized_frobenius_error(
-        down_weight,
+        down_weight if down_target is None else down_target,
         factors["down_output_factor"],
         factors["down_input_factor"],
     )
@@ -549,6 +589,75 @@ def _full_expert_output(
 
 
 @torch.no_grad()
+def fit_routing_penalty_threshold(
+    margin: torch.Tensor,
+    keep_cost: torch.Tensor,
+    drop_cost: torch.Tensor,
+    keep_price: float = 1.0,
+) -> tuple[float, float]:
+    """Best router-logit discount for one expert, and the damage it removes.
+
+    ``keep_cost`` is what each token costs if the expert serves it, ``drop_cost``
+    what it costs if the expert loses the slot to the top-(k+1) expert. The ideal
+    policy is per-token -- displace wherever dropping is cheaper -- but inference
+    can evaluate neither term, so a margin threshold is the deployable surrogate.
+
+    Sorting by margin turns every candidate threshold into a prefix, so the total
+    cost of each is two cumulative sums and the best is their argmin: exact, and
+    O(n log n) with no extra forward pass.
+
+    Returns ``(threshold, gain)``, gain being the fraction of this action's
+    damage the threshold removes. A gain of zero means no threshold beats serving
+    every token -- the honest per-expert verdict, readable without a benchmark.
+    Both branches grow with margin (a wider margin means both a worse replacement
+    AND a heavier routing weight), so a threshold only pays where the reroute
+    cost grows faster.
+
+    ``keep_price`` is the class exchange rate, and this is the right place for it.
+    ``tier_price`` currently multiplies tier RISK at the very end of the pipeline,
+    which can only reorder the final ranking. But the claim it encodes -- that a
+    unit of truncation error costs more downstream than a unit of removal error,
+    because removal is absorbed by router renormalisation -- applies equally to
+    the keep/drop comparison made HERE. If it is true, this threshold is
+    mispriced too, and ``lam`` itself is wrong. Priced here it changes WHICH
+    tokens get displaced, not just how the action is ranked afterwards.
+    ``1.0`` is an exact no-op and reproduces the untouched fit.
+    """
+
+    if float(keep_price) <= 0:
+        raise ValueError(f"keep_price must be positive, got {keep_price}")
+
+    tokens = int(margin.numel())
+    if tokens == 0:
+        return 0.0, 0.0
+    order = torch.argsort(margin)
+    ordered = margin[order]
+    keep = keep_cost[order].double() * float(keep_price)
+    drop = drop_cost[order].double()
+    zero = torch.zeros(1, dtype=torch.float64, device=keep.device)
+    cost = torch.cat((zero, drop.cumsum(0))) + (
+        keep.sum() - torch.cat((zero, keep.cumsum(0)))
+    )
+    best = int(cost.argmin().item())
+    baseline = float(cost[0].item())
+    # ``best`` counts displaced tokens, and displacing them needs a threshold
+    # ABOVE their margins: lam = ordered[best] displaces exactly the first
+    # ``best``. Displacing all of them has no such next margin to stop at, so
+    # step just past the largest one.
+    if best == 0:
+        threshold = 0.0
+    elif best < tokens:
+        threshold = float(ordered[best])
+    else:
+        threshold = math.nextafter(float(ordered[-1]), math.inf)
+    # A negative threshold would mean PREFERRING the compressed expert to an
+    # exact one, which this term does not model.
+    threshold = max(threshold, 0.0)
+    gain = (baseline - float(cost[best].item())) / max(baseline, 1e-30)
+    return threshold, gain
+
+
+@torch.no_grad()
 def _build_layer_streaming_trace(
     module,
     name: str,
@@ -571,15 +680,23 @@ def _build_layer_streaming_trace(
     occupancy_alpha: float,
     removal_fallback_depths: int = 1,
     gram_metric: bool = False,
+    gram_shrink_target_mode: str = "diagonal",
+    down_compensation: bool = False,
+    factor_calibration: str = "shortlist",
+    factor_output_metric: str = "none",
+    damage_unit: str = "energy",
+    routing_penalty_scale: float = 0.0,
+    routing_penalty_calibrate: bool = False,
     seed: int,
 ):
     """Build compact single-action statistics from every cached hidden state.
 
     The reference MoE output is evaluated with the stacked module in chunks.
     SVD errors use every token that currently activates the expert. Candidate
-    factors are calibrated on the same router top-L token set used when the
-    final factor artifact is saved, so the factors scored by planning are the
-    factors loaded for inference. Removal errors exactly recompute top-k
+    factors are calibrated on the token set ``factor_calibration`` selects (the
+    router top-L by default), exactly as when the final factor artifact is
+    saved, so the factors scored by planning are the factors loaded for
+    inference. Removal errors exactly recompute top-k
     replacement and normalization for removing that expert alone. Multiple
     selected actions are combined additively by the allocator; no per-token
     output or Gram tensor is retained.
@@ -624,6 +741,24 @@ def _build_layer_streaming_trace(
     # Qwen3MoeRoutedFunctionalSVDSubsetBlock.build_factor_state.  Active top-k
     # probabilities below still follow the model's actual routing semantics.
     shortlist_probability = F.softmax(shortlist_values, dim=-1)
+    use_recorded_moments = str(factor_calibration) == "shortlist"
+    if use_recorded_moments:
+        # Kept inline rather than through factor_calibration_selection: the
+        # planner widens its shortlist to top_k + depths, and existing traces
+        # must stay bit-identical.
+        factor_ids = shortlist_ids
+        factor_weight_table = shortlist_probability.square()
+    else:
+        # No plan exists while traces are built, so a top-k mode is priced on the
+        # full router. Deployment routes over the plan's retained experts; the two
+        # differ only for tokens whose original top-k held a removed expert.
+        factor_ids, factor_weight_table = factor_calibration_selection(
+            logits,
+            factor_calibration=factor_calibration,
+            top_k=top_k,
+            norm_topk_prob=bool(module.norm_topk_prob),
+            router_candidates=router_candidates,
+        )
     topk_ids = shortlist_ids[:, :top_k]
     topk_values = shortlist_values[:, :top_k]
     # One column per candidate fallback depth: depth d is the top-(k+1+d)
@@ -660,6 +795,25 @@ def _build_layer_streaming_trace(
     storage_dtype = expert_projection_weight(
         module, int(global_expert_ids[0]), "gate"
     ).dtype
+    if str(damage_unit) not in DAMAGE_UNITS:
+        raise ValueError(
+            f"damage_unit must be one of {DAMAGE_UNITS}, got {damage_unit!r}"
+        )
+    amplitude = str(damage_unit) == "amplitude"
+    if amplitude and (
+        routing_penalty_calibrate
+        or float(routing_penalty_scale) > 0.0
+        or float(occupancy_alpha) != 1.0
+    ):
+        raise ValueError(
+            "the pair Gram, routing-penalty pricing and occupancy_alpha != 1 are "
+            "defined on squared error; build this trace with damage_unit='energy'"
+        )
+
+    def per_token_damage(energy: torch.Tensor) -> torch.Tensor:
+        """Squared norms in, the trace's damage unit out (identity for energy)."""
+        return energy.clamp_min(0).sqrt() if amplitude else energy
+
     hidden_size = int(hidden.shape[1])
     reference_output = torch.empty(
         tokens, hidden_size, dtype=storage_dtype, device="cpu"
@@ -677,7 +831,7 @@ def _build_layer_streaming_trace(
         del batch
 
     reference_energy = _category_energy_sum(
-        reference_output.float().square().sum(dim=1),
+        per_token_damage(reference_output.float().square().sum(dim=1)),
         category_ids,
         categories,
     )
@@ -691,7 +845,9 @@ def _build_layer_streaming_trace(
     ).clamp_min(1e-300)
     prompt_reference_energy = torch.bincount(
         prompt_ids,
-        weights=reference_output.float().square().sum(dim=1).double(),
+        weights=per_token_damage(
+            reference_output.float().square().sum(dim=1)
+        ).double(),
         minlength=prompts,
     )
     # One replacement aggregate per depth. Each expert is evaluated once for the
@@ -780,6 +936,12 @@ def _build_layer_streaming_trace(
     prompt_action_numerator = torch.zeros(
         pool_size, len(action_names), prompts, dtype=torch.float64
     )
+    routing_penalty = torch.zeros(
+        pool_size, len(action_names), dtype=torch.float64
+    )
+    routing_penalty_gain = torch.zeros(
+        pool_size, len(action_names), dtype=torch.float64
+    )
     prompt_expert_output_energy = torch.zeros(
         pool_size, prompts, dtype=torch.float64
     )
@@ -807,6 +969,26 @@ def _build_layer_streaming_trace(
         "down_weight_only": 0,
     }
 
+    # Must match Qwen3MoeRoutedFunctionalSVDSubsetBlock.build_factor_state exactly:
+    # the plan prices the factors the deployment will build, so the shrinkage
+    # target has to be identical on both sides.
+    layer_gram_target = None
+    layer_shrink_alpha = (
+        1.0 if str(gram_shrink_target_mode) == "layer_only" else "auto"
+    )
+    if gram_metric and str(gram_shrink_target_mode) in ("layer", "layer_only"):
+        acc = torch.zeros(
+            (int(hidden.shape[1]),) * 2, device=device, dtype=torch.float32
+        )
+        for start in range(0, int(hidden.shape[0]), int(routing_batch_size)):
+            batch = hidden[start : start + int(routing_batch_size)].to(
+                device=device, dtype=torch.float32
+            )
+            acc += batch.t() @ batch
+            del batch
+        layer_gram_target = acc.cpu()
+        del acc
+
     for local_id in tqdm(
         range(pool_size), desc=f"Full-token actions {name}", leave=False
     ):
@@ -815,15 +997,15 @@ def _build_layer_streaming_trace(
         token_ids = matches[:, 0] if active else torch.empty(0, dtype=torch.long)
         slots = matches[:, 1] if active else torch.empty(0, dtype=torch.long)
         expert_id = int(global_expert_ids[local_id].item())
-        factor_token_ids, factor_slots = (shortlist_ids == local_id).nonzero(
+        factor_token_ids, factor_slots = (factor_ids == local_id).nonzero(
             as_tuple=True
         )
         factor_x = hidden.index_select(0, factor_token_ids).to(
             device=device, dtype=torch.float32
         )
-        factor_weights = shortlist_probability[
+        factor_weights = factor_weight_table[
             factor_token_ids, factor_slots
-        ].to(device=device, dtype=torch.float32).square()
+        ].to(device=device, dtype=torch.float32)
         gate_weight = expert_projection_weight(module, expert_id, "gate")
         up_weight = expert_projection_weight(module, expert_id, "up")
         down_weight = expert_projection_weight(module, expert_id, "down")
@@ -854,7 +1036,9 @@ def _build_layer_streaming_trace(
             active_token_count[local_id] = counts
             conditional_importance[local_id] = importance_sum / counts.clamp_min(1)
             expert_output_energy[local_id] = _category_energy_sum(
-                routed_norm.square(), token_categories, categories
+                routed_norm if amplitude else routed_norm.square(),
+                token_categories,
+                categories,
             )
             linear_routed_energy = weights.to(device) * original_y.square().sum(dim=1)
             linear_routing_output_energy[local_id] = _category_energy_sum(
@@ -862,7 +1046,9 @@ def _build_layer_streaming_trace(
             )
             prompt_expert_output_energy[local_id] = torch.bincount(
                 token_prompts,
-                weights=routed_norm.square().detach().double().cpu(),
+                weights=(
+                    routed_norm if amplitude else routed_norm.square()
+                ).detach().double().cpu(),
                 minlength=prompts,
             )
             prompt_linear_routing_output_energy[local_id] = torch.bincount(
@@ -905,12 +1091,13 @@ def _build_layer_streaming_trace(
                         + replacement_route.unsqueeze(1) * replacement
                     ) / normalizer.unsqueeze(1)
                 removal_energy = removal_delta.square().sum(dim=1)
+                removal_damage = per_token_damage(removal_energy)
                 removal_depth_numerator[local_id, depth] = _category_energy_sum(
-                    removal_energy, token_categories, categories
+                    removal_damage, token_categories, categories
                 )
                 removal_depth_prompt_numerator[local_id, depth] = torch.bincount(
                     token_prompts,
-                    weights=removal_energy.detach().double().cpu(),
+                    weights=removal_damage.detach().double().cpu(),
                     minlength=prompts,
                 )
                 (
@@ -918,11 +1105,17 @@ def _build_layer_streaming_trace(
                     removal_depth_log_square_sum[local_id, depth],
                     removal_depth_positive_count[local_id, depth],
                 ) = _log_damage_moments(
-                    removal_energy,
+                    removal_damage,
                     token_categories,
                     reference_mean_energy,
                     categories,
                 )
+                if depth == 0:
+                    # Retained for routing-penalty pricing below: a token whose
+                    # penalised expert loses its slot incurs exactly the damage
+                    # measured here, because losing the slot to the top-(k+1)
+                    # expert IS removal as far as that token is concerned.
+                    displaced_energy = removal_energy.clone()
                 del replacement, removal_delta, removal_energy
             # Action zero keeps the depth-zero measurement, which is what a plan
             # whose nearest fallback survives actually incurs. The retention-aware
@@ -959,22 +1152,85 @@ def _build_layer_streaming_trace(
                 storage_dtype=storage_dtype,
                 gram_metric=gram_metric,
                 allow_uncalibrated=True,
+                # Must match the deployment's shrinkage target exactly: the plan
+                # prices the factors the restructurer will build, and pricing them
+                # against a different target is the plan/deployment divergence that
+                # made the first gram run ship uncalibrated factors.
+                gram_shrink_target=layer_gram_target,
+                gram_shrink_alpha=layer_shrink_alpha,
+                down_compensation=down_compensation,
+                use_recorded_moments=use_recorded_moments,
+                output_metric=factor_output_metric,
             )
             structural_action_error[local_id, action] = (
                 _deployed_factor_structural_error(
-                    gate_weight, up_weight, down_weight, factors
+                    gate_weight,
+                    up_weight,
+                    down_weight,
+                    factors,
+                    down_target=fallbacks.get("down_target"),
                 )
             )
             if active:
                 compressed_y, _ = apply_deployed_expert_factors(x, factors)
                 delta = route.unsqueeze(1) * (compressed_y.float() - original_y)
                 delta_energy = delta.square().sum(dim=1)
+                if routing_penalty_calibrate:
+                    margin = (
+                        topk_values[token_ids, slots].to(device)
+                        - replacement_values[token_ids, 0].to(device)
+                    )
+                    (
+                        routing_penalty[local_id, action],
+                        routing_penalty_gain[local_id, action],
+                    ) = fit_routing_penalty_threshold(
+                        margin, delta_energy, displaced_energy
+                    )
+                if float(routing_penalty_scale) > 0.0:
+                    # Deployment discounts this expert's router logit by lam, so
+                    # it keeps a slot only where its margin over the top-(k+1)
+                    # expert survives the discount. Pricing the action as if it
+                    # still served every token would price a plan the model will
+                    # never run. Tokens it loses are priced as removal, which is
+                    # what they actually incur.
+                    #
+                    # lam is self-normalising -- the expert's own relative damage
+                    # amplitude -- so it needs no layer-wide statistic and can be
+                    # recomputed at deployment from quantities the plan records.
+                    if routing_penalty_calibrate:
+                        # scale shrinks the FITTED threshold toward zero. The fit
+                        # is a per-expert argmin over calibration tokens, so it
+                        # is the term most exposed to overfitting them; scale = 1
+                        # trusts it fully, below 1 is the conservative reading.
+                        lam = float(routing_penalty_scale) * float(
+                            routing_penalty[local_id, action]
+                        )
+                    else:
+                        relative = (
+                            delta_energy.sum()
+                            / routed_norm.square().sum().clamp_min(1e-30)
+                        )
+                        lam = float(
+                            routing_penalty_scale
+                            * float(relative.clamp_min(0).sqrt())
+                        )
+                        routing_penalty[local_id, action] = lam
+                    margin = (
+                        topk_values[token_ids, slots].to(device)
+                        - replacement_values[token_ids, 0].to(device)
+                    )
+                    # Each expert is priced as the only one discounted, matching
+                    # the additive treatment removal already gets in this trace.
+                    delta_energy = torch.where(
+                        margin < lam, displaced_energy, delta_energy
+                    )
+                delta_damage = per_token_damage(delta_energy)
                 action_numerator[local_id, action] = _category_energy_sum(
-                    delta_energy, token_categories, categories
+                    delta_damage, token_categories, categories
                 )
                 prompt_action_numerator[local_id, action] = torch.bincount(
                     token_prompts,
-                    weights=delta_energy.detach().double().cpu(),
+                    weights=delta_damage.detach().double().cpu(),
                     minlength=prompts,
                 )
                 (
@@ -982,7 +1238,7 @@ def _build_layer_streaming_trace(
                     damage_log_square_sum[local_id, action],
                     damage_positive_count[local_id, action],
                 ) = _log_damage_moments(
-                    delta_energy,
+                    delta_damage,
                     token_categories,
                     reference_mean_energy,
                     categories,
@@ -1031,6 +1287,30 @@ def _build_layer_streaming_trace(
         scale[observed] = occupancy[observed].pow(float(occupancy_alpha) - 1.0)
         action_numerator.mul_(scale.unsqueeze(1))
 
+    # The deployment recomputes lam from the plan alone, so it needs the same
+    # denominator this trace divided by. Recorded relative to the layer reference
+    # energy, exactly as single_action_relative_distortion is, so the reference
+    # cancels when the two are divided and neither has to be shipped.
+    usage_stats["routed_output_energy"] = (
+        expert_output_energy.sum(dim=1).double()
+        / float(reference_energy.sum().clamp_min(1e-30))
+    )
+    if routing_penalty_calibrate or float(routing_penalty_scale) > 0.0:
+        for action_id, action_label in enumerate(action_names):
+            if action_label in ("removed", "full"):
+                continue
+            usage_stats[f"routing_penalty_{action_label}"] = routing_penalty[
+                :, action_id
+            ]
+            if routing_penalty_calibrate:
+                # The fraction of this action's damage the best threshold
+                # removes. Zero means no threshold beats keeping every token,
+                # which is the honest per-expert verdict on the whole idea and
+                # is readable without running a benchmark.
+                usage_stats[f"routing_penalty_gain_{action_label}"] = (
+                    routing_penalty_gain[:, action_id]
+                )
+
     trace = LayerIndependentActionTrace(
         name=name,
         action_numerator=action_numerator,
@@ -1060,6 +1340,7 @@ def _build_layer_streaming_trace(
         action_costs=action_cost.unsqueeze(0).expand(pool_size, -1).clone(),
         action_names=action_names,
         top_k=top_k,
+        damage_unit=str(damage_unit),
     )
     if any(fallback_counts.values()):
         logging.debug("%s calibration fallbacks: %s", name, fallback_counts)
@@ -1096,8 +1377,8 @@ def _ordered_retained_routes(
 def _build_conditioned_factor_bank(
     module,
     hidden: torch.Tensor,
-    shortlist_ids: torch.Tensor,
-    shortlist_probability: torch.Tensor,
+    calibration_ids: torch.Tensor,
+    calibration_weights: torch.Tensor,
     global_expert_ids: torch.Tensor,
     actions: torch.Tensor,
     gate_moments: torch.Tensor,
@@ -1107,10 +1388,17 @@ def _build_conditioned_factor_bank(
     *,
     device: str,
     randomized: bool,
+    gram_metric: bool = False,
+    use_recorded_moments: bool = True,
+    factor_output_metric: str = "none",
     scale_floor: float,
     seed: int,
 ) -> tuple[dict[tuple[int, int], dict[str, torch.Tensor]], dict[str, int]]:
-    """Materialize only low-rank factors needed by adjacent refinement moves."""
+    """Materialize only low-rank factors needed by adjacent refinement moves.
+
+    ``calibration_weights`` is already the per-token weight (see
+    ``factor_calibration_selection``), not a probability still to be squared.
+    """
 
     full_action = len(rank_pairs) + 1
     factor_bank: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
@@ -1128,15 +1416,15 @@ def _build_conditioned_factor_bank(
         }
         if not needed:
             continue
-        token_ids, positions = (shortlist_ids == local_id).nonzero(as_tuple=True)
+        token_ids, positions = (calibration_ids == local_id).nonzero(as_tuple=True)
         candidate_inputs = candidate_weights = None
         if int(token_ids.numel()):
             candidate_inputs = hidden.index_select(0, token_ids).to(
                 device=device, dtype=torch.float32
             )
-            candidate_weights = shortlist_probability[
+            candidate_weights = calibration_weights[
                 token_ids, positions
-            ].to(device=device, dtype=torch.float32).square()
+            ].to(device=device, dtype=torch.float32)
         expert_id = int(global_expert_ids[local_id].item())
         gate_weight = expert_projection_weight(module, expert_id, "gate")
         up_weight = expert_projection_weight(module, expert_id, "up")
@@ -1161,6 +1449,8 @@ def _build_conditioned_factor_bank(
                 storage_dtype=gate_weight.dtype,
                 gram_metric=gram_metric,
                 allow_uncalibrated=True,
+                use_recorded_moments=use_recorded_moments,
+                output_metric=factor_output_metric,
             )
             factor_bank[(local_id, action)] = factors
             for key in fallbacks:
@@ -1217,6 +1507,9 @@ def _build_layer_rerouting_conditioned_scores(
     router_candidates: int,
     refinement_chunk_size: int,
     randomized: bool,
+    gram_metric: bool = False,
+    factor_calibration: str = "shortlist",
+    factor_output_metric: str = "none",
     scale_floor: float,
     seed: int,
 ) -> tuple[_ConditionedLayerScores, torch.Tensor, dict[str, int]]:
@@ -1280,11 +1573,24 @@ def _build_layer_rerouting_conditioned_scores(
     # retained for conditioned rerouting.
     shortlist_values, shortlist_ids = torch.topk(logits, k=shortlist, dim=1)
     shortlist_probability = F.softmax(shortlist_values, dim=1)
+    if str(factor_calibration) == "shortlist":
+        calibration_ids = shortlist_ids
+        calibration_weights = shortlist_probability.square()
+    else:
+        calibration_ids, calibration_weights = factor_calibration_selection(
+            logits,
+            factor_calibration=factor_calibration,
+            top_k=top_k,
+            norm_topk_prob=bool(module.norm_topk_prob),
+            router_candidates=router_candidates,
+            # The current plan's routing, as the restructurer would deploy it.
+            retained=retained,
+        )
     factor_bank, fallback_counts = _build_conditioned_factor_bank(
         module,
         hidden,
-        shortlist_ids,
-        shortlist_probability,
+        calibration_ids,
+        calibration_weights,
         global_expert_ids,
         actions,
         gate_moments,
@@ -1293,6 +1599,9 @@ def _build_layer_rerouting_conditioned_scores(
         rank_pairs,
         device=device,
         randomized=randomized,
+        gram_metric=gram_metric,
+        use_recorded_moments=str(factor_calibration) == "shortlist",
+        factor_output_metric=factor_output_metric,
         scale_floor=scale_floor,
         seed=seed,
     )
@@ -1554,6 +1863,82 @@ def _conditioned_component(
     raise ValueError("layer_reduction must be energy or mean")
 
 
+def _reassign_plan_tiers_by_saliency(
+    plan: FunctionalCompressionPlan,
+    traces: Sequence[LayerIndependentActionTrace],
+    usage_stats: Mapping[str, Mapping[str, torch.Tensor]],
+    *,
+    saliency_key: str,
+    objective: str,
+    cvar_fraction: float,
+    layer_reduction: str,
+) -> FunctionalCompressionPlan:
+    """Preserve every layer's action histogram but rank experts by saliency."""
+
+    reassigned: dict[str, torch.Tensor] = {}
+    numerator = denominator = None
+    category_names = tuple(traces[0].category_names)
+    memory = 0
+    for trace in traces:
+        current = plan.actions[trace.name].long()
+        try:
+            saliency = torch.as_tensor(usage_stats[trace.name][saliency_key]).double()
+        except KeyError as error:
+            raise ValueError(
+                f"{trace.name}: tier assignment needs usage statistic {saliency_key!r}"
+            ) from error
+        order = sorted(
+            range(trace.experts), key=lambda expert: (float(saliency[expert]), expert)
+        )
+        actions = torch.empty_like(current)
+        cursor = 0
+        for action in range(trace.actions):
+            count = int((current == action).sum().item())
+            if count:
+                actions[torch.tensor(order[cursor : cursor + count])] = action
+                cursor += count
+        if cursor != trace.experts:
+            raise RuntimeError(f"{trace.name}: failed to reassign every expert")
+        reassigned[trace.name] = actions
+        memory += trace.memory(actions)
+        report = trace.evaluate(actions)
+        if layer_reduction == "energy":
+            layer_numerator, layer_denominator = report.numerator, report.denominator
+        elif layer_reduction == "mean":
+            layer_numerator = report.relative
+            layer_denominator = torch.ones_like(report.relative)
+        else:
+            raise ValueError("layer_reduction must be energy or mean")
+        numerator = layer_numerator if numerator is None else numerator + layer_numerator
+        denominator = (
+            layer_denominator if denominator is None else denominator + layer_denominator
+        )
+    if memory != plan.memory:
+        raise RuntimeError("saliency tier reassignment changed plan memory")
+    score, relative = robust_objective(
+        numerator, denominator, method=objective, cvar_fraction=cvar_fraction
+    )
+    history = list(plan.history)
+    history.append(
+        {
+            "operation": "reassign_tiers_by_saliency",
+            "saliency": saliency_key,
+            "memory": int(memory),
+            "objective": float(score),
+        }
+    )
+    return FunctionalCompressionPlan(
+        actions=reassigned,
+        memory=int(memory),
+        objective=float(score),
+        category_relative_distortion={
+            category: float(relative[index].item())
+            for index, category in enumerate(category_names)
+        },
+        history=history,
+    )
+
+
 @torch.no_grad()
 def _rerouting_conditioned_refinement(
     initial_plan: FunctionalCompressionPlan,
@@ -1582,6 +1967,9 @@ def _rerouting_conditioned_refinement(
     router_candidates: int,
     refinement_chunk_size: int,
     randomized: bool,
+    gram_metric: bool = False,
+    factor_calibration: str = "shortlist",
+    factor_output_metric: str = "none",
     scale_floor: float,
     seed: int,
 ) -> tuple[FunctionalCompressionPlan, dict[str, DistortionReport], dict]:
@@ -1635,6 +2023,9 @@ def _rerouting_conditioned_refinement(
                 router_candidates=router_candidates,
                 refinement_chunk_size=refinement_chunk_size,
                 randomized=randomized,
+                gram_metric=gram_metric,
+                factor_calibration=factor_calibration,
+                factor_output_metric=factor_output_metric,
                 scale_floor=scale_floor,
                 seed=int(seed) + layer_index * 1_000_003,
             )
@@ -2292,6 +2683,7 @@ def _json_plan(
     factorized_risk: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
     propagated_risk: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
     distortion_risk: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
+    mean_loss: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
 ):
     layers = {}
     for trace in traces:
@@ -2332,6 +2724,9 @@ def _json_plan(
         )
         distortion_diagnostics = (
             None if distortion_risk is None else distortion_risk[trace.name]
+        )
+        mean_loss_diagnostics = (
+            None if mean_loss is None else mean_loss[trace.name]
         )
         layers[trace.name] = {
             "expert_actions": {
@@ -2925,6 +3320,44 @@ def _json_plan(
                     },
                 }
             ),
+            "mean_loss": (
+                None
+                if mean_loss_diagnostics is None
+                else {
+                    "damage_unit": trace.damage_unit,
+                    **{
+                        field: {
+                            category: float(
+                                mean_loss_diagnostics[field][category_id].item()
+                            )
+                            for category_id, category in enumerate(
+                                trace.category_names
+                            )
+                        }
+                        for field in (
+                            "reference_mean_output",
+                            "svd_propagation_factor",
+                            "removal_propagation_factor",
+                        )
+                    },
+                    "experts": {
+                        str(int(expert_id)): {
+                            action_name: {
+                                category: float(
+                                    mean_loss_diagnostics["mean_loss"][
+                                        local_id, action_id, category_id
+                                    ].item()
+                                )
+                                for category_id, category in enumerate(
+                                    trace.category_names
+                                )
+                            }
+                            for action_id, action_name in enumerate(action_names)
+                        }
+                        for local_id, expert_id in enumerate(ids)
+                    },
+                }
+            ),
             "diagnostics": {
                 "category_relative_distortion": {
                     category: float(report.relative[index].item())
@@ -3160,6 +3593,11 @@ def _save_selected_factor_artifact(
     scale_floor: float,
     randomized: bool,
     seed: int,
+    gram_metric: bool,
+    gram_shrink_mode: str,
+    down_compensation: bool,
+    factor_calibration: str = "shortlist",
+    factor_output_metric: str = "none",
 ) -> None:
     """Save only factors selected by the final plan, one layer per file."""
 
@@ -3196,6 +3634,17 @@ def _save_selected_factor_artifact(
             scale_floor=scale_floor,
             randomized=randomized,
             layer_seed=int(seed) + layer_index * 1_000_003,
+            # These change the factors. Omitting them silently saved
+            # diagonal-metric factors for a Gram plan, which is the plan/
+            # deployment divergence the trace scope exists to prevent.
+            gram_metric=gram_metric,
+            gram_shrink_mode=gram_shrink_mode,
+            down_compensation=down_compensation,
+            factor_calibration=factor_calibration,
+            factor_output_metric=factor_output_metric,
+            # The same retained set the restructurer's from_stacked routes over,
+            # so saved factors equal the ones built on the fly from this plan.
+            retained_ids=ids[actions != 0].tolist(),
         )
         cpu_tiers = []
         for tier in state["tiers"]:
@@ -3235,11 +3684,14 @@ def _save_selected_factor_artifact(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B")
-    parser.add_argument("--moments", required=True)
-    parser.add_argument("--basis-category", default="balanced")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    group_inputs = parser.add_argument_group("inputs", "required artifacts and what the plan is priced against")
+    group_inputs.add_argument("--model", default="Qwen/Qwen3-30B-A3B")
+    group_inputs.add_argument("--moments", required=True)
+    group_inputs.add_argument("--basis-category", default="balanced")
+    group_inputs.add_argument(
         "--routing-kept-path",
         default=None,
         help=(
@@ -3247,32 +3699,9 @@ def main() -> None:
             "plan all original experts"
         ),
     )
-    parser.add_argument("--sequence-cache", required=True)
-    parser.add_argument("--hidden-cache-dir", required=True)
-    parser.add_argument("--reuse-hidden-cache", action="store_true")
-    parser.add_argument("--rank-pairs", nargs="+", type=_parse_rank_pair, default=[(256, 128), (384, 256)])
-    parser.add_argument("--memory-ratio", type=float, default=0.50)
-    parser.add_argument(
-        "--planner",
-        choices=[
-            "distortion",
-            "importance_compressibility",
-            "posterior_distortion",
-            "factorized_risk",
-            "propagated_risk",
-            "distortion_risk",
-        ],
-        default="distortion",
-        help=(
-            "initial allocation objective: routed additive distortion or "
-            "conditional REAP importance times confidence-shrunk compressibility, "
-            "prompt-clustered empirical-Bayes functional distortion, or "
-            "posterior routed exposure times conditional compressibility, or "
-            "linear-routing importance times degradation and propagated damage, "
-            "or the mean-CVaR distortion risk of the measured per-token damage"
-        ),
-    )
-    parser.add_argument(
+    group_inputs.add_argument("--sequence-cache", required=True)
+    group_inputs.add_argument("--hidden-cache-dir", required=True)
+    group_inputs.add_argument(
         "--propagation-path",
         default=None,
         help=(
@@ -3281,131 +3710,74 @@ def main() -> None:
             "optional for distortion_risk"
         ),
     )
-    parser.add_argument(
-        "--propagation-svd-scale",
-        type=float,
-        default=None,
-        help=(
-            "re-evaluate the stored propagation damage curve for low-rank "
-            "actions at this relative perturbation scale instead of using the "
-            "factors the calibration tool saved"
-        ),
-    )
-    parser.add_argument(
-        "--propagation-removal-scale",
-        type=float,
-        default=None,
-        help=(
-            "re-evaluate the stored propagation damage curve for removal at "
-            "this relative perturbation scale"
-        ),
-    )
-    parser.add_argument(
-        "--removal-fallback-depths",
-        type=int,
-        default=1,
-        help=(
-            "how many router-shortlist fallback depths to measure removal damage "
-            "against. Depth zero is the top-(k+1) expert; deeper entries are what "
-            "a plan that also removed the nearer candidates incurs"
-        ),
-    )
-    parser.add_argument(
-        "--removal-depth-rounds",
+    group_budget = parser.add_argument_group("budget", "what the plan is allowed to spend")
+    group_budget.add_argument("--rank-pairs", nargs="+", type=_parse_rank_pair, default=[(256, 128), (384, 256)])
+    group_budget.add_argument("--memory-ratio", type=float, default=0.50)
+    group_budget.add_argument(
+        "--min-retained-experts",
         type=int,
         default=0,
-        help=(
-            "retention-aware replanning rounds for distortion_risk: each feeds the "
-            "previous plan's retained fraction back into the removal-depth mixture "
-            "and reallocates. Zero keeps the nearest-fallback removal risk"
-        ),
+        help="hard minimum number of non-removed experts in every layer",
     )
-    parser.add_argument(
-        "--removal-depth-damping",
+    group_budget.add_argument(
+        "--min-layer-memory-ratio",
         type=float,
-        default=0.5,
-        help=(
-            "damping on the retention fixed point; the feedback is negative, so "
-            "one can oscillate and 0.5 is a safe default"
-        ),
+        default=0.0,
+        help="hard per-layer floor relative to that layer's full expert parameters",
     )
-    parser.add_argument(
-        "--tail-fraction",
+    group_budget.add_argument(
+        "--layer-min-memory-json",
+        default=None,
+        help="greedy only: JSON {layer name or index: floor} overriding "
+        "--min-layer-memory-ratio for those layers (1.0 keeps a layer "
+        "uncompressed), e.g. to protect the layers a propagation probe finds "
+        "most sensitive",
+    )
+    group_budget.add_argument(
+        "--min-layer-routed-mass",
         type=float,
-        default=0.01,
-        help=(
-            "distortion_risk beta: the worst fraction of corpus tokens the risk "
-            "measure averages over. An expert routed less often than beta is "
-            "amplified by 1/beta relative to its expected damage, so beta must "
-            "sit well below the mean routing frequency top_k/experts or every "
-            "expert saturates and the tail term stops discriminating"
-        ),
+        default=0.0,
+        help="coverage constraint: never remove an expert if the layer would keep "
+        "less than this fraction of its routed mass on retained experts (tiers keep "
+        "their mass). Generation collapses near 54-65%% retained mass on "
+        "Qwen3-30B-A3B. 0 disables it. Greedy allocator only.",
     )
-    parser.add_argument(
-        "--tail-weight",
+    group_budget.add_argument(
+        "--max-layer-relative-distortion",
         type=float,
-        default=0.5,
+        default=None,
+        help="optional hard cap on every layer/category relative distortion",
+    )
+    group_ranking = parser.add_argument_group("ranking", "how experts are scored and ordered against each other")
+    group_ranking.add_argument(
+        "--routing-penalty-calibrate",
+        action="store_true",
         help=(
-            "distortion_risk lambda mixing expected damage with the tail term; "
-            "0 scores the exact expected relative damage and 1 uses CVaR alone"
+            "fit each expert's discount instead of scaling it: choose the "
+            "margin threshold that minimises measured damage, exactly, from the "
+            "per-token cost of keeping the expert versus losing the slot. "
+            "--routing-penalty-scale then shrinks the fitted value toward zero "
+            "(1.0 trusts the fit). Safe to pass with scale 0: the plan is priced "
+            "exactly as an undiscounted one but records every fitted threshold "
+            "and the damage fraction it would remove"
         ),
     )
-    parser.add_argument(
-        "--frequency-floor-tokens",
-        type=float,
-        default=1.0,
-        help=(
-            "distortion_risk floor on activation frequency, expressed in "
-            "calibration tokens, so an expert never routed in the corpus is not "
-            "scored as free to remove"
-        ),
-    )
-    parser.add_argument(
-        "--frequency-temper",
+    group_ranking.add_argument(
+        "--routing-penalty-scale",
         type=float,
         default=0.0,
         help=(
-            "distortion_risk exponent dividing routing frequency out of the risk. "
-            "0 keeps the exposure-weighted measure, which ranks experts almost "
-            "exactly as REAP's reap_sum does and therefore deletes rare "
-            "specialists in favour of frequent substitutable experts; 1 scores an "
-            "expert purely on damage per token it is routed to, the quantity "
-            "REAP's reap_mean measures"
+            "RETIRED -- any nonzero value is rejected. It discounted a "
+            "compressed expert's router logit by scale times its own relative "
+            "damage amplitude and repriced displaced tokens as removal. The "
+            "discount is equivalent to scaling the expert's output by gamma < 1, "
+            "but the SVD fit's own optimality condition already places the "
+            "least-squares optimum at gamma = 1, so the term can only add error; "
+            "the calibrated fit confirmed it, returning a zero threshold on all "
+            "18,432 cells. Only 0 is accepted"
         ),
     )
-    parser.add_argument(
-        "--posterior-min-active-prompts",
-        type=int,
-        default=2,
-        help=(
-            "minimum independent prompts activating an expert before its "
-            "measured functional risk can override the structural prior"
-        ),
-    )
-    parser.add_argument(
-        "--posterior-epsilon",
-        type=float,
-        default=1e-12,
-        help="numerical floor used by the log-risk posterior planner",
-    )
-    parser.add_argument(
-        "--risk-uncertainty-z",
-        type=float,
-        default=1.0,
-        help=(
-            "one-sided posterior uncertainty multiplier used by risk planners' "
-            "importance, SVD degradation, and rerouting-removal guards"
-        ),
-    )
-    parser.add_argument(
-        "--disable-rerouting-removal-guard",
-        action="store_true",
-        help=(
-            "use importance alone for factorized/propagated removal risk instead of the "
-            "maximum of importance and measured rerouting-aware removal risk"
-        ),
-    )
-    parser.add_argument(
+    group_ranking.add_argument(
         "--confidence-kappa",
         type=float,
         default=64.0,
@@ -3414,21 +3786,21 @@ def main() -> None:
             "importance priors in importance-compressibility planning"
         ),
     )
-    parser.add_argument(
+    group_ranking.add_argument(
         "--importance-power",
         type=float,
         default=2.0,
         help="power applied to normalized conditional REAP importance",
     )
-    parser.add_argument(
+    group_ranking.add_argument(
         "--importance-prior",
         choices=["median", "mean"],
         default="median",
         help="layer/category prior used for sparsely observed expert importance",
     )
-    parser.add_argument("--objective", choices=["mean", "worst", "cvar"], default="worst")
-    parser.add_argument("--cvar-fraction", type=float, default=0.5)
-    parser.add_argument(
+    group_ranking.add_argument("--objective", choices=["mean", "worst", "cvar"], default="worst")
+    group_ranking.add_argument("--cvar-fraction", type=float, default=0.5)
+    group_ranking.add_argument(
         "--token-reduction",
         choices=["energy", "relative"],
         default="energy",
@@ -3439,7 +3811,7 @@ def main() -> None:
             "layer normalization"
         ),
     )
-    parser.add_argument(
+    group_ranking.add_argument(
         "--token-energy-floor-ratio",
         type=float,
         default=0.05,
@@ -3448,7 +3820,7 @@ def main() -> None:
             "this fraction of its category median"
         ),
     )
-    parser.add_argument(
+    group_ranking.add_argument(
         "--layer-reduction",
         choices=["energy", "mean"],
         default="mean",
@@ -3457,25 +3829,7 @@ def main() -> None:
             "equal weight after within-layer normalization ('mean')"
         ),
     )
-    parser.add_argument(
-        "--min-retained-experts",
-        type=int,
-        default=0,
-        help="hard minimum number of non-removed experts in every layer",
-    )
-    parser.add_argument(
-        "--min-layer-memory-ratio",
-        type=float,
-        default=0.0,
-        help="hard per-layer floor relative to that layer's full expert parameters",
-    )
-    parser.add_argument(
-        "--max-layer-relative-distortion",
-        type=float,
-        default=None,
-        help="optional hard cap on every layer/category relative distortion",
-    )
-    parser.add_argument(
+    group_ranking.add_argument(
         "--occupancy-alpha",
         type=float,
         default=1.0,
@@ -3485,34 +3839,7 @@ def main() -> None:
             "tempers frequency to protect rare high-contribution experts"
         ),
     )
-    parser.add_argument(
-        "--rerouting-refinement-rounds",
-        type=int,
-        default=0,
-        help=(
-            "full-token closed-loop refinement rounds after streaming allocation; "
-            "zero disables rerouting-conditioned refinement"
-        ),
-    )
-    parser.add_argument(
-        "--rerouting-swaps-per-round",
-        type=int,
-        default=16,
-        help="maximum memory-neutral adjacent-action swaps accepted per round",
-    )
-    parser.add_argument(
-        "--rerouting-candidates-per-boundary",
-        type=int,
-        default=64,
-        help="best upgrades and downgrades retained per action boundary",
-    )
-    parser.add_argument(
-        "--rerouting-chunk-size",
-        type=int,
-        default=256,
-        help="cached token states evaluated at once during conditioned replay",
-    )
-    parser.add_argument(
+    group_ranking.add_argument(
         "--removal-tiebreak",
         choices=["none", "reap_mean", "reap_sum"],
         default="reap_mean",
@@ -3521,50 +3848,39 @@ def main() -> None:
             "candidates; 'none' is the functional-only ablation"
         ),
     )
-    parser.add_argument(
+    group_ranking.add_argument(
         "--removal-tiebreak-rtol",
         type=float,
         default=0.01,
         help="relative functional-score tolerance for the REAP removal near-tie",
     )
-    parser.add_argument(
-        "--tokens-per-category",
-        type=int,
-        default=256,
+    group_ranking.add_argument(
+        "--tier-price-scale-json",
+        default=None,
         help=(
-            "random token states per category for projected/gram traces; "
-            "streaming mode always consumes every cached token"
+            "mean_loss only: JSON {\"layers\": {layer: [scale per SVD tier, cheapest "
+            "first]}} multiplying tier prices on top of --tier-price, e.g. the "
+            "measured damage ratio of refined to traced factors "
+            "(tools/refine_tier_factors.py). Layers not listed keep scale 1."
         ),
     )
-    parser.add_argument("--router-candidates", type=int, default=16)
-    parser.add_argument("--sketch-dim", type=int, default=16)
-    parser.add_argument(
-        "--trace-mode",
-        choices=["projected", "gram", "streaming"],
-        default="projected",
+    group_ranking.add_argument(
+        "--tier-price",
+        type=float,
+        default=1.0,
         help=(
-            "'gram' evaluates exact full-output squared error with no random "
-            "projection; 'projected' retains the legacy sketch trace; "
-            "'streaming' consumes every cached token and stores compact exact "
-            "single-action statistics"
+            "multiply the risk of the SVD-tier actions relative to removal. 1.0 is "
+            "an exact no-op. The propagation gains that otherwise set this exchange "
+            "rate come from a random-direction probe and price the two action "
+            "classes by error magnitude alone; measured on Qwen3-30B-A3B, shifting "
+            "routing mass from removal into tiers costs 0.038 human-eval points per "
+            "1%% of mass. Raising this drives tier usage toward zero, which is the "
+            "right behaviour above the ~0.35-budget crossover where removal-only "
+            "(REAP) wins; below it the ladder is worth 43-49 points and the price "
+            "should return to 1.0."
         ),
     )
-    parser.add_argument("--routing-batch-size", type=int, default=2048)
-    parser.add_argument("--chunk-size", type=int, default=128)
-    parser.add_argument(
-        "--factor-metric",
-        choices=("diagonal", "gram"),
-        default="diagonal",
-        help=(
-            "input metric the SVD is calibrated in. 'diagonal' is the shipped "
-            "per-coordinate second moment. 'gram' uses the full Z^T diag(w) Z, "
-            "which is the correct metric when input coordinates are correlated; "
-            "it is built from the routed calibration tokens, so a diagonal "
-            "moments artifact is simply unused rather than an error. Changing "
-            "this changes the deployed weights and REQUIRES its own --trace-dir."
-        ),
-    )
-    parser.add_argument(
+    group_ranking.add_argument(
         "--action-interaction-rho",
         type=float,
         default=0.0,
@@ -3580,17 +3896,352 @@ def main() -> None:
             "0 (default) reproduces the additive objective exactly."
         ),
     )
-    parser.add_argument("--scale-floor", type=float, default=1e-12)
-    parser.add_argument("--exact-svd", action="store_true")
-    parser.add_argument("--max-layers", type=int, default=None)
-    parser.add_argument("--trace-dir", default=None)
-    parser.add_argument(
+    group_ranking.add_argument(
+        "--tier-assignment",
+        choices=("risk", "reap_mean", "reap_sum"),
+        default="risk",
+        help=(
+            "after allocating each layer's action counts, optionally assign "
+            "cheaper tiers to experts with lower REAP saliency while preserving "
+            "memory and every per-layer action histogram"
+        ),
+    )
+    group_factors = parser.add_argument_group("factors", "how a retained expert is factorized")
+    group_factors.add_argument("--router-candidates", type=int, default=16)
+    group_factors.add_argument("--sketch-dim", type=int, default=16)
+    group_factors.add_argument(
+        "--gram-shrink-target",
+        choices=("diagonal", "layer", "layer_only"),
+        default="diagonal",
+        help=(
+            "what a starved per-expert Gram is shrunk toward under --factor-metric "
+            "gram. 'diagonal' keeps only per-coordinate variance and discards the "
+            "correlation structure whitening exists for; 'layer' shrinks toward the "
+            "LAYER Gram pooled over every calibration token, which is the per-layer "
+            "covariance SVD-LLM-style whitening actually assumes. Ignored for the "
+            "diagonal metric."
+        ),
+    )
+    group_factors.add_argument(
+        "--down-compensation",
+        action="store_true",
+        help=(
+            "fit the down projection to reproduce the expert's ORIGINAL output "
+            "from the compressed intermediate, instead of approximating W_down "
+            "as a map in the compressed intermediate's geometry. Measured on "
+            "Qwen3-30B-A3B coding256, ~72%% of the down-stage error is inherited "
+            "from the gate/up truncation rather than caused by down's own rank "
+            "limit; targeting the original output lets down absorb 2.2-2.6x of "
+            "it at identical rank, bytes and kernels. Requires calibration "
+            "tokens (--hidden-cache-dir); a no-op for experts that have none."
+        ),
+    )
+    group_factors.add_argument(
+        "--factor-metric",
+        choices=("diagonal", "gram"),
+        default="diagonal",
+        help=(
+            "input metric the SVD is calibrated in. 'diagonal' is the shipped "
+            "per-coordinate second moment. 'gram' uses the full Z^T diag(w) Z, "
+            "which is the correct metric when input coordinates are correlated; "
+            "it is built from the routed calibration tokens, so a diagonal "
+            "moments artifact is simply unused rather than an error. Changing "
+            "this changes the deployed weights and REQUIRES its own --trace-dir."
+        ),
+    )
+    group_factors.add_argument(
+        "--factor-output-metric",
+        choices=FACTOR_OUTPUT_METRICS,
+        default="none",
+        help=(
+            "how the gate/up factorization weights its 768 output channels. "
+            "'none' is the plain Frobenius norm (every channel equal); "
+            "'jacobian' weights channel j by how much an error there reaches "
+            "the expert output through the SiLU product and W_down. Needs "
+            "calibration tokens, and gets its own factor-calibration scope"
+        ),
+    )
+    group_factors.add_argument(
+        "--factor-calibration",
+        choices=FACTOR_CALIBRATIONS,
+        default=None,
+        help=(
+            "which tokens calibrate the SVD and how each is weighted; default "
+            "'topk_g2' for --trace-mode streaming, 'shortlist' otherwise. "
+            "'shortlist' (legacy) uses every token whose router top-L "
+            "(--router-candidates) contains the expert, weighted by the squared "
+            "top-L softmax, with gate/up taken from the recorded sensitivity "
+            "moments. 'topk_g2' is ASVD-style: only the tokens routed to the "
+            "expert (router top-k over the experts the plan retains, so a "
+            "removed expert's tokens go to the next retained one), weighted by "
+            "the squared routing weight, for gate/up and down alike; recorded "
+            "moments are ignored. Traces are priced before any removal. "
+            "'topk_uniform' uses the same tokens unweighted. Streaming traces "
+            "only; changes the deployed weights and REQUIRES its own --trace-dir."
+        ),
+    )
+    group_factors.add_argument(
+        "--damage-unit",
+        choices=DAMAGE_UNITS,
+        default=None,
+        help=(
+            "unit of every per-token damage the planner prices: 'amplitude' "
+            "g||f - fhat|| (L2 norm, REAP's unit; the propagation probe measures "
+            "logit KL growing like |delta|^1.25, much nearer amplitude than "
+            "energy) or 'energy' g^2||f - fhat||^2 (squared L2, the original). "
+            "Default 'amplitude' for --planner distortion_risk on streaming "
+            "traces, 'energy' otherwise. SVD factors are still fitted by least "
+            "squares. Changes every trace number and REQUIRES its own --trace-dir."
+        ),
+    )
+    group_factors.add_argument(
+        "--damage-reference",
+        choices=("layer_mean", "none"),
+        default="layer_mean",
+        help=(
+            "what distortion_risk and mean_loss divide per-token damage by: "
+            "'layer_mean' (the "
+            "layer's mean MoE output, the original) or 'none' (absolute damage). "
+            "Within a layer this is one constant; it only changes how layers "
+            "trade off. The propagation factors are fitted per relative error, "
+            "so 'none' mixes units. Applied at pricing time; traces are reusable."
+        ),
+    )
+    group_factors.add_argument("--scale-floor", type=float, default=1e-12)
+    group_factors.add_argument("--exact-svd", action="store_true")
+    group_refinement = parser.add_argument_group("refinement", "iterative improvement passes over a finished allocation")
+    group_refinement.add_argument(
+        "--mean-loss-frequency-power",
+        type=float,
+        default=0.0,
+        help=(
+            "mean_loss only: alpha in price *= (activations / layer mean)**alpha. "
+            "0 = mean per activation (frequency-blind, the default); 1 = total "
+            "damage, so a busy expert outprices an equally-lossy quiet one. "
+            "Pricing-time only, so existing traces are reusable"
+        ),
+    )
+    group_refinement.add_argument(
+        "--planner",
+        choices=[
+            "distortion",
+            "importance_compressibility",
+            "posterior_distortion",
+            "factorized_risk",
+            "propagated_risk",
+            "distortion_risk",
+            "mean_loss",
+        ],
+        default="distortion",
+        help=(
+            "initial allocation objective: routed additive distortion or "
+            "conditional REAP importance times confidence-shrunk compressibility, "
+            "prompt-clustered empirical-Bayes functional distortion, or "
+            "posterior routed exposure times conditional compressibility, or "
+            "linear-routing importance times degradation and propagated damage, "
+            "or the mean-CVaR distortion risk of the measured per-token damage"
+        ),
+    )
+    group_ranking.add_argument(
+        "--propagation-svd-scale",
+        type=float,
+        default=None,
+        help=(
+            "re-evaluate the stored propagation damage curve for low-rank "
+            "actions at this relative perturbation scale instead of using the "
+            "factors the calibration tool saved"
+        ),
+    )
+    group_ranking.add_argument(
+        "--propagation-removal-scale",
+        type=float,
+        default=None,
+        help=(
+            "re-evaluate the stored propagation damage curve for removal at "
+            "this relative perturbation scale"
+        ),
+    )
+    group_ranking.add_argument(
+        "--tail-fraction",
+        type=float,
+        default=0.01,
+        help=(
+            "distortion_risk beta: the worst fraction of corpus tokens the risk "
+            "measure averages over. An expert routed less often than beta is "
+            "amplified by 1/beta relative to its expected damage, so beta must "
+            "sit well below the mean routing frequency top_k/experts or every "
+            "expert saturates and the tail term stops discriminating"
+        ),
+    )
+    group_ranking.add_argument(
+        "--tail-weight",
+        type=float,
+        default=0.5,
+        help=(
+            "distortion_risk lambda mixing expected damage with the tail term; "
+            "0 scores the exact expected relative damage and 1 uses CVaR alone"
+        ),
+    )
+    group_ranking.add_argument(
+        "--frequency-floor-tokens",
+        type=float,
+        default=1.0,
+        help=(
+            "distortion_risk floor on activation frequency, expressed in "
+            "calibration tokens, so an expert never routed in the corpus is not "
+            "scored as free to remove"
+        ),
+    )
+    group_ranking.add_argument(
+        "--frequency-temper",
+        type=float,
+        default=0.0,
+        help=(
+            "distortion_risk exponent dividing routing frequency out of the risk. "
+            "0 keeps the exposure-weighted measure, which ranks experts almost "
+            "exactly as REAP's reap_sum does and therefore deletes rare "
+            "specialists in favour of frequent substitutable experts; 1 scores an "
+            "expert purely on damage per token it is routed to, the quantity "
+            "REAP's reap_mean measures"
+        ),
+    )
+    group_ranking.add_argument(
+        "--margin-proxy-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "distortion_risk weight for a first-order residual-amplitude proxy "
+            "to logit-margin damage. It is normalized into energy-risk units "
+            "per action/category; 0 reproduces the previous equation exactly"
+        ),
+    )
+    group_ranking.add_argument(
+        "--risk-uncertainty-z",
+        type=float,
+        default=1.0,
+        help=(
+            "one-sided posterior uncertainty multiplier used by risk planners' "
+            "importance, SVD degradation, and rerouting-removal guards"
+        ),
+    )
+    group_ranking.add_argument(
+        "--disable-rerouting-removal-guard",
+        action="store_true",
+        help=(
+            "use importance alone for factorized/propagated removal risk instead of the "
+            "maximum of importance and measured rerouting-aware removal risk"
+        ),
+    )
+    group_refinement.add_argument(
+        "--removal-fallback-depths",
+        type=int,
+        default=1,
+        help=(
+            "how many router-shortlist fallback depths to measure removal damage "
+            "against. Depth zero is the top-(k+1) expert; deeper entries are what "
+            "a plan that also removed the nearer candidates incurs"
+        ),
+    )
+    group_refinement.add_argument(
+        "--removal-depth-rounds",
+        type=int,
+        default=0,
+        help=(
+            "retention-aware replanning rounds for distortion_risk: each feeds the "
+            "previous plan's retained fraction back into the removal-depth mixture "
+            "and reallocates. Zero keeps the nearest-fallback removal risk"
+        ),
+    )
+    group_refinement.add_argument(
+        "--removal-depth-damping",
+        type=float,
+        default=0.5,
+        help=(
+            "damping on the retention fixed point; the feedback is negative, so "
+            "one can oscillate and 0.5 is a safe default"
+        ),
+    )
+    group_refinement.add_argument(
+        "--posterior-min-active-prompts",
+        type=int,
+        default=2,
+        help=(
+            "minimum independent prompts activating an expert before its "
+            "measured functional risk can override the structural prior"
+        ),
+    )
+    group_refinement.add_argument(
+        "--posterior-epsilon",
+        type=float,
+        default=1e-12,
+        help="numerical floor used by the log-risk posterior planner",
+    )
+    group_refinement.add_argument(
+        "--rerouting-refinement-rounds",
+        type=int,
+        default=0,
+        help=(
+            "full-token closed-loop refinement rounds after streaming allocation; "
+            "zero disables rerouting-conditioned refinement"
+        ),
+    )
+    group_refinement.add_argument(
+        "--rerouting-swaps-per-round",
+        type=int,
+        default=16,
+        help="maximum memory-neutral adjacent-action swaps accepted per round",
+    )
+    group_refinement.add_argument(
+        "--rerouting-candidates-per-boundary",
+        type=int,
+        default=64,
+        help="best upgrades and downgrades retained per action boundary",
+    )
+    group_refinement.add_argument(
+        "--rerouting-chunk-size",
+        type=int,
+        default=256,
+        help="cached token states evaluated at once during conditioned replay",
+    )
+    group_runtime = parser.add_argument_group("runtime", "I/O, devices and caches; none of these change the plan")
+    group_runtime.add_argument("--reuse-hidden-cache", action="store_true")
+    group_runtime.add_argument(
+        "--tokens-per-category",
+        type=int,
+        default=256,
+        help=(
+            "random token states per category for projected/gram traces; "
+            "streaming mode always consumes every cached token"
+        ),
+    )
+    group_runtime.add_argument(
+        "--trace-mode",
+        choices=["projected", "gram", "streaming"],
+        default="projected",
+        help=(
+            "'gram' evaluates exact full-output squared error with no random "
+            "projection; 'projected' retains the legacy sketch trace; "
+            "'streaming' consumes every cached token and stores compact exact "
+            "single-action statistics"
+        ),
+    )
+    group_runtime.add_argument("--routing-batch-size", type=int, default=2048)
+    group_runtime.add_argument("--chunk-size", type=int, default=128)
+    group_runtime.add_argument("--max-layers", type=int, default=None)
+    group_runtime.add_argument("--trace-dir", default=None)
+    group_runtime.add_argument(
+        "--traces-only",
+        action="store_true",
+        help="build and save every layer trace to --trace-dir, then exit without "
+        "allocating; plan later on CPU with --reuse-traces",
+    )
+    group_runtime.add_argument(
         "--reuse-traces",
         action="store_true",
         help="load existing per-layer trace files from --trace-dir when available",
     )
-    parser.add_argument("--out", required=True)
-    parser.add_argument(
+    group_runtime.add_argument("--out", required=True)
+    group_runtime.add_argument(
         "--factors-out-dir",
         default=None,
         help=(
@@ -3598,10 +4249,26 @@ def main() -> None:
             "and loaded by inference"
         ),
     )
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
-    parser.add_argument("--seed", type=int, default=0)
+    group_runtime.add_argument("--device", default="cuda:0")
+    group_runtime.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
+    group_runtime.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.factor_calibration is None:
+        # The ASVD-style calibration is the default wherever it exists. The
+        # shortlist (top-L tokens, recorded sens_t gate/up moments) remains for
+        # the legacy trace modes and for reproducing plans built with it.
+        args.factor_calibration = (
+            "topk_g2" if args.trace_mode == "streaming" else "shortlist"
+        )
+    if args.damage_unit is None:
+        # Amplitude is implemented for the streaming distortion-risk path only;
+        # every other planner keeps the squared error it was built around.
+        args.damage_unit = (
+            "amplitude"
+            if args.planner in ("distortion_risk", "mean_loss")
+            and args.trace_mode == "streaming"
+            else "energy"
+        )
     if not (0 < args.memory_ratio <= 1):
         parser.error("--memory-ratio must be in (0, 1]")
     if args.confidence_kappa < 0:
@@ -3616,6 +4283,8 @@ def main() -> None:
         parser.error("token, shortlist, and sketch sizes must be positive")
     if args.reuse_traces and not args.trace_dir:
         parser.error("--reuse-traces requires --trace-dir")
+    if args.traces_only and not args.trace_dir:
+        parser.error("--traces-only requires --trace-dir")
     if args.factors_out_dir and args.trace_mode not in {"gram", "streaming"}:
         parser.error("--factors-out-dir requires --trace-mode gram or streaming")
     if args.removal_tiebreak_rtol < 0:
@@ -3635,6 +4304,54 @@ def main() -> None:
         parser.error("--max-layer-relative-distortion must be nonnegative")
     if not (0 <= args.occupancy_alpha <= 1):
         parser.error("--occupancy-alpha must be in [0, 1]")
+    if args.factor_calibration != "shortlist" and args.trace_mode != "streaming":
+        parser.error(
+            "--factor-calibration other than 'shortlist' needs --trace-mode "
+            "streaming; the projected and gram trace builders calibrate on the "
+            "shortlist only"
+        )
+    if args.damage_unit == "amplitude":
+        conflicts = [
+            flag
+            for flag, active in (
+                ("--trace-mode " + args.trace_mode, args.trace_mode != "streaming"),
+                (
+                    "--planner " + args.planner,
+                    args.planner not in ("distortion_risk", "mean_loss"),
+                ),
+                ("--margin-proxy-weight", args.margin_proxy_weight > 0),
+                ("--action-interaction-rho", float(args.action_interaction_rho) != 0),
+                ("--occupancy-alpha", float(args.occupancy_alpha) != 1.0),
+                ("--routing-penalty-calibrate", bool(args.routing_penalty_calibrate)),
+            )
+            if active
+        ]
+        if conflicts:
+            parser.error(
+                "--damage-unit amplitude is implemented for the streaming "
+                "distortion_risk and mean_loss planners only, and these are "
+                f"defined on squared error: {', '.join(conflicts)}. Pass "
+                "--damage-unit energy."
+            )
+    if args.damage_reference == "none" and args.planner not in (
+        "distortion_risk", "mean_loss"
+    ):
+        parser.error(
+            "--damage-reference none is implemented for --planner "
+            "distortion_risk and mean_loss only"
+        )
+    if args.mean_loss_frequency_power and args.planner != "mean_loss":
+        parser.error("--mean-loss-frequency-power applies to --planner mean_loss")
+    if args.tier_price_scale_json and args.planner != "mean_loss":
+        parser.error("--tier-price-scale-json applies to --planner mean_loss")
+    if args.planner == "mean_loss":
+        if args.trace_mode != "streaming":
+            parser.error("--planner mean_loss needs --trace-mode streaming")
+        if args.removal_depth_rounds:
+            parser.error(
+                "--removal-depth-rounds re-prices removal inside distortion_risk; "
+                "mean_loss does not use it"
+            )
     if args.planner == "propagated_risk" and args.propagation_path is None:
         parser.error("--planner propagated_risk requires --propagation-path")
     for flag, value in (
@@ -3655,6 +4372,28 @@ def main() -> None:
         parser.error("--tail-weight must be in [0, 1]")
     if not (0 <= args.frequency_temper <= 1):
         parser.error("--frequency-temper must be in [0, 1]")
+    if args.margin_proxy_weight < 0:
+        parser.error("--margin-proxy-weight must be nonnegative")
+    if args.routing_penalty_scale:
+        # Retired. Discounting a compressed expert's router logit is the same
+        # operation as scaling its output by gamma < 1, and the least-squares
+        # optimum is gamma* = 1 + <rho, fhat> / ||fhat||^2 with rho = f - fhat.
+        # But <rho, fhat> = 0 is precisely the first-order condition the SVD fit
+        # already imposes on the calibration distribution, so gamma* = 1: the
+        # discount moves AWAY from the optimum rather than toward it. The
+        # measurement agreed -- the calibrated fit returned a zero threshold on
+        # all 18,432 cells, dropping a token never beating serving it truncated
+        # (minimum ratio 2.03x). Removal is the only action that may move
+        # routing, because it is the only one that takes the expert away.
+        parser.error(
+            "--routing-penalty-scale is retired: discounting an SVD expert's "
+            "router logit sets gamma < 1 when the SVD fit's own optimality "
+            "condition already puts the optimum at gamma = 1, so it can only "
+            "increase error. The calibrated fit measured this directly, "
+            "returning a zero threshold on all 18,432 cells. Pass "
+            "--routing-penalty-calibrate alone (scale 0) to record the fitted "
+            "thresholds as a diagnostic without repricing any action."
+        )
     if args.frequency_floor_tokens < 0:
         parser.error("--frequency-floor-tokens must be nonnegative")
     if args.planner == "distortion_risk":
@@ -3890,7 +4629,10 @@ def main() -> None:
             saved = _load_moments(str(trace_path))
             trace_kind = saved.get("trace_kind", "functional")
             expected_scope = _factor_calibration_scope(
-                args.trace_mode, args.factor_metric
+                args.trace_mode, args.factor_metric, args.gram_shrink_target,
+                args.down_compensation,
+                factor_calibration=args.factor_calibration,
+                factor_output_metric=args.factor_output_metric,
             )
             if args.trace_mode == "streaming" and saved.get(
                 "factor_calibration_scope"
@@ -3898,8 +4640,45 @@ def main() -> None:
                 raise ValueError(
                     f"cached trace {trace_path} was calibrated as "
                     f"{saved.get('factor_calibration_scope')!r} but this run needs "
-                    f"{expected_scope!r} (--factor-metric {args.factor_metric}); "
-                    "use a different --trace-dir or rerun without --reuse-traces"
+                    f"{expected_scope!r} (--factor-metric {args.factor_metric}, "
+                    f"--factor-calibration {args.factor_calibration}); "
+                    "use a different --trace-dir, rerun without --reuse-traces, "
+                    "or pass --factor-calibration shortlist for traces built "
+                    "before that option existed"
+                )
+            cached_usage = saved.get("usage_stats") or {}
+            penalty_mismatch = float(
+                saved.get("routing_penalty_scale", 0.0)
+            ) != float(args.routing_penalty_scale) or bool(
+                saved.get("routing_penalty_calibrate", False)
+            ) != bool(args.routing_penalty_calibrate)
+            if penalty_mismatch and float(args.routing_penalty_scale) == 0.0:
+                # The penalty is retired, so every run now prices at scale 0. A
+                # trace cached under a nonzero scale is still identical to an
+                # unpriced one whenever every fitted threshold came out zero: a
+                # token is displaced only where margin < lam, and lam == 0 against
+                # a nonnegative margin displaces nothing. That is what the flag
+                # did in every measured run, so reuse those traces instead of
+                # forcing a rebuild that cannot change a number.
+                penalty_keys = [
+                    key
+                    for key in cached_usage
+                    if key.startswith("routing_penalty_")
+                ]
+                if penalty_keys and not any(
+                    bool(torch.as_tensor(cached_usage[key]).any())
+                    for key in penalty_keys
+                ):
+                    penalty_mismatch = False
+            if args.trace_mode == "streaming" and penalty_mismatch:
+                raise ValueError(
+                    f"cached trace {trace_path} was priced at routing penalty "
+                    f"scale={saved.get('routing_penalty_scale', 0.0)} "
+                    f"calibrate={saved.get('routing_penalty_calibrate', False)}, "
+                    f"but this run needs scale={args.routing_penalty_scale} "
+                    f"calibrate={args.routing_penalty_calibrate}. The penalty "
+                    "reprices every action, so use a different --trace-dir or "
+                    "rerun without --reuse-traces."
                 )
             if (
                 args.trace_mode == "streaming"
@@ -3910,6 +4689,14 @@ def main() -> None:
                     f"cached trace {trace_path} uses occupancy alpha "
                     f"{saved.get('occupancy_alpha', 1.0)}, requested "
                     f"{args.occupancy_alpha}"
+                )
+            saved_unit = str(saved.get("damage_unit", "energy"))
+            if args.trace_mode == "streaming" and saved_unit != args.damage_unit:
+                raise ValueError(
+                    f"cached trace {trace_path} prices damage as {saved_unit!r}, "
+                    f"but this run needs {args.damage_unit!r}; use a different "
+                    "--trace-dir, rerun without --reuse-traces, or pass "
+                    f"--damage-unit {saved_unit}"
                 )
             trace = (
                 LayerIndependentActionTrace.from_state_dict(saved["trace"])
@@ -4021,12 +4808,32 @@ def main() -> None:
         )
         if args.trace_mode == "streaming":
             builder_kwargs["occupancy_alpha"] = args.occupancy_alpha
+            builder_kwargs["gram_shrink_target_mode"] = args.gram_shrink_target
+            builder_kwargs["down_compensation"] = args.down_compensation
             builder_kwargs["removal_fallback_depths"] = args.removal_fallback_depths
             builder_kwargs["prompt_ids"] = prompt_ids
             builder_kwargs["prompt_category_ids"] = prompt_category_ids
             builder_kwargs["gram_metric"] = args.factor_metric == "gram"
+            builder_kwargs["factor_calibration"] = args.factor_calibration
+            builder_kwargs["factor_output_metric"] = args.factor_output_metric
+            builder_kwargs["damage_unit"] = args.damage_unit
+            builder_kwargs["routing_penalty_scale"] = args.routing_penalty_scale
+            builder_kwargs["routing_penalty_calibrate"] = (
+                args.routing_penalty_calibrate
+            )
         if args.trace_mode == "projected":
             builder_kwargs["sketch_dim"] = args.sketch_dim
+        if args.routing_penalty_scale and args.removal_fallback_depths < 1:
+            raise ValueError(
+                "--routing-penalty-scale prices a displaced token as removal, "
+                "which needs at least one removal fallback depth"
+            )
+        if args.routing_penalty_scale and args.trace_mode != "streaming":
+            raise ValueError(
+                "--routing-penalty-scale prices actions from per-token routing "
+                f"margins, which only the streaming trace retains; got "
+                f"--trace-mode {args.trace_mode}"
+            )
         trace, expert_ids, layer_fallbacks, layer_usage = builder(
             modules[name],
             name,
@@ -4052,6 +4859,14 @@ def main() -> None:
                         if args.trace_mode == "streaming"
                         else "functional"
                     ),
+                    # The penalty REPRICES action_numerator (tokens whose margin
+                    # does not survive lam are scored as removal), so a trace is
+                    # only valid for the penalty it was built with. Recorded here
+                    # and checked on reuse, exactly like occupancy_alpha.
+                    "routing_penalty_scale": float(args.routing_penalty_scale),
+                    "routing_penalty_calibrate": bool(
+                        args.routing_penalty_calibrate
+                    ),
                     "trace": trace.state_dict(),
                     "global_expert_ids": expert_ids,
                     "calibration_fallbacks": layer_fallbacks,
@@ -4062,8 +4877,12 @@ def main() -> None:
                         else None
                     ),
                     "factor_calibration_scope": _factor_calibration_scope(
-                        args.trace_mode, args.factor_metric
+                        args.trace_mode, args.factor_metric,
+                        args.gram_shrink_target, args.down_compensation,
+                        factor_calibration=args.factor_calibration,
+                        factor_output_metric=args.factor_output_metric,
                     ),
+                    "damage_unit": str(args.damage_unit),
                     "importance_compressibility_statistics": (
                         "conditional_reap_output_energy_structural_v1"
                         if args.trace_mode == "streaming"
@@ -4096,6 +4915,11 @@ def main() -> None:
         gc.collect()
         torch.cuda.empty_cache()
 
+    if args.traces_only:
+        logging.info("--traces-only: %d layer traces in %s; skipping allocation",
+                     len(traces), args.trace_dir)
+        return
+
     full_memory = sum(
         trace.memory(torch.full((trace.experts,), trace.actions - 1))
         for trace in traces
@@ -4113,6 +4937,7 @@ def main() -> None:
     factorized_risk = None
     propagated_risk = None
     distortion_risk = None
+    mean_loss = None
     if args.planner == "importance_compressibility":
         allocation_traces, importance_compressibility = (
             build_importance_compressibility_traces(
@@ -4209,6 +5034,9 @@ def main() -> None:
             uncertainty_z=args.risk_uncertainty_z,
             frequency_floor_tokens=args.frequency_floor_tokens,
             frequency_temper=args.frequency_temper,
+            tier_price=args.tier_price,
+            damage_reference=args.damage_reference,
+            margin_proxy_weight=args.margin_proxy_weight,
             epsilon=args.posterior_epsilon,
         )
         allocation_traces, distortion_risk = build_distortion_risk_traces(
@@ -4217,12 +5045,55 @@ def main() -> None:
         logging.info(
             "Initial allocation uses the mean-CVaR distortion risk of measured "
             "per-token damage (tail fraction=%.4g, tail weight=%.3g, minimum "
-            "active prompts=%d, uncertainty z=%.3g, propagation=%s)",
+            "active prompts=%d, uncertainty z=%.3g, margin proxy=%.3g, "
+            "propagation=%s)",
             args.tail_fraction,
             args.tail_weight,
             args.posterior_min_active_prompts,
             args.risk_uncertainty_z,
+            args.margin_proxy_weight,
             args.propagation_path or "none",
+        )
+    elif args.planner == "mean_loss":
+        propagation_factors = (
+            None
+            if args.propagation_path is None
+            else _load_propagation_factors(
+                args.propagation_path,
+                traces,
+                svd_scale=args.propagation_svd_scale,
+                removal_scale=args.propagation_removal_scale,
+            )
+        )
+        if args.propagation_path is not None and (
+            args.propagation_svd_scale is None
+            or args.propagation_svd_scale != args.propagation_removal_scale
+        ):
+            logging.warning(
+                "mean_loss with class-specific propagation scales prices tiers "
+                "against removal by a random-noise artefact; pass one shared "
+                "--propagation-svd-scale/--propagation-removal-scale"
+            )
+        allocation_traces, mean_loss = build_mean_loss_traces(
+            traces,
+            propagation_factors=propagation_factors,
+            damage_reference=args.damage_reference,
+            frequency_power=args.mean_loss_frequency_power,
+            epsilon=args.posterior_epsilon,
+            tier_price=args.tier_price,
+            tier_price_scale=(
+                json.loads(Path(args.tier_price_scale_json).read_text())["layers"]
+                if args.tier_price_scale_json else None
+            ),
+        )
+        logging.info(
+            "Initial allocation prices every action by its mean %s loss per "
+            "activation (reference=%s, propagation=%s, scales svd=%s removal=%s)",
+            args.damage_unit,
+            args.damage_reference,
+            args.propagation_path or "none",
+            args.propagation_svd_scale,
+            args.propagation_removal_scale,
         )
     removal_saliency = (
         None
@@ -4234,6 +5105,7 @@ def main() -> None:
             "factorized_risk",
             "propagated_risk",
             "distortion_risk",
+            "mean_loss",
         }
         else {
             name: values[args.removal_tiebreak]
@@ -4259,7 +5131,13 @@ def main() -> None:
         shortlist = torch.as_tensor(stats["shortlist_count"]).reshape(-1)
         if int(topk.numel()) != int(trace.experts):
             continue
-        dead = (topk <= 0) & (shortlist <= 0)
+        # mean_loss prices only the tokens an expert serves, so an expert no
+        # token routes to has no evidence at all, whatever its shortlist rank.
+        dead = (
+            topk <= 0
+            if args.planner == "mean_loss"
+            else (topk <= 0) & (shortlist <= 0)
+        )
         # Never start below the retention floor: the greedy enforces it for its
         # own moves, so handing it an already-violating plan would be silent.
         budgeted = int(trace.experts) - int(args.min_retained_experts)
@@ -4316,6 +5194,19 @@ def main() -> None:
         min_layer_memory_ratio=args.min_layer_memory_ratio,
         max_layer_relative_distortion=args.max_layer_relative_distortion,
     )
+    if args.layer_min_memory_json:
+        raw_floors = json.loads(Path(args.layer_min_memory_json).read_text())
+        names_by_index = {name.split(".")[2]: name for name in (t.name for t in allocation_traces)}
+        allocator_kwargs["layer_min_memory_ratio"] = {
+            names_by_index.get(str(key), str(key)): float(value)
+            for key, value in raw_floors.items()
+        }
+    if float(args.min_layer_routed_mass) > 0.0:
+        allocator_kwargs["min_layer_routed_mass"] = float(args.min_layer_routed_mass)
+        allocator_kwargs["expert_routed_mass"] = {
+            name: torch.as_tensor(stats["routing_mass"], dtype=torch.float64)
+            for name, stats in usage_stats.items()
+        }
     plan = cached_greedy_global_downgrade(allocation_traces, **allocator_kwargs)
     retention_history = []
     if args.planner == "distortion_risk" and args.removal_depth_rounds:
@@ -4326,6 +5217,24 @@ def main() -> None:
             allocator_kwargs=allocator_kwargs,
             rounds=args.removal_depth_rounds,
             damping=args.removal_depth_damping,
+        )
+    if args.tier_assignment != "risk":
+        before = float(plan.objective)
+        plan = _reassign_plan_tiers_by_saliency(
+            plan,
+            allocation_traces,
+            usage_stats,
+            saliency_key=args.tier_assignment,
+            objective=args.objective,
+            cvar_fraction=args.cvar_fraction,
+            layer_reduction=args.layer_reduction,
+        )
+        logging.info(
+            "reassigned fixed per-layer tier histograms by %s saliency "
+            "(local proxy objective %.6g -> %.6g; memory unchanged)",
+            args.tier_assignment,
+            before,
+            plan.objective,
         )
     conditioned_reports = None
     refinement_metadata = None
@@ -4361,6 +5270,9 @@ def main() -> None:
                 router_candidates=args.router_candidates,
                 refinement_chunk_size=args.rerouting_chunk_size,
                 randomized=not args.exact_svd,
+                gram_metric=args.factor_metric == "gram",
+                factor_calibration=args.factor_calibration,
+                factor_output_metric=args.factor_output_metric,
                 scale_floor=args.scale_floor,
                 seed=args.seed,
             )
@@ -4381,6 +5293,7 @@ def main() -> None:
         factorized_risk=factorized_risk,
         propagated_risk=propagated_risk,
         distortion_risk=distortion_risk,
+        mean_loss=mean_loss,
     )
     if args.planner in {
         "importance_compressibility",
@@ -4388,6 +5301,7 @@ def main() -> None:
         "factorized_risk",
         "propagated_risk",
         "distortion_risk",
+        "mean_loss",
     }:
         payload["meta"]["objective"] = (
             "category-robust conditional importance-compressibility risk"
@@ -4398,6 +5312,8 @@ def main() -> None:
             if args.planner == "propagated_risk"
             else "category-robust mean-CVaR per-token damage distortion risk"
             if args.planner == "distortion_risk"
+            else "category-robust mean contribution loss per activation"
+            if args.planner == "mean_loss"
             else "category-robust conservative importance-degradation risk"
         )
         payload["category_allocation_objective"] = dict(
@@ -4455,6 +5371,42 @@ def main() -> None:
                 else None
             ),
             "distortion_risk_frequency_temper": float(args.frequency_temper),
+                "distortion_risk_tier_price": float(args.tier_price),
+                "gram_shrink_target": str(args.gram_shrink_target),
+            # Recorded because each of these changes the plan or the factors.
+            # Leaving them out made a shipped plan unreproducible, and the
+            # propagation scales in particular ARE the SVD-vs-removal exchange
+            # rate -- the single most consequential knob the planner exposes.
+            "seed": int(args.seed),
+            "scale_floor": float(args.scale_floor),
+            "exact_svd": bool(args.exact_svd),
+            "propagation_svd_scale": (
+                None if args.propagation_svd_scale is None
+                else float(args.propagation_svd_scale)
+            ),
+            "propagation_removal_scale": (
+                None if args.propagation_removal_scale is None
+                else float(args.propagation_removal_scale)
+            ),
+            "removal_depth_damping": float(args.removal_depth_damping),
+            "down_compensation": bool(args.down_compensation),
+            "routing_penalty_scale": float(args.routing_penalty_scale),
+            # Names the formula, so a deployment cannot discount by a different
+            # rule than the plan was priced under. Absent means an older plan
+            # that was priced with no discount at all.
+            "routing_penalty_calibrated": bool(args.routing_penalty_calibrate),
+            "routing_penalty_definition": (
+                "scale * fitted margin threshold, per expert and action"
+                if args.routing_penalty_calibrate else
+                "scale * sqrt(action_damage / routed_output_energy), per expert "
+                "and action, both relative to the layer reference energy"
+            ),
+            "distortion_risk_margin_proxy_weight": (
+                float(args.margin_proxy_weight)
+                if args.planner == "distortion_risk"
+                else None
+            ),
+            "tier_assignment": str(args.tier_assignment),
             "distortion_risk_frequency_floor_tokens": (
                 float(args.frequency_floor_tokens)
                 if args.planner == "distortion_risk"
@@ -4552,9 +5504,22 @@ def main() -> None:
                 else None
             ),
             "factor_calibration_scope": _factor_calibration_scope(
-                args.trace_mode, args.factor_metric
+                args.trace_mode, args.factor_metric, args.gram_shrink_target,
+                args.down_compensation,
+                factor_calibration=args.factor_calibration,
+                factor_output_metric=args.factor_output_metric,
             ),
             "factor_metric": str(args.factor_metric),
+            # Read back by the restructurer: it selects the deployed factors.
+            "factor_calibration": str(args.factor_calibration),
+            "factor_output_metric": str(args.factor_output_metric),
+            "mean_loss_frequency_power": float(args.mean_loss_frequency_power),
+            "mean_loss_tier_price": float(args.tier_price),
+            "mean_loss_tier_price_scale_json": args.tier_price_scale_json,
+            "min_layer_routed_mass": float(args.min_layer_routed_mass),
+            # Units of every priced damage and of single_action_relative_distortion.
+            "damage_unit": str(args.damage_unit),
+            "damage_reference": str(args.damage_reference),
             "rank_pairs": [list(pair) for pair in rank_pairs],
             "calibration_fallbacks_by_layer": calibration_fallbacks,
             "objective_reducer": args.objective,
@@ -4594,6 +5559,10 @@ def main() -> None:
             "layer_reduction": args.layer_reduction,
             "min_retained_experts": int(args.min_retained_experts),
             "min_layer_memory_ratio": float(args.min_layer_memory_ratio),
+            "layer_min_memory": (
+                json.loads(Path(args.layer_min_memory_json).read_text())
+                if args.layer_min_memory_json else None
+            ),
             "max_layer_relative_distortion": args.max_layer_relative_distortion,
             "rerouting_conditioned_refinement": refinement_metadata,
             "rerouting_refinement_rounds": int(
@@ -4668,6 +5637,11 @@ def main() -> None:
             scale_floor=args.scale_floor,
             randomized=not args.exact_svd,
             seed=args.seed,
+            gram_metric=args.factor_metric == "gram",
+            gram_shrink_mode=args.gram_shrink_target,
+            down_compensation=args.down_compensation,
+            factor_calibration=args.factor_calibration,
+            factor_output_metric=args.factor_output_metric,
         )
     logging.info(
         "Planned ratio %.4f, objective %.6g, category objective %s",

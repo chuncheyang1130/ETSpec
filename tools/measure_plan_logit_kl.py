@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import logging
 import os
@@ -89,6 +90,46 @@ def answer_logits(model, input_ids, answer_start, device):
     return out[answer_start - 1: input_ids.shape[1] - 1].float()
 
 
+def plan_quality_vectors(
+    reference: torch.Tensor,
+    approximate: torch.Tensor,
+    *,
+    margin_retention: float = 1.0,
+    margin_floor: float = 0.1,
+) -> dict[str, torch.Tensor]:
+    """Return token-level KL and teacher-decision margin diagnostics."""
+
+    if reference.shape != approximate.shape or reference.ndim != 2:
+        raise ValueError("logits must have the same [tokens, vocabulary] shape")
+    log_full = F.log_softmax(reference.float(), dim=-1)
+    log_approx = F.log_softmax(approximate.float(), dim=-1)
+    kl = (log_full.exp() * (log_full - log_approx)).sum(-1)
+    teacher_id = reference.argmax(-1)
+    teacher_logit = reference.gather(1, teacher_id.unsqueeze(1)).squeeze(1)
+    other_reference = reference.clone()
+    other_reference.scatter_(1, teacher_id.unsqueeze(1), -torch.inf)
+    reference_margin = teacher_logit - other_reference.max(dim=1).values
+    approximate_teacher = approximate.gather(
+        1, teacher_id.unsqueeze(1)
+    ).squeeze(1)
+    other_approximate = approximate.clone()
+    other_approximate.scatter_(1, teacher_id.unsqueeze(1), -torch.inf)
+    approximate_margin = approximate_teacher - other_approximate.max(dim=1).values
+    margin_shortfall = F.relu(
+        float(margin_retention) * reference_margin - approximate_margin
+    )
+    normalized_margin_loss = margin_shortfall.square() / (
+        reference_margin.square() + float(margin_floor) ** 2
+    )
+    return {
+        "kl": kl,
+        "agreement": (teacher_id == approximate.argmax(-1)).float(),
+        "reference_margin": reference_margin,
+        "approximate_teacher_margin": approximate_margin,
+        "normalized_margin_loss": normalized_margin_loss,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", required=True)
@@ -109,8 +150,15 @@ def main() -> None:
                     help="reuse (or create) full-model logits here; the sequences "
                          "are cached with them so every plan is scored identically")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--tail-fraction", type=float, default=0.01)
+    ap.add_argument("--margin-retention", type=float, default=1.0)
+    ap.add_argument("--margin-floor", type=float, default=0.1)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    if not 0 < args.tail_fraction <= 1:
+        ap.error("--tail-fraction must be in (0, 1]")
+    if args.margin_retention < 0 or args.margin_floor <= 0:
+        ap.error("margin retention must be nonnegative and margin floor positive")
 
     device = torch.device(args.device)
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -130,7 +178,7 @@ def main() -> None:
 
     logging.info("Loading %s ...", args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, low_cpu_mem_usage=True
+        args.model, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
     ).to(device)
     model.eval()
 
@@ -173,23 +221,30 @@ def main() -> None:
         model, structure, torch.bfloat16, str(device)
     )
 
-    kls, agreements, tokens = [], [], 0
+    vectors: dict[str, list[torch.Tensor]] = {}
     for (ids, start), reference in zip(cache["sequences"], cache["reference"]):
         approximate = answer_logits(model, ids, start, device).cpu()
-        log_full = F.log_softmax(reference, dim=-1)
-        log_approx = F.log_softmax(approximate, dim=-1)
-        kl = (log_full.exp() * (log_full - log_approx)).sum(-1)
-        kls.append(kl.sum().item())
-        agreements.append(
-            (reference.argmax(-1) == approximate.argmax(-1)).float().sum().item()
+        values = plan_quality_vectors(
+            reference,
+            approximate,
+            margin_retention=args.margin_retention,
+            margin_floor=args.margin_floor,
         )
-        tokens += int(kl.numel())
+        for name, value in values.items():
+            vectors.setdefault(name, []).append(value.cpu())
 
-    mean_kl = sum(kls) / max(tokens, 1)
-    top1 = sum(agreements) / max(tokens, 1)
+    combined = {name: torch.cat(value) for name, value in vectors.items()}
+    tokens = int(combined["kl"].numel())
+    mean_kl = float(combined["kl"].mean().item())
+    top1 = float(combined["agreement"].mean().item())
+    tail_count = max(1, math.ceil(args.tail_fraction * tokens))
+    tail_kl = float(torch.topk(combined["kl"], k=tail_count).values.mean().item())
+    margin_loss = float(combined["normalized_margin_loss"].mean().item())
     logging.info(
-        "\n%s\n  mean KL(full||plan) = %.6f over %d answer tokens\n  top-1 agreement = %.4f",
-        args.plan, mean_kl, tokens, top1,
+        "\n%s\n  mean KL(full||plan) = %.6f over %d answer tokens"
+        "\n  tail-%.3g CVaR KL = %.6f\n  top-1 agreement = %.4f"
+        "\n  normalized margin loss = %.6f",
+        args.plan, mean_kl, tokens, args.tail_fraction, tail_kl, top1, margin_loss,
     )
 
     if args.out:
@@ -203,7 +258,18 @@ def main() -> None:
                 "gen_tokens": args.gen_tokens,
                 "answer_tokens": tokens,
                 "mean_kl": mean_kl,
+                "tail_fraction": args.tail_fraction,
+                "tail_cvar_kl": tail_kl,
                 "top1_agreement": top1,
+                "margin_retention": args.margin_retention,
+                "margin_floor": args.margin_floor,
+                "normalized_margin_loss": margin_loss,
+                "mean_reference_margin": float(
+                    combined["reference_margin"].mean().item()
+                ),
+                "mean_approximate_teacher_margin": float(
+                    combined["approximate_teacher_margin"].mean().item()
+                ),
             }, handle, indent=2)
         logging.info("Wrote %s", args.out)
 

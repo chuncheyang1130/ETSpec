@@ -38,7 +38,7 @@ from tqdm.auto import tqdm
 from specdecodes.helpers.recipes.moe.expert_calibration import load_selection
 from specdecodes.models.utils.moe.base.activation_svd import expert_projection_weight
 from specdecodes.models.utils.moe.base.expert_usage_tracker import _is_qwen3_moe_block
-from specdecodes.models.utils.moe.base.skipcat import metric_square_roots
+from specdecodes.models.utils.moe.base.ordinary_svd import metric_square_roots
 from tools.analyze_activation_svd import (
     _generate_category_sequences,
     _load_moments,
@@ -112,7 +112,7 @@ def _decompose_calibrated(
 
     ``second_moment`` is either a 1-D diagonal or a 2-D Gram; ``metric`` is the
     ``(root, inverse, is_matrix)`` triple from
-    :func:`~specdecodes.models.utils.moe.base.skipcat.metric_square_roots` and is
+    :func:`~specdecodes.models.utils.moe.base.ordinary_svd.metric_square_roots` and is
     passed straight through to :func:`_apply_factors`.
     """
 

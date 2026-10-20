@@ -279,6 +279,9 @@ def main() -> None:
                     routing_batch_size=args.batch_size,
                     randomized=True,
                     layer_seed=layer_seed,
+                    factor_calibration=str(
+                        meta.get("factor_calibration", "shortlist")
+                    ),
                 ).to(device)
         if args.max_tokens and args.max_tokens < int(row_ids.numel()):
             generator = torch.Generator().manual_seed(args.seed + 7919)

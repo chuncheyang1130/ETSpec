@@ -12,17 +12,25 @@ import argparse
 import json
 from collections import Counter
 
-TIER_ORDER = ["removed", "gu256_down128", "gu384_down256", "full"]
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--saliency", default="reap_mean")
+    ap.add_argument(
+        "--keep-removed",
+        action="store_true",
+        help="leave the source plan's removed set untouched and reorder only the "
+        "retained experts. Reassigning removals by saliency drops high-traffic "
+        "experts and cost 20 human-eval points at b30, so this isolates the "
+        "question of WHICH retained experts stay exact.",
+    )
     args = ap.parse_args()
 
     plan = json.load(open(args.source))
+    tier_order = list(plan.get("meta", {}).get("action_names", ()))
+    if not tier_order or tier_order[0] != "removed" or tier_order[-1] != "full":
+        raise ValueError("source plan meta.action_names must run from removed to full")
     for layer in plan["layers"].values():
         usage = layer["expert_usage"]
         actions = layer["expert_actions"]
@@ -32,10 +40,16 @@ def main() -> None:
 
         # least salient first, so the cheapest tiers are handed out first
         order = sorted(range(n), key=lambda e: (float(usage[str(e)][args.saliency]), e))
+        if args.keep_removed:
+            removed = [e for e in range(n) if current[e] == "removed"]
+            order = removed + [e for e in order if current[e] != "removed"]
 
         assigned: dict[int, str] = {}
         cursor = 0
-        for tier in TIER_ORDER:
+        unknown = set(histogram) - set(tier_order)
+        if unknown:
+            raise ValueError(f"source plan contains unknown actions: {sorted(unknown)}")
+        for tier in tier_order:
             for _ in range(histogram.get(tier, 0)):
                 assigned[order[cursor]] = tier
                 cursor += 1
@@ -50,6 +64,7 @@ def main() -> None:
     plan["meta"]["planner"] = "planalloc_reaprank_tiers"
     plan["meta"]["derived_from"] = [args.source]
     plan["meta"]["saliency"] = args.saliency
+    plan["meta"]["reaprank_keep_removed"] = bool(args.keep_removed)
     json.dump(plan, open(args.out, "w"))
     print(f"wrote {args.out}")
 

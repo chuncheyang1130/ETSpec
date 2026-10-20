@@ -4,15 +4,17 @@ Standalone expert calibration — decouples calibration from inference.
 
 Loads the FULL model, runs benchmark prompts through it to accumulate per-layer
 routing mass, selects each layer's kept experts by a coverage target, and SAVES
-the selection JSON. Inference then points the `moe_calibrated_subset` recipe's
-`kept_path` at this file and skips calibration entirely.
+the selection JSON.
 
-  # Step 1 (once): calibrate -> selection file
   python tools/calibrate_experts.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
       --dataset gsm8k --n 8 --gen-tokens 64 --tau 0.92 --out ./expert_activation/kept_gsm8k.json
 
-  # Step 2 (any number of inference runs): set in the method yaml
-  #   recipe.init_args.kept_path: ./expert_activation/kept_gsm8k.json
+The `--signal avg` mode is the REAP-style per-firing average. NOTE: the selection JSON
+has no inference consumer any more — the `moe_calibrated_subset` recipe that applied it
+at load time was retired. The REAP baseline that is actually run takes its saliency
+from `expert_usage[j]["reap_mean"]` inside a plan built by
+`plan_routed_functional_compression.py` (see `build_reap_plan.py`), so this tool is now
+calibration analysis only.
 """
 
 import argparse
