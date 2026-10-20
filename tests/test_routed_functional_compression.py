@@ -34,6 +34,7 @@ from tools.plan_routed_functional_compression import (
     _build_layer_streaming_trace,
     _calibration_moment_or_fallback,
     _rerouting_conditioned_refinement,
+    _reassign_plan_tiers_by_saliency,
     _selected_calibration_rows,
     _validate_full_expert_coverage,
     _validate_hidden_cache_routing,
@@ -1648,6 +1649,89 @@ def test_distortion_risk_without_tail_weight_is_exact_relative_damage():
     assert float(risk[1]) > 3.0 * float(risk[0])
 
 
+def test_margin_proxy_is_opt_in_and_changes_only_relative_ranking():
+    trace = _damage_trace(
+        [
+            [[1.0] * 8, [0.01] * 8, [0.0] * 8],
+            [[1.0] * 2, [0.8] * 2, [0.0] * 2],
+            [[1.0] * 4, [0.2] * 4, [0.0] * 4],
+        ],
+        [[0, 0, 1, 1, 2, 2, 3, 3], [0, 1], [0, 1, 2, 3]],
+        conditional_expert_energy=[1.0, 1.0, 1.0],
+        structural=[[1.0, 0.01, 0.0], [1.0, 0.8, 0.0], [1.0, 0.2, 0.0]],
+    )
+    _, baseline = build_distortion_risk_traces(
+        [trace], tail_weight=0.0, uncertainty_z=0.0
+    )
+    _, explicit_zero = build_distortion_risk_traces(
+        [trace], tail_weight=0.0, uncertainty_z=0.0, margin_proxy_weight=0.0
+    )
+    _, margin = build_distortion_risk_traces(
+        [trace], tail_weight=0.0, uncertainty_z=0.0, margin_proxy_weight=1.0
+    )
+    base = baseline["distortion"]["action_risk"][:, 1, 0]
+    assert torch.equal(base, explicit_zero["distortion"]["action_risk"][:, 1, 0])
+    changed = margin["distortion"]["action_risk"][:, 1, 0]
+    assert not torch.allclose(base / base.median(), changed / changed.median())
+    assert float(margin["distortion"]["amplitude_to_energy_scale"][1, 0]) > 0
+
+
+def test_interaction_correction_uses_damage_effective_multiplicity():
+    trace = _damage_trace(
+        [
+            [[1.0] * 4, [1.0] * 4, [0.0] * 4],
+            [[1.0] * 4, [1.0] * 4, [0.0] * 4],
+            [[1.0] * 4, [0.2] * 4, [0.0] * 4],
+        ],
+        [[0, 1, 2, 3]] * 3,
+        conditional_expert_energy=[1.0, 1.0, 1.0],
+        structural=[[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.2, 0.0]],
+    )
+    trace.set_interaction_model(0.5, occupancy=torch.ones(3, 1))
+    equal = trace.evaluate(torch.tensor([1, 1, 2])).numerator.item()
+    assert math.isclose(equal, 12.0, rel_tol=1e-12)
+
+    trace.action_numerator[1, 1, 0] = 4e-12
+    unbalanced = trace.evaluate(torch.tensor([1, 1, 2])).numerator.item()
+    assert unbalanced < 4.00002
+
+
+def test_saliency_tier_assignment_preserves_histogram_and_memory():
+    trace = _damage_trace(
+        [
+            [[1.0] * 4, [0.1] * 4, [0.0] * 4],
+            [[1.0] * 4, [0.2] * 4, [0.0] * 4],
+            [[1.0] * 4, [0.3] * 4, [0.0] * 4],
+        ],
+        [[0, 1, 2, 3]] * 3,
+        conditional_expert_energy=[1.0, 1.0, 1.0],
+        structural=[[1.0, 0.1, 0.0], [1.0, 0.2, 0.0], [1.0, 0.3, 0.0]],
+    )
+    initial_actions = torch.tensor([0, 1, 2])
+    initial = FunctionalCompressionPlan(
+        actions={trace.name: initial_actions},
+        memory=trace.memory(initial_actions),
+        objective=0.0,
+        category_relative_distortion={"coding": 0.0},
+        history=[],
+    )
+    assigned = _reassign_plan_tiers_by_saliency(
+        initial,
+        [trace],
+        {trace.name: {"reap_mean": torch.tensor([3.0, 1.0, 2.0])}},
+        saliency_key="reap_mean",
+        objective="mean",
+        cvar_fraction=0.5,
+        layer_reduction="mean",
+    )
+    assert assigned.memory == initial.memory
+    assert torch.equal(
+        torch.bincount(assigned.actions[trace.name], minlength=3),
+        torch.tensor([1, 1, 1]),
+    )
+    assert torch.equal(assigned.actions[trace.name], torch.tensor([2, 0, 1]))
+
+
 def test_distortion_risk_is_monotone_in_activation_frequency():
     # Two experts with identical conditional damage and dispersion, differing
     # only in how often the router selects them. A third expert with a distinct
@@ -2352,3 +2436,662 @@ def test_retention_iteration_reports_and_survives_a_nonconverging_cycle():
     assert refined.memory <= allocator_kwargs["memory_budget"]
     achieved = _layer_retained_fraction(refined, [trace])
     assert 0 < achieved["layer0"] <= 1
+
+
+def test_svd_action_pricing_is_independent_of_routing_penalty():
+    """An SVD action is priced at its own truncation error, never a reroute.
+
+    Removal is the only action that may move routing, because it is the only one
+    that takes the expert away. A truncated expert keeps its slot and its router
+    weight: scaling its output by gamma would be the same operation as
+    discounting its logit, and the SVD fit's own optimality condition
+    (<f - fhat, fhat> = 0) already puts the least-squares optimum at gamma = 1.
+    So --routing-penalty-calibrate must remain a pure diagnostic -- it may record
+    thresholds, but it may not move a single number the allocator reads.
+    """
+
+    class TinyMoe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_experts = 3
+            self.top_k = 1
+            self.norm_topk_prob = True
+            self.kept = 3
+            self.register_buffer("selected_expert_ids", torch.arange(3))
+            self.register_buffer(
+                "router_weights",
+                torch.tensor(
+                    [[2.0, 0.0], [0.0, 2.0], [-1.0, -1.0]],
+                    dtype=torch.float32,
+                ),
+            )
+            # Intermediate width 2 against a rank-1 action, so truncation
+            # actually discards a direction and the SVD numerator is nonzero.
+            self.gate_proj_stacked = torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [[1.0, 0.0], [0.3, 1.0]],
+                        [[0.0, 1.0], [1.0, -0.4]],
+                        [[1.0, 1.0], [-0.6, 0.2]],
+                    ]
+                )
+            )
+            self.up_proj_stacked = torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [[1.0, 0.5], [0.2, 1.0]],
+                        [[0.7, 1.0], [1.0, 0.1]],
+                        [[1.0, -0.3], [0.4, 1.0]],
+                    ]
+                )
+            )
+            self.down_proj_stacked = torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [[1.0, 0.5], [0.5, -1.0]],
+                        [[2.0, -1.0], [0.3, 1.0]],
+                        [[-1.0, 1.5], [1.0, 0.2]],
+                    ]
+                )
+            )
+
+        def _expert(self, x, expert):
+            gate = F.linear(x, self.gate_proj_stacked[expert])
+            up = F.linear(x, self.up_proj_stacked[expert])
+            return F.linear(F.silu(gate) * up, self.down_proj_stacked[expert])
+
+        def forward(self, x):
+            flat = x.reshape(-1, x.shape[-1])
+            logits = F.linear(flat, self.router_weights)
+            ids = logits.argmax(dim=1)
+            output = torch.empty(flat.shape[0], flat.shape[1])
+            for expert in range(self.num_experts):
+                mask = ids == expert
+                if bool(mask.any()):
+                    output[mask] = self._expert(flat[mask], expert)
+            return output.reshape(*x.shape)
+
+    hidden = torch.tensor([[1.0, 0.2], [0.1, 1.0], [0.8, 1.0], [0.4, 0.6]])
+
+    def build(**extra):
+        trace, _, _, usage = _build_layer_streaming_trace(
+            TinyMoe(),
+            "tiny",
+            hidden,
+            torch.zeros(hidden.shape[0], dtype=torch.long),
+            ("coding",),
+            torch.ones(3, 2),
+            torch.ones(3, 2),
+            [(1, 1)],
+            ("removed", "gu1_down1", "full"),
+            torch.tensor([0, 3, 6]),
+            device="cpu",
+            routing_batch_size=2,
+            router_candidates=2,
+            randomized=False,
+            scale_floor=1e-12,
+            occupancy_alpha=1.0,
+            seed=0,
+            **extra,
+        )
+        return trace, usage
+
+    plain, _ = build()
+    calibrated, usage = build(routing_penalty_calibrate=True)
+
+    # The action the test is about must actually cost something, or the
+    # comparison below would be vacuously true on a tensor of zeros.
+    assert float(plain.action_numerator[:, 1, 0].sum()) > 0.0
+
+    # Calibration may record a threshold; it may not reprice any action.
+    assert torch.equal(plain.action_numerator, calibrated.action_numerator)
+    assert torch.equal(plain.raw_action_numerator, calibrated.raw_action_numerator)
+
+    # And the fit itself is the diagnostic it claims to be: a nonnegative
+    # threshold per (expert, tier action), reported without being applied.
+    recorded = [value for key, value in usage.items() if key.startswith("routing_penalty_")]
+    assert recorded
+    for value in recorded:
+        assert bool(torch.as_tensor(value).ge(0).all())
+
+
+import pytest  # noqa: E402
+
+import tools.plan_routed_functional_compression as _planner  # noqa: E402
+
+
+class _ToyTopTwoMoe(torch.nn.Module):
+    """Five experts with top-2 routing, so the router top-k, the top-3 shortlist
+    and the full pool are three different calibration token sets."""
+
+    def __init__(self):
+        super().__init__()
+        generator = torch.Generator().manual_seed(3)
+        self.num_experts, self.top_k, self.norm_topk_prob, self.kept = 5, 2, True, 5
+        self.register_buffer("selected_expert_ids", torch.arange(5))
+        self.register_buffer(
+            "router_weights", torch.randn(5, 4, generator=generator)
+        )
+        self.gate_proj_stacked = torch.nn.Parameter(
+            torch.randn(5, 3, 4, generator=generator)
+        )
+        self.up_proj_stacked = torch.nn.Parameter(
+            torch.randn(5, 3, 4, generator=generator)
+        )
+        self.down_proj_stacked = torch.nn.Parameter(
+            torch.randn(5, 4, 3, generator=generator)
+        )
+
+    def _expert(self, x, expert):
+        gate = F.linear(x, self.gate_proj_stacked[expert])
+        up = F.linear(x, self.up_proj_stacked[expert])
+        return F.linear(F.silu(gate) * up, self.down_proj_stacked[expert])
+
+    def forward(self, x):
+        flat = x.reshape(-1, x.shape[-1])
+        values, ids = torch.topk(
+            F.linear(flat, self.router_weights), k=self.top_k, dim=-1
+        )
+        weights = F.softmax(values, dim=-1)
+        output = torch.zeros_like(flat)
+        for slot in range(self.top_k):
+            for expert in range(self.num_experts):
+                mask = ids[:, slot] == expert
+                if bool(mask.any()):
+                    output[mask] += weights[mask, slot].unsqueeze(1) * self._expert(
+                        flat[mask], expert
+                    )
+        return output.reshape(*x.shape)
+
+
+@pytest.mark.parametrize(
+    "factor_calibration", ["shortlist", "topk_g2", "topk_uniform"]
+)
+def test_streaming_trace_builds_exactly_the_factors_deployment_loads(
+    monkeypatch, factor_calibration
+):
+    module = _ToyTopTwoMoe()
+    generator = torch.Generator().manual_seed(11)
+    hidden = torch.randn(60, 4, generator=generator)
+    gate_moments = torch.rand(5, 4, generator=generator) + 0.1
+    up_moments = torch.rand(5, 4, generator=generator) + 0.1
+    built = {}
+    real_builder = _planner.build_deployed_expert_factors
+
+    def recording_builder(*args, **kwargs):
+        factors, flags = real_builder(*args, **kwargs)
+        built[int(kwargs["expert_id"])] = factors
+        return factors, flags
+
+    monkeypatch.setattr(_planner, "build_deployed_expert_factors", recording_builder)
+    _planner._build_layer_streaming_trace(
+        module,
+        "toy",
+        hidden,
+        torch.zeros(60, dtype=torch.long),
+        ("coding",),
+        gate_moments,
+        up_moments,
+        [(2, 2)],
+        ("removed", "gu2_down2", "full"),
+        torch.tensor([0, 22, 36]),
+        device="cpu",
+        routing_batch_size=16,
+        router_candidates=3,
+        randomized=False,
+        scale_floor=1e-12,
+        occupancy_alpha=1.0,
+        seed=0,
+        factor_calibration=factor_calibration,
+    )
+    assert sorted(built) == list(range(5))
+    for expert, factors in built.items():
+        state = Qwen3MoeRoutedFunctionalSVDSubsetBlock.build_factor_state(
+            module,
+            tier_specs=[([expert], 2, 2)],
+            gate_moments=gate_moments,
+            up_moments=up_moments,
+            down_moments=torch.ones(5, 3),
+            calibration_hidden=hidden,
+            router_candidates=3,
+            routing_batch_size=16,
+            randomized=False,
+            layer_seed=0,
+            factor_calibration=factor_calibration,
+        )
+        for key, value in factors.items():
+            assert torch.equal(state["tiers"][0][key][0], value), (expert, key)
+
+
+def test_factor_calibration_scope_keeps_shortlist_traces_reusable():
+    scope = _planner._factor_calibration_scope
+    assert scope("streaming", "diagonal") == "router_top_l_all_tokens_v1"
+    assert (
+        scope("streaming", "diagonal", factor_calibration="shortlist")
+        == "router_top_l_all_tokens_v1"
+    )
+    assert (
+        scope("streaming", "diagonal", factor_calibration="topk_g2")
+        == "router_topk_g2_tokens_v1"
+    )
+    assert (
+        scope("streaming", "gram", "layer", True, factor_calibration="topk_uniform")
+        == "router_topk_uniform_tokens_gram_layer_v4_downcomp"
+    )
+    assert scope("projected", "diagonal", factor_calibration="topk_g2") is None
+
+
+def test_saved_factor_artifact_calibrates_on_the_plans_retained_routing(
+    monkeypatch, tmp_path
+):
+    import json
+    import types
+
+    module = _ToyTopTwoMoe()
+    hidden = torch.randn(60, 4, generator=torch.Generator().manual_seed(5))
+    monkeypatch.setattr(_planner, "_load_hidden_cache", lambda metadata, name: hidden)
+    monkeypatch.setattr(
+        _planner, "_select_hidden_rows_without_full_copy", lambda rows, row_ids: rows
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}")
+    # expert 0 full, 1 and 2 tiered, 3 and 4 removed
+    actions = torch.tensor([2, 1, 1, 0, 0])
+    moments = dict(
+        gate_moments={"toy": torch.ones(5, 4)},
+        up_moments={"toy": torch.ones(5, 4)},
+        down_moments={"toy": torch.ones(5, 3)},
+    )
+    _planner._save_selected_factor_artifact(
+        output_dir=str(tmp_path / "factors"),
+        plan_path=str(plan_path),
+        plan=types.SimpleNamespace(actions={"toy": actions}),
+        traces=[types.SimpleNamespace(name="toy")],
+        global_ids={"toy": torch.arange(5)},
+        modules={"toy": module},
+        hidden_metadata={},
+        row_ids=torch.arange(60),
+        rank_pairs=[(2, 2)],
+        router_candidates=3,
+        routing_batch_size=16,
+        scale_floor=1e-12,
+        randomized=False,
+        seed=0,
+        gram_metric=False,
+        gram_shrink_mode="diagonal",
+        down_compensation=False,
+        factor_calibration="topk_g2",
+        **moments,
+    )
+    metadata = json.loads((tmp_path / "factors" / "metadata.json").read_text())
+    saved = torch.load(
+        tmp_path / "factors" / metadata["layers"]["toy"], weights_only=False
+    )
+    build = dict(
+        tier_specs=[([1, 2], 2, 2)],
+        gate_moments=moments["gate_moments"]["toy"],
+        up_moments=moments["up_moments"]["toy"],
+        down_moments=moments["down_moments"]["toy"],
+        calibration_hidden=hidden,
+        router_candidates=3,
+        routing_batch_size=16,
+        randomized=False,
+        layer_seed=0,
+        factor_calibration="topk_g2",
+    )
+    retained = Qwen3MoeRoutedFunctionalSVDSubsetBlock.build_factor_state(
+        module, retained_ids=[0, 1, 2], **build
+    )
+    unrouted = Qwen3MoeRoutedFunctionalSVDSubsetBlock.build_factor_state(
+        module, **build
+    )
+    keys = [key for key in saved["tiers"][0] if key.endswith("_factor")]
+    assert keys
+    for key in keys:
+        assert torch.equal(saved["tiers"][0][key], retained["tiers"][0][key]), key
+    assert not all(
+        torch.equal(saved["tiers"][0][key], unrouted["tiers"][0][key]) for key in keys
+    )
+
+
+def _energy_and_amplitude_traces(monkeypatch):
+    module = _ToyTopTwoMoe()
+    generator = torch.Generator().manual_seed(21)
+    hidden = torch.randn(60, 4, generator=generator)
+    moments = torch.rand(5, 4, generator=generator) + 0.1
+    built = {}
+    real_builder = _planner.build_deployed_expert_factors
+
+    def recording_builder(*args, **kwargs):
+        factors, flags = real_builder(*args, **kwargs)
+        built[int(kwargs["expert_id"])] = factors
+        return factors, flags
+
+    monkeypatch.setattr(_planner, "build_deployed_expert_factors", recording_builder)
+    positional = (
+        module, "toy", hidden, torch.zeros(60, dtype=torch.long), ("coding",),
+        moments, moments, [(2, 2)], ("removed", "gu2_down2", "full"),
+        torch.tensor([0, 22, 36]),
+    )
+    options = dict(
+        device="cpu", routing_batch_size=16, router_candidates=3,
+        randomized=False, scale_floor=1e-12, occupancy_alpha=1.0, seed=0,
+        factor_calibration="topk_g2",
+    )
+    energy, _, _, _ = _planner._build_layer_streaming_trace(*positional, **options)
+    amplitude, _, _, _ = _planner._build_layer_streaming_trace(
+        *positional, damage_unit="amplitude", **options
+    )
+    return module, hidden, built, energy, amplitude
+
+
+@torch.no_grad()
+def test_amplitude_trace_prices_norms_where_energy_prices_squared_norms(monkeypatch):
+    module, hidden, built, energy, amplitude = _energy_and_amplitude_traces(
+        monkeypatch
+    )
+    assert (energy.damage_unit, amplitude.damage_unit) == ("energy", "amplitude")
+    close = dict(rtol=1e-4, atol=1e-8)
+    reference = module(hidden.unsqueeze(0)).reshape_as(hidden)
+    torch.testing.assert_close(
+        energy.reference_energy[0], reference.square().sum().double(), **close
+    )
+    torch.testing.assert_close(
+        amplitude.reference_energy[0], reference.norm(dim=1).sum().double(), **close
+    )
+    logits = F.linear(hidden, module.router_weights)
+    values, ids = torch.topk(logits, k=2, dim=-1)
+    routing = F.softmax(values, dim=-1)
+    for expert in range(5):
+        tokens, slots = (ids == expert).nonzero(as_tuple=True)
+        x = hidden[tokens]
+        compressed, _ = apply_deployed_expert_factors(x, built[expert])
+        routed_error = routing[tokens, slots].unsqueeze(1) * (
+            compressed.float() - module._expert(x, expert)
+        )
+        torch.testing.assert_close(
+            energy.raw_action_numerator[expert, 1, 0],
+            routed_error.square().sum().double(), **close,
+        )
+        torch.testing.assert_close(
+            amplitude.raw_action_numerator[expert, 1, 0],
+            routed_error.norm(dim=1).sum().double(), **close,
+        )
+        # Removal: the token's top-2 among the other experts, renormalized.
+        masked = logits[tokens].clone()
+        masked[:, expert] = -torch.inf
+        kept_values, kept_ids = torch.topk(masked, k=2, dim=-1)
+        kept_weights = F.softmax(kept_values, dim=-1)
+        rerouted = torch.stack([
+            sum(
+                kept_weights[row, slot]
+                * module._expert(x[row : row + 1], int(kept_ids[row, slot]))[0]
+                for slot in range(2)
+            )
+            for row in range(int(tokens.numel()))
+        ])
+        removal = rerouted - reference[tokens]
+        torch.testing.assert_close(
+            energy.raw_action_numerator[expert, 0, 0],
+            removal.square().sum().double(), **close,
+        )
+        torch.testing.assert_close(
+            amplitude.raw_action_numerator[expert, 0, 0],
+            removal.norm(dim=1).sum().double(), **close,
+        )
+    restored = _planner.LayerIndependentActionTrace.from_state_dict(
+        amplitude.state_dict()
+    )
+    assert restored.damage_unit == "amplitude"
+
+
+def test_distortion_risk_keeps_amplitude_units_and_refuses_mixing(monkeypatch):
+    from specdecodes.models.utils.moe.base.routed_functional_compression import (
+        build_distortion_risk_traces,
+    )
+
+    _, _, _, energy, amplitude = _energy_and_amplitude_traces(monkeypatch)
+    _, diagnostics = build_distortion_risk_traces([amplitude], tail_fraction=0.01)
+    torch.testing.assert_close(
+        diagnostics["toy"]["structural_relative_action_error"],
+        amplitude.structural_action_error.sqrt(),
+    )
+    with pytest.raises(ValueError, match="already an amplitude"):
+        build_distortion_risk_traces(
+            [amplitude], tail_fraction=0.01, margin_proxy_weight=0.5
+        )
+    with pytest.raises(ValueError, match="one damage_unit"):
+        build_distortion_risk_traces([energy, amplitude], tail_fraction=0.01)
+
+
+def test_absolute_damage_rescales_each_layer_by_its_mean_output(monkeypatch):
+    from specdecodes.models.utils.moe.base.routed_functional_compression import (
+        build_distortion_risk_traces,
+    )
+
+    _, _, _, _, amplitude = _energy_and_amplitude_traces(monkeypatch)
+    relative, _ = build_distortion_risk_traces([amplitude], tail_fraction=0.01)
+    absolute, _ = build_distortion_risk_traces(
+        [amplitude], tail_fraction=0.01, damage_reference="none"
+    )
+    category_tokens = (
+        amplitude.active_token_count.double().sum(dim=0) / amplitude.top_k
+    ).clamp_min(1.0)
+    mean_output = amplitude.reference_energy / category_tokens
+    torch.testing.assert_close(
+        absolute[0].action_numerator,
+        relative[0].action_numerator * mean_output.reshape(1, 1, -1),
+        rtol=1e-9,
+        atol=1e-15,
+    )
+    with pytest.raises(ValueError, match="damage_reference"):
+        build_distortion_risk_traces(
+            [amplitude], tail_fraction=0.01, damage_reference="bogus"
+        )
+
+
+def test_mean_loss_prices_average_loss_per_activation(monkeypatch):
+    from specdecodes.models.utils.moe.base.routed_functional_compression import (
+        build_mean_loss_traces,
+    )
+
+    _, _, _, _, amplitude = _energy_and_amplitude_traces(monkeypatch)
+    factors = {"toy": {"svd": torch.tensor([2.0]), "remove": torch.tensor([3.0])}}
+    converted, diagnostics = build_mean_loss_traces(
+        [amplitude], propagation_factors=factors
+    )
+    active = amplitude.active_token_count.double()
+    category_tokens = (active.sum(dim=0) / amplitude.top_k).clamp_min(1.0)
+    reference = amplitude.reference_energy / category_tokens
+    expected = amplitude.raw_action_numerator / (
+        active.clamp_min(1.0) * reference
+    ).unsqueeze(1)
+    expected[:, -1, :] = 0.0
+    torch.testing.assert_close(diagnostics["toy"]["mean_loss"], expected)
+    price = converted[0].action_numerator
+    torch.testing.assert_close(price[:, 0], 3.0 * expected[:, 0])
+    torch.testing.assert_close(
+        price[:, 1], torch.minimum(2.0 * expected[:, 1], price[:, 0])
+    )
+    assert bool((price[:, -1] == 0).all())
+    assert converted[0].damage_unit == "amplitude"
+
+    _, absolute = build_mean_loss_traces([amplitude], damage_reference="none")
+    torch.testing.assert_close(
+        absolute["toy"]["mean_loss"][:, :-1],
+        (amplitude.raw_action_numerator / active.clamp_min(1.0).unsqueeze(1))[:, :-1],
+    )
+
+
+def test_mean_loss_keeps_a_rare_expert_that_loses_a_lot_when_it_fires():
+    from specdecodes.models.utils.moe.base.routed_functional_compression import (
+        LayerIndependentActionTrace,
+        build_mean_loss_traces,
+    )
+
+    numerator = torch.zeros(2, 3, 1, dtype=torch.float64)
+    numerator[0, :2, 0] = torch.tensor([5.0, 4.0])      # 1 token, 5.0 lost
+    numerator[1, :2, 0] = torch.tensor([100.0, 80.0])   # 100 tokens, 1.0 each
+    trace = LayerIndependentActionTrace(
+        name="rare",
+        action_numerator=numerator,
+        active_token_count=torch.tensor([[1], [100]]),
+        reference_energy=torch.tensor([101.0], dtype=torch.float64),
+        category_names=("coding",),
+        action_costs=torch.tensor([[0, 22, 36], [0, 22, 36]]),
+        action_names=("removed", "gu2_down2", "full"),
+        top_k=1,
+    )
+    converted, _ = build_mean_loss_traces([trace])
+    price = converted[0].action_numerator[:, :, 0]
+    # Summed exposure would protect the frequent expert (100 vs 5); the mean
+    # per activation protects the one that loses more each time it fires.
+    assert float(price[0, 0]) > float(price[1, 0])
+
+
+
+def test_mean_loss_frequency_power_prices_busy_experts_higher():
+    """alpha=0 must stay bit-identical; alpha>0 must scale by activation count."""
+
+    import torch
+    from specdecodes.models.utils.moe.base.routed_functional_compression import (
+        build_mean_loss_traces,
+    )
+
+    # two experts, identical per-activation damage, 10x different traffic
+    actions, categories = 3, 1
+    active = torch.tensor([[100.0], [1000.0]])
+    raw = torch.zeros(2, actions, categories)
+    raw[:, 0, 0] = torch.tensor([100.0, 1000.0])   # same damage PER ACTIVATION
+    raw[:, 1, 0] = torch.tensor([50.0, 500.0])
+    trace = LayerIndependentActionTrace(
+        name="model.layers.0.mlp",
+        action_numerator=raw.clone(),
+        raw_action_numerator=raw.clone(),
+        reference_energy=torch.tensor([1100.0]),
+        category_names=["coding"],
+        action_costs=torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long),
+        action_names=["removed", "tier", "full"],
+        top_k=1,
+        active_token_count=active,
+        damage_unit="amplitude",
+    )
+    base, diag0 = build_mean_loss_traces([trace], frequency_power=0.0)
+    quiet0, busy0 = diag0["model.layers.0.mlp"]["mean_loss"][:, 0, 0].tolist()
+    assert abs(quiet0 - busy0) < 1e-9, (quiet0, busy0)
+
+    _, diag1 = build_mean_loss_traces([trace], frequency_power=1.0)
+    quiet1, busy1 = diag1["model.layers.0.mlp"]["mean_loss"][:, 0, 0].tolist()
+    # 100 and 1000 activations around a mean of 550 -> ratio is exactly 10x
+    assert busy1 / quiet1 == pytest.approx(10.0), (quiet1, busy1)
+    # and the geometric middle is unchanged in aggregate scale
+    assert quiet1 < quiet0 < busy1
+
+    _, diag_half = build_mean_loss_traces([trace], frequency_power=0.5)
+    q, b = diag_half["model.layers.0.mlp"]["mean_loss"][:, 0, 0].tolist()
+    assert b / q == pytest.approx(10.0 ** 0.5)
+
+
+def test_mean_loss_frequency_power_zero_is_bit_identical():
+    import torch
+    from specdecodes.models.utils.moe.base.routed_functional_compression import (
+        build_mean_loss_traces,
+    )
+
+    active = torch.tensor([[7.0], [913.0], [55.0]])
+    raw = torch.rand(3, 4, 1) * 10
+    trace = LayerIndependentActionTrace(
+        name="model.layers.3.mlp",
+        action_numerator=raw.clone(),
+        raw_action_numerator=raw.clone(),
+        reference_energy=torch.tensor([321.0]),
+        category_names=["coding"],
+        action_costs=torch.tensor([[0, 1, 2, 3]] * 3, dtype=torch.long),
+        action_names=["removed", "a", "b", "full"],
+        top_k=2,
+        active_token_count=active,
+        damage_unit="amplitude",
+    )
+    default, _ = build_mean_loss_traces([trace])
+    explicit, _ = build_mean_loss_traces([trace], frequency_power=0.0)
+    assert torch.equal(default[0].raw_action_numerator, explicit[0].raw_action_numerator)
+
+
+def test_mean_loss_tier_price_scale_is_per_layer_and_per_tier():
+    """Scales multiply each tier's price on top of eta; unlisted layers keep 1."""
+
+    from specdecodes.models.utils.moe.base.routed_functional_compression import (
+        build_mean_loss_traces,
+    )
+
+    active = torch.tensor([[10.0], [20.0]])
+    raw = torch.zeros(2, 4, 1, dtype=torch.float64)
+    raw[:, 0, 0] = torch.tensor([100.0, 200.0])   # removal: 10 per activation
+    raw[:, 1, 0] = torch.tensor([40.0, 80.0])     # cheap tier: 4
+    raw[:, 2, 0] = torch.tensor([20.0, 40.0])     # dear tier: 2
+
+    def trace(name):
+        return LayerIndependentActionTrace(
+            name=name,
+            action_numerator=raw.clone(),
+            raw_action_numerator=raw.clone(),
+            reference_energy=torch.tensor([30.0]),
+            category_names=["coding"],
+            action_costs=torch.tensor([[0, 1, 2, 3]] * 2, dtype=torch.long),
+            action_names=["removed", "t1", "t2", "full"],
+            top_k=1,
+            active_token_count=active,
+            damage_unit="amplitude",
+        )
+
+    layers = [trace("a"), trace("b")]
+    base, _ = build_mean_loss_traces(layers, tier_price=1.3)
+    scaled, _ = build_mean_loss_traces(
+        layers, tier_price=1.3, tier_price_scale={"a": [0.5, 0.25]}
+    )
+    pa, pa0 = scaled[0].action_numerator, base[0].action_numerator
+    torch.testing.assert_close(pa[:, 0], pa0[:, 0])            # removal untouched
+    torch.testing.assert_close(pa[:, 1], 0.5 * pa0[:, 1])
+    torch.testing.assert_close(pa[:, 2], 0.25 * pa0[:, 2])
+    assert torch.equal(scaled[1].action_numerator, base[1].action_numerator)
+
+    unit, _ = build_mean_loss_traces(layers, tier_price_scale={"a": [1.0, 1.0]})
+    plain, _ = build_mean_loss_traces(layers)
+    assert torch.equal(unit[0].action_numerator, plain[0].action_numerator)
+
+    with pytest.raises(ValueError, match="tier_price_scale"):
+        build_mean_loss_traces(layers, tier_price_scale={"a": [1.0]})
+    with pytest.raises(ValueError, match="tier_price_scale"):
+        build_mean_loss_traces(layers, tier_price_scale={"a": [1.0, 0.0]})
+
+
+def test_greedy_layer_min_memory_ratio_protects_named_layer():
+    from specdecodes.models.utils.moe.base.routed_functional_compression import (
+        cached_greedy_global_downgrade,
+    )
+
+    def trace(name):
+        numerator = torch.zeros(4, 2, 1, dtype=torch.float64)
+        numerator[:, 0, 0] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        return LayerIndependentActionTrace(
+            name=name,
+            action_numerator=numerator,
+            reference_energy=torch.tensor([10.0], dtype=torch.float64),
+            category_names=("coding",),
+            action_costs=torch.tensor([[0, 5]] * 4),
+            action_names=("removed", "full"),
+            top_k=1,
+        )
+
+    layers = [trace("model.layers.0.mlp"), trace("model.layers.1.mlp")]
+    # Each layer must keep top_k = 1 expert, so 25 is the tightest budget
+    # that leaves layer 1 whole (20) plus one expert (5) in layer 0.
+    plain = cached_greedy_global_downgrade(layers, memory_budget=25)
+    protected = cached_greedy_global_downgrade(
+        layers, memory_budget=25, layer_min_memory_ratio={"model.layers.1.mlp": 1.0}
+    )
+    assert int((plain.actions["model.layers.1.mlp"] == 1).sum()) < 4
+    assert bool((protected.actions["model.layers.1.mlp"] == 1).all())
+    assert int((protected.actions["model.layers.0.mlp"] == 1).sum()) == 1
+    with pytest.raises(ValueError, match="unknown layers"):
+        cached_greedy_global_downgrade(layers, memory_budget=25, layer_min_memory_ratio={"x": 1.0})

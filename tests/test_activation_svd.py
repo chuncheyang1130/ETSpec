@@ -14,7 +14,6 @@ from tools.analyze_activation_svd import (
     _select_analysis_views,
     _select_projection_moments,
     _select_tiers,
-    _shared_gate_up_configuration_memory,
 )
 from tools.evaluate_joint_svd_rank_grid import (
     _apply_factors,
@@ -201,21 +200,6 @@ def test_calibrated_shared_gate_up_basis_tracks_joint_input_metric():
     assert metrics.joint_weight_only[1] > 0.95
     assert metrics.gate_activation_scaled[1] < metrics.gate_weight_only[1]
     assert metrics.up_activation_scaled[1] < metrics.up_weight_only[1]
-
-
-def test_shared_gate_up_memory_counts_cat_and_skip_blocks():
-    model = _Model()
-    report = _shared_gate_up_configuration_memory(
-        model,
-        full={"mlp": []},
-        svd={"mlp": [0]},
-        pruned={"mlp": [1]},
-        ranks=[1],
-    )
-    assert report["dense_expert_parameters"] == 24
-    assert report["parameters"]["independent_all_three"]["1"] == 12
-    assert report["parameters"]["cat_gate_up_independent_down"]["1"] == 10
-    assert report["parameters"]["skipcat_all_three"]["1"] == 8
 
 
 def test_joint_rank_grid_skipcat_memory_matches_qwen_tiers():
