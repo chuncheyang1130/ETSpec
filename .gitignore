@@ -1,6 +1,8 @@
 *.nsys-rep
 expert_activation/
 logs/
+figs/
+paper/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
