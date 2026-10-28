@@ -27,6 +27,7 @@ from tqdm.auto import tqdm
 
 from .qwen3_moe_stacked import Qwen3MoeStackedBlock, _is_qwen3_moe_block
 from .expert_usage_tracker import _set_module_by_name
+from .gemma4_adapter import prepare_moe_blocks
 
 
 def _hf_moe_block_names(model: nn.Module):
@@ -36,7 +37,9 @@ def _hf_moe_block_names(model: nn.Module):
     original expert block while replacements are being constructed.  Paths are
     sufficient to avoid mutating ``named_modules()`` during traversal, and let each
     source block become collectible immediately after its layer is replaced.
+    Architectures without an MoE module (Gemma 4) get one first.
     """
+    prepare_moe_blocks(model)
     return [name for name, module in model.named_modules() if _is_qwen3_moe_block(module)]
 
 

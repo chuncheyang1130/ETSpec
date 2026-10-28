@@ -26,21 +26,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .grouped_moe import GroupedMoEForward
-from .triton_fused_gate_up_gmm_silu import triton_fused_gate_up_gmm_silu
+from .triton_fused_gate_up_gmm_silu import activation_code, triton_fused_gate_up_gmm_silu
 from .triton_fused_down_gmm_reduction import triton_fused_down_gmm_reduction
+from .moe_arch import (
+    _HF_BLOCKS, describe_moe_block, is_moe_block, router_weight, topk_routing,
+)
 
 
 from typing import Optional
 
 def _is_qwen3_moe_block(module: nn.Module) -> bool:
-    """Heuristic check for `Qwen3MoeSparseMoeBlock` without importing transformers."""
-    return (
-        module.__class__.__name__ == "Qwen3MoeSparseMoeBlock"
-        and hasattr(module, "experts")
-        and hasattr(module, "gate")
-        and hasattr(module, "num_experts")
-        and hasattr(module, "top_k")
-    )
+    """True for an unrestructured MoE block (HF Qwen3-MoE or the Gemma 4 adapter)."""
+    return is_moe_block(module) and module.__class__.__name__ in _HF_BLOCKS
 
 def get_grouped_matmul_metadata(topk_indices: torch.Tensor, num_experts: int):
     """
@@ -110,6 +107,7 @@ class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
         top_k: int,
         norm_topk_prob: bool,
         *,
+        activation: str = "silu",
         kept: Optional[int] = None,
         sig_mode: str = "l1",
         owns_store: bool = True,
@@ -123,6 +121,9 @@ class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
         self.norm_topk_prob = bool(norm_topk_prob)
+        # Expert nonlinearity (moe_arch.SILU / GELU_TANH); carried to the hybrid block.
+        self.activation = str(activation)
+        self._act = activation_code(self.activation)
         if not (0 < self.top_k <= self.num_experts):
             raise ValueError(
                 f"top_k ({self.top_k}) must be in (0, num_experts={self.num_experts}]."
@@ -177,8 +178,9 @@ class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
         # ============================================
         sample_w = hf_block.experts[0].gate_proj.weight
         target_device, target_dtype = sample_w.device, sample_w.dtype
-        hidden_size, intermediate_size = sample_w.shape[1], sample_w.shape[0]
-        num_experts, top_k, norm_topk_prob = hf_block.num_experts, hf_block.top_k, hf_block.norm_topk_prob
+        spec = describe_moe_block(hf_block)
+        hidden_size, intermediate_size = spec.hidden_size, spec.intermediate_size
+        num_experts, top_k, norm_topk_prob = spec.num_experts, spec.top_k, spec.norm_topk_prob
 
         block = cls(
             hidden_size=hidden_size,
@@ -186,6 +188,7 @@ class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
             num_experts=num_experts,
             top_k=top_k,
             norm_topk_prob=norm_topk_prob,
+            activation=spec.activation,
             sig_mode=sig_mode,
             owns_store=True,
         ).to(device=target_device, dtype=target_dtype)
@@ -195,15 +198,12 @@ class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
             # ================================================
             # 1. Register router weights: HF uses `.gate` (a Linear); some forks expose `.router`. Take whichever exists.
             # ================================================
-            router_module = getattr(hf_block, "gate", None) or getattr(hf_block, "router", None)
-            if router_module is None:
-                raise AttributeError(
-                    "hf_block exposes neither .gate nor .router for the MoE router."
-                )
             block.register_buffer(
                 "router_weights",
-                router_module.weight.detach().clone().to(device=target_device, dtype=target_dtype),
+                router_weight(hf_block).detach().clone().to(
+                    device=target_device, dtype=target_dtype),
             )
+
 
             # ================================================
             # 2-1. Build gate stacked weights: [E, IM, H]
@@ -397,36 +397,28 @@ class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
             # Map local kept slots back to global ids only after top-k. This preserves
             # the stacked full-store indexing used by the GMM kernels.
             kept_router = self.router_weights.index_select(0, self.selected_expert_ids)
-            kept_logits = F.linear(x, kept_router)                          # [T, kept]
-            kept_vals, topk_slot = torch.topk(
-                kept_logits.to(torch.float32), k=self.top_k, dim=-1
+            kept_logits = F.linear(x, kept_router).to(torch.float32)         # [T, kept]
+            topk_w, topk_slot = topk_routing(
+                kept_logits, self.top_k, norm_topk_prob=self.norm_topk_prob,
             )
-            if self.norm_topk_prob:
-                topk_w = F.softmax(kept_vals, dim=-1).to(x.dtype)
-            else:
-                kept_probs = F.softmax(kept_logits, dim=-1)
-                topk_w = torch.gather(kept_probs, -1, topk_slot).to(x.dtype)
-            topk_eid = self.selected_expert_ids[topk_slot]
-            return topk_w, topk_eid
+            return topk_w.to(x.dtype), self.selected_expert_ids[topk_slot]
 
-        all_logits = F.linear(x, self.router_weights)                       # [T, E]
-        topk_vals, topk_idx = torch.topk(all_logits.to(torch.float32), k=self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            topk_probs = F.softmax(topk_vals, dim=-1).to(x.dtype)           # [T, top_k] sums to 1
-        else:
-            topk_probs = torch.gather(F.softmax(all_logits, dim=-1), -1, topk_idx).to(x.dtype)
-
-        return topk_probs, topk_idx                                         # full: global ids directly
+        all_logits = F.linear(x, self.router_weights).to(torch.float32)      # [T, E]
+        topk_probs, topk_idx = topk_routing(
+            all_logits, self.top_k, norm_topk_prob=self.norm_topk_prob,
+        )
+        return topk_probs.to(x.dtype), topk_idx                              # full: global ids directly
 
     def _grouped_matmul_metadata(self, topk_eid: torch.Tensor):
         """Sort tokens by expert for the GMM kernels (active experts only)."""
         return get_grouped_matmul_metadata(topk_eid, self.num_experts)
 
     def _gmm_gate_up_silu(self, x_flat, active_experts, token_offsets, sorted_token_ids, k):
-        """Fused gate+up+SiLU grouped matmul -> [T*k, IM]."""
+        """Fused gate+up+act grouped matmul -> [T*k, IM] (SiLU unless `self.activation`)."""
         return triton_fused_gate_up_gmm_silu(
             x_flat, self.gate_proj_stacked, self.up_proj_stacked,
             active_experts, token_offsets, sorted_token_ids, top_k=k,
+            act=getattr(self, "_act", 0),
         )
 
     def _gmm_down_reduce(self, interm, active_experts, token_offsets, sorted_token_ids,

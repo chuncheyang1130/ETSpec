@@ -14,6 +14,11 @@ class AppConfig:
     
     # Model paths
     llm_path: str = "meta-llama/Llama-3.1-8B-Instruct"
+    # Token that actually ends an assistant turn. Defaults to the
+    # tokenizer's own `eos_token`, which is right for Qwen3/Llama. Gemma 4
+    # reports `<eos>` there, but its chat template closes assistant turns
+    # with `<turn|>` -- so without this override nothing ever stops.
+    eos_token: Optional[str] = None
     draft_model_path: Optional[str] = None
     
     # Generation parameters
@@ -36,6 +41,12 @@ class AppConfig:
     cache_implementation: Union[str, Dict[str, Optional[str]]] = "dynamic"
     warmup_iter: int = 0
     compile_mode: Optional[Union[str, Dict[str, Optional[str]]]] = None
+    # torch.compile `dynamic` for the target model. False (default) specializes every
+    # Python int -- right for Qwen3, whose static caches report positions as
+    # tensors. Gemma 4's sliding-window cache layers report an int that changes every
+    # token (transformers >= 5), so they need None: compile once specialized, then once
+    # generic, instead of recompiling per token until the recompile limit.
+    compile_dynamic: Optional[bool] = False
     
     # Profiling
     generator_profiling: bool = True

@@ -1,0 +1,21 @@
+# ===========================================================================
+#  gemma4_ours_coding -- every budget for this method x domain (b75/b50/b20).
+#    --budget N  integer percent   --eta X  tier price   --k N  min kept/layer
+#  eta comes from the last-action-cheapest rule on Gemma's own prices (computed
+#  before any benchmark, recorded in GEMMA4_PORT.md); k = 51 = 0.4 x 128, as Qwen3.
+#  Moments and plans live in ./expert_activation; the hidden-state cache is
+#  node-local (/tmp/scott306lr_g4/ea), regenerable from the sequences.
+# ===========================================================================
+extends: gemma4_moe_routed_svd.yaml
+recipe:
+  kwargs:
+    moments_path: ./expert_activation/gemma4_activation_svd_coding256_allproj.moments.pt
+    category: coding
+    hidden_cache_dir: /tmp/scott306lr_g4/ea/gemma4_routed_functional_coding256.hidden_states
+
+default_variant: plan
+plan_defaults:
+  eta: RULE   # set from the eta* computation before benchmarking; pass --eta until then
+  k: 51
+plan_variants:
+  plan: ./expert_activation/gemma4_plan_128-256-384_coding256_eta{eta}_k{k}_b{budget}.json

@@ -31,7 +31,7 @@ import triton
 import triton.language as tl
 
 from .triton_fused_down_gmm_reduction import _fused_down_gmm_reduction
-from .triton_fused_gate_up_gmm_silu import _fused_gate_up_gmm_silu
+from .triton_fused_gate_up_gmm_silu import ACT_SILU, _fused_gate_up_gmm_silu, glu_activation
 
 LIB_NAME = "expspec"
 
@@ -121,8 +121,9 @@ def fused_gate_up_gmm_silu_store(
     token_offsets: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     top_k: int,
+    act: int = ACT_SILU,
 ) -> None:
-    """Write the exact experts' rows of the shared SwiGLU intermediate."""
+    """Write the exact experts' rows of the shared gated intermediate (SiLU unless `act`)."""
 
     T, H = map(int, x.shape)
     _, IM, _ = map(int, w_gate.shape)
@@ -142,14 +143,14 @@ def fused_gate_up_gmm_silu_store(
         w_gate.stride(0), w_gate.stride(1), w_gate.stride(2),
         w_up.stride(0), w_up.stride(1), w_up.stride(2),
         out.stride(0), out.stride(1),
-        BLOCK_T=BLOCK_T, BLOCK_IM=BLOCK_IM, BLOCK_H=BLOCK_H,
+        BLOCK_T=BLOCK_T, BLOCK_IM=BLOCK_IM, BLOCK_H=BLOCK_H, ACT=int(act),
     )
 
 
 @fused_gate_up_gmm_silu_store.register_fake
 def _fused_gate_up_gmm_silu_store_fake(
     out, x, w_gate, w_up, active_experts, token_offsets, sorted_token_ids,
-    top_k: int,
+    top_k: int, act: int = ACT_SILU,
 ) -> None:
     return None
 
@@ -383,6 +384,7 @@ def _fused_ragged_gate_up_gmm_silu_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ACT: tl.constexpr,
 ):
     expert = tl.program_id(0)
     block_m = tl.program_id(1)
@@ -419,7 +421,7 @@ def _fused_ragged_gate_up_gmm_silu_kernel(
         up = tl.load(up_ptr + offsets, mask=weight_mask, other=0.0)
         acc_gate += tl.dot(latent, gate).to(tl.float32)
         acc_up += tl.dot(latent, up).to(tl.float32)
-    value = (acc_gate * tl.sigmoid(acc_gate)) * acc_up
+    value = glu_activation(acc_gate, acc_up, ACT)
     tl.store(
         out_ptr + positions[:, None] * stride_out_row
         + output_ids[None, :] * stride_out_col,
@@ -442,8 +444,9 @@ def fused_ragged_gate_up_gmm_silu_store(
     tokens: int,
     expert_offset: int,
     max_rank: int,
+    act: int = ACT_SILU,
 ) -> None:
-    """Write every low-rank expert's rows of the shared SwiGLU intermediate."""
+    """Write every low-rank expert's rows of the shared gated intermediate (SiLU unless `act`)."""
 
     assignments = int(latent.shape[0])
     experts = int(ranks.numel())
@@ -466,6 +469,7 @@ def fused_ragged_gate_up_gmm_silu_store(
         EXPERT_OFFSET=int(expert_offset), INTERMEDIATE=intermediate,
         BASE_ALIGN=_base_alignment(intermediate),
         BLOCK_M=block_m, BLOCK_N=_GATE_UP_TILE["BLOCK_N"], BLOCK_K=block_k,
+        ACT=int(act),
         num_warps=num_warps,
         num_stages=_GATE_UP_TILE["num_stages"],
     )
@@ -474,7 +478,7 @@ def fused_ragged_gate_up_gmm_silu_store(
 @fused_ragged_gate_up_gmm_silu_store.register_fake
 def _fused_ragged_gate_up_gmm_silu_store_fake(
     out, latent, gate_factors, up_factors, factor_base, ranks, token_offsets,
-    tokens: int, expert_offset: int, max_rank: int,
+    tokens: int, expert_offset: int, max_rank: int, act: int = ACT_SILU,
 ) -> None:
     return None
 
@@ -664,6 +668,7 @@ def hybrid_moe_experts_overlapped(
     max_down_rank: int,
     tokens: int,
     assignments: int,
+    act: int = ACT_SILU,
 ) -> torch.Tensor:
     """Both expert stages, with the low-rank chain on a second stream."""
 
@@ -687,11 +692,11 @@ def hybrid_moe_experts_overlapped(
         fused_ragged_gate_up_gmm_silu_store(
             intermediate, latent, gate_output_store, up_output_store,
             gu_output_base, gate_up_ranks, token_offsets, tokens, full_experts,
-            max_gate_up_rank,
+            max_gate_up_rank, act,
         )
     fused_gate_up_gmm_silu_store(
         intermediate, flat, full_gate, full_up, full_active_slots,
-        token_offsets, sorted_token_ids, top_k,
+        token_offsets, sorted_token_ids, top_k, act,
     )
     main.wait_stream(side)
 
@@ -734,5 +739,6 @@ def _hybrid_moe_experts_overlapped_fake(
     down_output_store, down_output_base,
     top_k: int, full_experts: int, hidden_size: int, intermediate_size: int,
     max_gate_up_rank: int, max_down_rank: int, tokens: int, assignments: int,
+    act: int = ACT_SILU,
 ) -> torch.Tensor:
     return flat.new_empty((tokens, hidden_size), dtype=torch.float32)

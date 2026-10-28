@@ -1,0 +1,46 @@
+# ===========================================================================
+#  Shared base for the Gemma 4 26B-A4B-it arm (needs transformers >= 5.5, the
+#  first release with Gemma 4). Mirrors moe_routed_svd.yaml (Qwen3) and differs
+#  only where the architecture forces it:
+#
+#  * Gemma 4 has no MoE module: router + fused experts sit on the decoder
+#    layer. `gemma4_adapter.install_gemma4_moe_adapter` (run by the
+#    restructurer) gives each layer a Qwen3-shaped `moe_block`; the router's
+#    input norm and per_expert_scale are folded in exactly.
+#  * 128 routed experts, top-8, softmax + renorm (Qwen3's routing), NO shared
+#    experts -- but a dense MLP runs beside the MoE in every layer and is never
+#    touched. Experts use GeLU-tanh, carried through the kernels as ACT=1.
+#  * Rank ladder 128/256/384 (per-domain configs): the cost-fraction rule
+#    (r* = 3IH/(3I+2H) = 768, 64-grid) gives Qwen3's ladder exactly here,
+#    16.7 / 33.3 / 50.0% of an expert's parameters.
+#  * eos: the tokenizer reports `<eos>` (1) but the chat template closes an
+#    assistant turn with `<turn|>` (106), so `eos_token` overrides it.
+#  * Sampling values are Gemma's own recommendation (generation_config); the
+#    benchmark runner forces greedy with --set do_sample=false.
+# ===========================================================================
+method: vanilla
+llm_path: google/gemma-4-26B-A4B-it
+eos_token: "<turn|>"
+dtype: bfloat16
+recipe:
+  class_path: specdecodes.helpers.recipes.moe.moe_routed_functional_svd:Recipe
+  kwargs:
+    seed: 0
+max_length: 2048
+cache_implementation: static
+warmup_iter: 2
+compile_mode: max-autotune
+# Sliding-window cache layers report a per-token Python int (transformers >= 5);
+# dynamic=None lets compile go generic instead of recompiling every token.
+compile_dynamic: null
+do_sample: true
+temperature: 1.0
+top_p: 0.95
+top_k: 64
+min_p: 0
+generator_profiling: true
+generator_kwargs:
+  enable_thinking: false
+  prefill_chunk_size: 2048
+  verify_method: exact
+  verify_kwargs: {}

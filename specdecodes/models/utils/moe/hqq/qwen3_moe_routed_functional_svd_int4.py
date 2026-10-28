@@ -1,5 +1,5 @@
 """
-HQQ-INT4 (W4A16) twin of `Qwen3MoeRoutedFunctionalSVDSubsetBlock`.
+HQQ-INT4 (W4A16) twin of `Qwen3MoeHybridSVDBlock`.
 
 Same routing, same plan, same grouped forward -- only the expert storage
 changes, through the three storage hooks of the base block:
@@ -35,7 +35,7 @@ from __future__ import annotations
 import torch
 
 from ..base.qwen3_moe_routed_functional_svd import (
-    Qwen3MoeRoutedFunctionalSVDSubsetBlock,
+    Qwen3MoeHybridSVDBlock,
     RoutedFunctionalSVDTier,
 )
 from .hqq_quantize import hqq_quantize_and_pack_int4
@@ -48,7 +48,7 @@ from .triton_hybrid_svd_int4_gmm import (
 )
 
 
-__all__ = ["Qwen3MoeRoutedFunctionalSVDInt4Block", "dequantize_int4_grouped"]
+__all__ = ["Qwen3MoeHybridSVDInt4Block", "dequantize_int4_grouped"]
 
 _FULL = ("full_gate", "full_up", "full_down")
 
@@ -75,7 +75,7 @@ def dequantize_int4_grouped(
     return weight.reshape(experts, rows, 2 * half_k).to(dtype)
 
 
-class Qwen3MoeRoutedFunctionalSVDInt4Block(Qwen3MoeRoutedFunctionalSVDSubsetBlock):
+class Qwen3MoeHybridSVDInt4Block(Qwen3MoeHybridSVDBlock):
     """Routed-functional SVD block with HQQ-INT4 full experts and factors."""
 
     # The INT4 full-expert steps call allocating kernel wrappers, so this block
@@ -92,9 +92,9 @@ class Qwen3MoeRoutedFunctionalSVDInt4Block(Qwen3MoeRoutedFunctionalSVDSubsetBloc
     @torch.no_grad()
     def from_bf16(
         cls,
-        source: Qwen3MoeRoutedFunctionalSVDSubsetBlock,
+        source: Qwen3MoeHybridSVDBlock,
         group_size: int = 64,
-    ) -> "Qwen3MoeRoutedFunctionalSVDInt4Block":
+    ) -> "Qwen3MoeHybridSVDInt4Block":
         if group_size % 2:
             raise ValueError(f"group_size ({group_size}) must be even (2 int4 / byte)")
         device = source.router_weights.device

@@ -26,6 +26,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .expert_usage_tracker import _compute_router_logits, _is_qwen3_moe_block
+from .moe_arch import (
+    activation_derivative, activation_fn, block_activation, compute_routing,
+    describe_moe_block,
+)
 
 
 @dataclass
@@ -78,9 +82,9 @@ def _expert_gate_up(
 
 
 def _expert_intermediate(module: nn.Module, expert_id: int, x: torch.Tensor) -> torch.Tensor:
-    """Evaluate one expert's SwiGLU intermediate without its down projection."""
+    """Evaluate one expert's gated intermediate ``act(gate) * up`` without its down projection."""
     gate, up = _expert_gate_up(module, expert_id, x)
-    return F.silu(gate) * up
+    return activation_fn(gate, block_activation(module)) * up
 
 
 def expert_down_weight(module: nn.Module, expert_id: int) -> torch.Tensor:
@@ -199,12 +203,10 @@ class RoutedIntermediateMomentCollector:
                 topk_vals, topk_idx = routing(flat)
                 topk_vals = topk_vals.float()
             else:
-                router_logits = _compute_router_logits(module, flat)
-                probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-                topk_vals, topk_idx = torch.topk(probs, k=int(module.top_k), dim=-1)
-                if bool(getattr(module, "norm_topk_prob", True)):
-                    topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                topk_idx, topk_vals = compute_routing(module, flat)
+                topk_vals = topk_vals.float()
 
+            act = block_activation(module)
             active_selected = selected.intersection(int(e) for e in topk_idx.unique().tolist())
             for expert_id in active_selected:
                 token_idx, slot_idx = (topk_idx == expert_id).nonzero(as_tuple=True)
@@ -214,20 +216,19 @@ class RoutedIntermediateMomentCollector:
                 gate_e, up_e = _expert_gate_up(module, expert_id, x_e)
                 gate_e = gate_e.float()
                 up_e = up_e.float()
-                gate_act = F.silu(gate_e)
+                gate_act = activation_fn(gate_e, act)
                 z_e = gate_act * up_e
                 g_e = topk_vals[token_idx, slot_idx].float().unsqueeze(1)
                 self.sums[name][expert_id].add_((g_e.square() * z_e.square()).sum(dim=0))
                 if self.track_gate_up_inputs:
                     column_energy = self.down_column_energy[name][expert_id]
-                    sigmoid = torch.sigmoid(gate_e)
-                    silu_prime = sigmoid * (1.0 + gate_e * (1.0 - sigmoid))
+                    act_prime = activation_derivative(gate_e, act)
                     up_sensitivity = (
                         gate_act.square() * column_energy.unsqueeze(0)
                     ).sum(dim=1, keepdim=True)
                     gate_sensitivity = (
                         up_e.square()
-                        * silu_prime.square()
+                        * act_prime.square()
                         * column_energy.unsqueeze(0)
                     ).sum(dim=1, keepdim=True)
                     weighted_hidden = g_e.square() * x_e.float().square()

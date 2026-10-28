@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .moe_arch import activation_fn, block_activation, compute_routing, is_moe_block, router_weight
+
 
 
 _TRACKER_BUFFER = "_expert_usage_mass"
@@ -60,35 +62,20 @@ _TRACKER_TOKEN_MASK = "_expert_usage_token_mask"
 
 
 def _is_qwen3_moe_block(module: nn.Module) -> bool:
-    """Heuristic check: HF `Qwen3MoeSparseMoeBlock` OR a stacked swap variant.
+    """True for any MoE block the stack recognises -- HF or a swap variant.
 
-    The stacked family is matched by name (`Qwen3MoeStackedBlock` and its
-    INT4 subclass `Qwen3MoeStackedInt4Block`, the reduced-target block) so the
-    mass tracker installs on it even when the target is itself an expert subset —
-    the tracker reruns the *full* router (`router_weights`), so mass is still
-    accumulated over all experts.
+    Kept under its original name because thirteen modules import it. The
+    architecture table itself now lives in `moe_arch`, so Qwen3-MoE and the
+    Gemma 4 adapter are both matched here, and the stacked family is matched too
+    so the mass tracker installs on an already-reduced target (it reruns the
+    *full* router, so mass still covers every expert).
     """
-    name = module.__class__.__name__
-    if name == "Qwen3MoeSparseMoeBlock":
-        return all(
-            hasattr(module, a) for a in ("experts", "gate", "num_experts", "top_k")
-        )
-    if name in (
-        "Qwen3MoeStackedBlock",
-        "Qwen3MoeStackedInt4Block",
-        "Qwen3MoeStackedSubsetBlock",  # offline fidelity-sweep block
-    ):
-        return all(
-            hasattr(module, a) for a in ("router_weights", "num_experts", "top_k")
-        )
-    return False
+    return is_moe_block(module)
 
 
 def _compute_router_logits(module: nn.Module, flat: torch.Tensor) -> torch.Tensor:
-    """Apply the block's router to flat hidden states, regardless of block type."""
-    if hasattr(module, "router_weights"):       # Qwen3MoeStackedBlock
-        return F.linear(flat, module.router_weights)
-    return module.gate(flat)                    # HF Qwen3MoeSparseMoeBlock
+    """Raw `[tokens, E]` router logits, before the softmax."""
+    return F.linear(flat, router_weight(module).to(flat.dtype))
 
 
 @torch.no_grad()
@@ -120,6 +107,7 @@ def _expert_contribution_norm(
     stacked = Wg is not None and Wu is not None and Wd is not None
     if not stacked and experts is None:
         return out
+    act = block_activation(module)
     for e in topk_idx.unique().tolist():
         tok_idx, slot_idx = (topk_idx == e).nonzero(as_tuple=True)
         if tok_idx.numel() == 0:
@@ -127,11 +115,11 @@ def _expert_contribution_norm(
         x_e = flat.index_select(0, tok_idx)                  # [n_e, H]
         g_e = topk_vals[tok_idx, slot_idx].float()           # [n_e]  routing value
         if stacked:
-            h = F.silu(x_e @ Wg[e].t()) * (x_e @ Wu[e].t())  # [n_e, IM]
+            h = activation_fn(x_e @ Wg[e].t(), act) * (x_e @ Wu[e].t())  # [n_e, IM]
             f = h @ Wd[e].t()                                # [n_e, H]
         else:
             ex = experts[e]
-            h = F.silu(ex.gate_proj(x_e)) * ex.up_proj(x_e)
+            h = activation_fn(ex.gate_proj(x_e), act) * ex.up_proj(x_e)
             f = ex.down_proj(h)
         n_e = f.float().norm(dim=-1)                         # ‖f‖₂ per token
         if power != 1:
@@ -177,14 +165,8 @@ def _make_tracker_hook(block: nn.Module):
                 return
             flat = flat[token_mask]
 
-        router_logits = _compute_router_logits(module, flat)
-        weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        topk_vals, topk_idx = torch.topk(weights, module.top_k, dim=-1)
-        
-        # ==========================================
-        # Match Qwen3's `norm_topk_prob=True`: renormalize so each token's kept routing weights sum to 1.
-        # ==========================================
-        topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        # Routing mass: softmax top-k, renormalized like the block itself.
+        topk_idx, topk_vals = compute_routing(module, flat)
 
         if getattr(module, _TRACKER_STASH_MODE, False):
             # Accept-aware mode: defer this forward's per-token mass. A later

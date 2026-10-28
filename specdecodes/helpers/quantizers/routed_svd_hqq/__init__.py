@@ -2,14 +2,14 @@
 
 Why `HqqQuantizer` alone cannot be used: `AutoHQQHFModel.patch_linearlayers`
 only replaces modules whose type is in `_QUANT_LAYERS` (`nn.Linear`). After the
-restructure, a MoE layer is a `Qwen3MoeRoutedFunctionalSVDSubsetBlock` holding
+restructure, a MoE layer is a `Qwen3MoeHybridSVDBlock` holding
 NO `nn.Linear`: full experts are 3-D Parameters (`full_gate/up/down`), every
 low-rank factor lives in one of five flat 1-D Parameter stores, and the router
 is a buffer. Upstream HQQ would quantize attention only.
 
 So the two kinds of layer take the two HQQ paths this repo already has:
 
-  * MoE blocks -> `Qwen3MoeRoutedFunctionalSVDInt4Block`: packed INT4 storage
+  * MoE blocks -> `Qwen3MoeHybridSVDInt4Block`: packed INT4 storage
     for the full experts (run by the INT4 GMM kernels of the stacked INT4
     family) and for every low-rank factor (dequantized per forward, HQQ's
     PyTorch-backend behaviour, as there is no INT4 ragged kernel).
@@ -34,10 +34,10 @@ import torch.nn as nn
 
 from specdecodes.models.utils.moe.base.expert_usage_tracker import _set_module_by_name
 from specdecodes.models.utils.moe.base.qwen3_moe_routed_functional_svd import (
-    Qwen3MoeRoutedFunctionalSVDSubsetBlock,
+    Qwen3MoeHybridSVDBlock,
 )
 from specdecodes.models.utils.moe.hqq.qwen3_moe_routed_functional_svd_int4 import (
-    Qwen3MoeRoutedFunctionalSVDInt4Block,
+    Qwen3MoeHybridSVDInt4Block,
 )
 
 _ATTENTION = ("q_proj", "k_proj", "v_proj", "o_proj")
@@ -90,14 +90,14 @@ class RoutedSVDHqqQuantizer:
         if cfg["experts"]:
             names = [
                 name for name, module in model.named_modules()
-                if type(module) is Qwen3MoeRoutedFunctionalSVDSubsetBlock
+                if type(module) is Qwen3MoeHybridSVDBlock
             ]
             if not names:
-                raise ValueError("no Qwen3MoeRoutedFunctionalSVDSubsetBlock found to quantize")
+                raise ValueError("no Qwen3MoeHybridSVDBlock found to quantize")
             stats = report["experts"]
             for name in names:
                 source = model.get_submodule(name)
-                quantized = Qwen3MoeRoutedFunctionalSVDInt4Block.from_bf16(
+                quantized = Qwen3MoeHybridSVDInt4Block.from_bf16(
                     source, group_size=group_size
                 )
                 if quantized.expert_parameter_count() != source.expert_parameter_count():

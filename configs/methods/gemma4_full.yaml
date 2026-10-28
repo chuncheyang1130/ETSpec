@@ -1,0 +1,28 @@
+# ===========================================================================
+#  Uncompressed Gemma 4 26B-A4B-it -- the baseline every gemma4_* cell is read
+#  against. Same path as the compressed arms (adapter -> stacked block -> GeLU
+#  kernels), like moe_vanilla.yaml for Qwen3, so full vs compressed differ only in the
+#  plan. Validated against Hugging Face's own Gemma 4 before any benchmark.
+# ===========================================================================
+method: vanilla
+llm_path: google/gemma-4-26B-A4B-it
+eos_token: "<turn|>"
+dtype: bfloat16
+recipe:
+  class_path: specdecodes.helpers.recipes.moe.moe_stacked:Recipe
+max_length: 2048
+cache_implementation: static
+warmup_iter: 2
+compile_mode: max-autotune
+# Sliding-window cache layers report a per-token Python int (transformers >= 5);
+# dynamic=None lets compile go generic instead of recompiling every token.
+compile_dynamic: null
+do_sample: true
+temperature: 1.0
+top_p: 0.95
+top_k: 64
+min_p: 0
+generator_profiling: true
+generator_kwargs:
+  enable_thinking: false
+  prefill_chunk_size: 2048

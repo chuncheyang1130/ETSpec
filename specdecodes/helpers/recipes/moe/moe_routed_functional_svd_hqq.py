@@ -2,7 +2,7 @@
 
 The restructure runs first (builder order: structure -> svd -> quant), so the
 quantizer sees the compressed block: MoE blocks become
-`Qwen3MoeRoutedFunctionalSVDInt4Block` (packed INT4 experts and factors).
+`Qwen3MoeHybridSVDInt4Block` (packed INT4 experts and factors).
 Attention stays bf16, as in every compressed-MoE configuration. See
 `quantizers/routed_svd_hqq` for why upstream HQQ alone cannot do this.
 """

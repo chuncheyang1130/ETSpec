@@ -14,8 +14,9 @@ import torch
 import torch.nn as nn
 
 from specdecodes.models.utils.moe.base.expert_usage_tracker import _set_module_by_name
+from specdecodes.models.utils.moe.base.gemma4_adapter import prepare_moe_blocks
 from specdecodes.models.utils.moe.base.qwen3_moe_routed_functional_svd import (
-    Qwen3MoeRoutedFunctionalSVDSubsetBlock,
+    Qwen3MoeHybridSVDBlock,
 )
 from specdecodes.models.utils.moe.base.qwen3_moe_stacked import (
     Qwen3MoeStackedBlock,
@@ -252,6 +253,7 @@ class MoERoutedFunctionalSVDRestructurer:
                 float(override), planned_scale,
             )
 
+        prepare_moe_blocks(model)    # Gemma 4: give each layer an MoE block to replace
         names = [
             name for name, module in model.named_modules()
             if (_is_qwen3_moe_block(module) or type(module) is Qwen3MoeStackedBlock)
@@ -305,7 +307,7 @@ class MoERoutedFunctionalSVDRestructurer:
                     map_location="cpu",
                     weights_only=False,
                 )
-                compact = Qwen3MoeRoutedFunctionalSVDSubsetBlock.from_factor_state(
+                compact = Qwen3MoeHybridSVDBlock.from_factor_state(
                     stacked,
                     full_ids=full_ids,
                     tier_specs=tier_specs,
@@ -315,7 +317,7 @@ class MoERoutedFunctionalSVDRestructurer:
             else:
                 with torch.random.fork_rng(devices=rng_devices):
                     torch.manual_seed(layer_seed)
-                    compact = Qwen3MoeRoutedFunctionalSVDSubsetBlock.from_stacked(
+                    compact = Qwen3MoeHybridSVDBlock.from_stacked(
                         stacked,
                         full_ids=full_ids,
                         tier_specs=tier_specs,

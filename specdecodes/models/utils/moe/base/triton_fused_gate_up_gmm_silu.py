@@ -10,6 +10,31 @@ import triton.language as tl
 
 LIB_NAME = "expspec"
 
+# Expert activation codes, passed to the kernels as a constexpr. 0 is the default
+# everywhere, so SiLU models compile exactly the kernel they always did.
+ACT_SILU, ACT_GELU_TANH = 0, 1
+
+
+def activation_code(activation: str) -> int:
+    """`moe_arch` activation name -> kernel constexpr."""
+    codes = {"silu": ACT_SILU, "gelu_tanh": ACT_GELU_TANH}
+    if activation not in codes:
+        raise ValueError(f"no kernel for expert activation {activation!r}")
+    return codes[activation]
+
+
+@triton.jit
+def glu_activation(gate, up, ACT: tl.constexpr):
+    """`act(gate) * up` in fp32. ACT=0 SiLU, ACT=1 GeLU-tanh (Gemma 4).
+
+    tanh is written as 2*sigmoid(2z) - 1 so the kernel needs no libdevice call.
+    """
+    if ACT == 1:
+        inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
+        return (0.5 * gate * (2.0 * tl.sigmoid(2.0 * inner))) * up
+    return (gate * tl.sigmoid(gate)) * up
+
+
 @triton.jit
 def _fused_gate_up_gmm_silu(
     # Pointers
@@ -32,6 +57,7 @@ def _fused_gate_up_gmm_silu(
     BLOCK_T: tl.constexpr,
     BLOCK_IM: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    ACT: tl.constexpr,
 ):
     # ==========================================
     # Grid Coordinates & Early Exit: [B, T_tiles, IM_tiles]
@@ -130,9 +156,9 @@ def _fused_gate_up_gmm_silu(
         acc_up += tl.dot(x_block, w_up_block).to(tl.float32)
 
     # ==========================================
-    # 5. Apply SiLU(gate) * up
+    # 5. Apply act(gate) * up  (SiLU unless ACT says otherwise)
     # ==========================================
-    out = (acc_gate * tl.sigmoid(acc_gate)) * acc_up
+    out = glu_activation(acc_gate, acc_up, ACT)
 
     # ==========================================
     # 6. Store output block: [BLOCK_T, BLOCK_IM] in BF16 at sorted positions
@@ -160,9 +186,10 @@ def triton_fused_gate_up_gmm_silu(
     sorted_token_ids: torch.Tensor,   # [T*top_k] (int64) original flat positions, sorted by expert
     top_k: int,
     dtype: torch.dtype = torch.bfloat16,
+    act: int = ACT_SILU,
 ) -> torch.Tensor:
     """
-    Python wrapper for the fused grouped BMM + SiLU kernel.
+    Python wrapper for the fused grouped BMM + SiLU kernel (`act` selects GeLU-tanh).
 
     For each (token, expert) assignment, computes:
         out[sorted_pos, :] = SiLU(x[token] @ w_gate[expert].T) * (x[token] @ w_up[expert].T)
@@ -214,6 +241,7 @@ def triton_fused_gate_up_gmm_silu(
         BLOCK_T=BLOCK_T,
         BLOCK_IM=BLOCK_IM,
         BLOCK_H=BLOCK_H,
+        ACT=act,
     )
 
     return out
@@ -232,6 +260,7 @@ def _fused_gate_up_gmm_silu_fake(
     sorted_token_ids: torch.Tensor,
     top_k: int,
     dtype: torch.dtype = torch.bfloat16,
+    act: int = ACT_SILU,
 ) -> torch.Tensor:
     T, H1 = x.shape
     E1, IM1, H2 = w_gate.shape

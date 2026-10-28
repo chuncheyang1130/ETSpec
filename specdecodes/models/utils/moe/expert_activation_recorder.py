@@ -39,6 +39,7 @@ from .base.expert_usage_tracker import (
     _compute_router_logits,
     _module_device,
 )
+from .base.moe_arch import compute_routing
 
 
 class ExpertActivationRecorder:
@@ -104,10 +105,8 @@ class ExpertActivationRecorder:
         if T == 0:
             return
 
-        logits = _compute_router_logits(module, flat)
-        weights = F.softmax(logits, dim=1, dtype=torch.float)
-        topk_vals, topk_idx = torch.topk(weights, self.top_k, dim=-1)
-        topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        topk_idx, topk_vals = compute_routing(module, flat)
+        topk_vals = topk_vals.float()
         per_call = torch.zeros(self.num_experts, dtype=torch.float32, device=flat.device)
         per_call.scatter_add_(0, topk_idx.flatten(), topk_vals.flatten().float())
 

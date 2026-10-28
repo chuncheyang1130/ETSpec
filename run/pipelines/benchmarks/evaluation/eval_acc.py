@@ -770,6 +770,14 @@ def run_loglikelihood_mc_eval(generator, tokenizer,
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"{bench_name}.jsonl")
 
+    # A model whose own chat template opens with <bos> (Gemma) is out of distribution
+    # without it, and its tokenizer never adds it to plain text; lm-eval-harness prepends
+    # it for such models. Qwen3 has no BOS, so its sequences are unchanged.
+    bos = getattr(tokenizer, "bos_token_id", None)
+    probe = tokenizer.apply_chat_template([{"role": "user", "content": "x"}], tokenize=True)
+    probe = probe["input_ids"] if hasattr(probe, "keys") else probe
+    prefix = [bos] if bos is not None and len(probe) > 0 and probe[0] == bos else []
+
     total, correct, correct_norm = 0, 0, 0
     for idx, sample in tqdm(enumerate(dataset), total=len(dataset),
                             desc=f"Eval {bench_name} (loglikelihood)"):
@@ -786,8 +794,9 @@ def run_loglikelihood_mc_eval(generator, tokenizer,
                 skip = True
                 break
             ids = ctx_ids + cont_ids
-            if len(ids) > args.max_length:
-                ids = ids[-args.max_length:]
+            if len(ids) > args.max_length - len(prefix):
+                ids = ids[-(args.max_length - len(prefix)):]
+            ids = prefix + ids
             # The model is compiled with fullgraph=True + max-autotune, so a new
             # sequence length forces a recompile and blows the dynamo cache. Pad
             # right into a small set of fixed buckets: causal attention means the
@@ -803,7 +812,7 @@ def run_loglikelihood_mc_eval(generator, tokenizer,
             padded = ids + [pad_id] * (bucket - n)
             inp = torch.tensor([padded], device=device)
             with torch.no_grad():
-                logits = model(inp).logits.float()
+                logits = model(inp, use_cache=False).logits.float()
             logprobs = torch.log_softmax(logits[0, :n], dim=-1)
             # token at position t is predicted by logits at t-1
             start = len(ids) - len(cont_ids)

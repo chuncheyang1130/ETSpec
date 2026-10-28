@@ -1,7 +1,15 @@
+import inspect
 from typing import List, Optional
 import torch
-from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.cache_utils import Cache, DynamicCache, StaticCache, StaticLayer
 from transformers.configuration_utils import PretrainedConfig
+
+# transformers >= 5 reworked static layers: `lazy_initialization(key, value)` sizes the
+# value buffer from the value tensor itself, and each layer keeps its own write counter
+# (`cumulative_length`) that `update` writes at -- ignoring any cache_position passed in --
+# and `get_seq_length` reads. Clearing only keys/values on reset would leave that counter
+# stale, so every sample after the first would write at the wrong positions.
+_TF5_STATIC_LAYERS = "value_states" in inspect.signature(StaticLayer.lazy_initialization).parameters
 
 def create_kv_cache(
     cache_implementation: str = "dynamic",
@@ -127,6 +135,11 @@ class TreeStaticCache(StaticCache):
         dtype: torch.dtype = torch.float32,
         max_batch_size: Optional[int] = None,
     ) -> None:
+        if _TF5_STATIC_LAYERS:
+            # v5 layers allocate lazily from the first update (device, dtype, batch),
+            # so the extra arguments do not apply.
+            super().__init__(config=config, max_cache_len=max_cache_len)
+            return
         super().__init__(
             config=config,
             max_cache_len=max_cache_len,
@@ -137,6 +150,11 @@ class TreeStaticCache(StaticCache):
     
     def reset(self):
         """Resets the cache values while preserving the objects"""
+        if _TF5_STATIC_LAYERS:
+            # Each layer's own reset also clears its write counter(s), in place.
+            for layer in self.layers:
+                layer.reset()
+            return
         for layer_idx in range(len(self.layers)):
             # In-place ops prevent breaking the static address
             self.layers[layer_idx].keys.zero_()
@@ -148,6 +166,11 @@ class TreeStaticCache(StaticCache):
         Negative start is counted from the end.
         Zero out tokens in the specified range.
         """
+        if _TF5_STATIC_LAYERS:
+            # Only the speculative generators crop. Under v5 a crop would also have to
+            # rewind each layer's write counter (and a sliding layer's ring buffer); fail
+            # loudly rather than silently write at the wrong positions.
+            raise NotImplementedError("TreeStaticCache.crop is not ported to transformers >= 5")
         if end is None:
             end = self.get_seq_length()
         if start < 0:

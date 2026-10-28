@@ -5,8 +5,7 @@ from datasets import load_dataset as _hf
 
 def load_winogrande_dataset(query_version: str = "llama"):
     samples = []
-    for entry in _hf("allenai/winogrande", "winogrande_xl", split="validation",
-                     trust_remote_code=True):
+    for entry in _hf("allenai/winogrande", "winogrande_xl", split="validation"):
         idx = entry["sentence"].index("_")
         suffix = entry["sentence"][idx + 1:].strip()
         samples.append({

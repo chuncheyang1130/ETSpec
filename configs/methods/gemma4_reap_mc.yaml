@@ -1,0 +1,15 @@
+# ===========================================================================
+#  gemma4_reap_mc -- REAP baseline on Gemma 4 26B-A4B-it (b75/b50/b20).
+#  Mirrors reap_mc.yaml. Saliency from the Gemma mc256 plan (same
+#  calibration tokens as gemma4_ours_mc); tools/build_reap_plan.py --top-k 8.
+#  Removes routed experts only; the dense MLP beside the MoE is never touched.
+# ===========================================================================
+extends: gemma4_moe_routed_svd.yaml
+recipe:
+  kwargs:
+    moments_path: ./expert_activation/gemma4_activation_svd_mc256_allproj.moments.pt
+    category: multiple_choice
+
+default_variant: plan
+plan_variants:
+  plan: ./expert_activation/gemma4_reap_mc256_budget{budget}.json

@@ -10,6 +10,9 @@ This file is largely copied from: https://github.com/ZubinGou/math-evaluation-ha
 import re
 import regex
 import multiprocessing
+import signal
+import threading
+from contextlib import contextmanager
 from math import isclose
 from typing import Union
 
@@ -174,7 +177,49 @@ def numeric_equal(prediction: float, reference: float):
     return isclose(reference, prediction, rel_tol=1e-4)
 
 
+# sympy's simplify / equals / N can run indefinitely on a pathological model
+# answer (2026-10-26: a MATH-500 cell spun 6 h at 100% CPU, GPU idle).
+# Every completed cell graded each problem far below this limit, so it cannot
+# change an existing result; it only ends what would otherwise never return.
+SYMBOLIC_TIMEOUT_S = 30.0
+
+
+class _SymbolicTimeout(Exception):
+    pass
+
+
+@contextmanager
+def _symbolic_time_limit(seconds: float):
+    """Interrupt sympy after `seconds`. The timer REPEATS (every 1 s) once due:
+    `symbolic_equal` wraps each sympy call in a bare `except:`, which swallows a
+    one-shot interrupt and would then hang in the next block. Main thread only
+    (signals); elsewhere this is a no-op."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _raise(signum, frame):
+        raise _SymbolicTimeout()
+
+    previous = signal.signal(signal.SIGALRM, _raise)
+    signal.setitimer(signal.ITIMER_REAL, seconds, 1.0)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def symbolic_equal(a, b):
+    """Sympy equivalence, capped at SYMBOLIC_TIMEOUT_S; a timeout grades as not equal."""
+    try:
+        with _symbolic_time_limit(SYMBOLIC_TIMEOUT_S):
+            return _symbolic_equal(a, b)
+    except _SymbolicTimeout:
+        return False
+
+
+def _symbolic_equal(a, b):
     def _parse(s):
         for f in [parse_latex, parse_expr, latex2sympy]:
             try:

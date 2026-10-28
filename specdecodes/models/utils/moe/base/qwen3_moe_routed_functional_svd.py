@@ -21,9 +21,10 @@ from .ordinary_svd import (
     input_metric_from_samples,
     uninformative_input_metric,
 )
+from .moe_arch import SILU, activation_derivative, activation_fn, describe_moe_block
 from .qwen3_moe_stacked import Qwen3MoeStackedBlock
 from .triton_fused_down_gmm_reduction import triton_fused_down_gmm_reduction
-from .triton_fused_gate_up_gmm_silu import triton_fused_gate_up_gmm_silu
+from .triton_fused_gate_up_gmm_silu import activation_code, triton_fused_gate_up_gmm_silu
 from .triton_hybrid_svd_gmm import (
     fused_down_gmm_reduction_accumulate,
     fused_gate_up_gmm_silu_store,
@@ -52,13 +53,14 @@ def _expert_middle(
     gate_weight: torch.Tensor,
     up_weight: torch.Tensor,
     storage_dtype: torch.dtype,
+    activation: str = SILU,
 ) -> torch.Tensor:
-    """The uncompressed SwiGLU intermediate, in the deployed dtype."""
+    """The uncompressed gated intermediate ``act(gate) * up``, in the deployed dtype."""
 
     deployed = inputs.to(device=gate_weight.device, dtype=storage_dtype)
     gate = F.linear(deployed, gate_weight.to(storage_dtype))
     up = F.linear(deployed, up_weight.to(storage_dtype))
-    return F.silu(gate) * up
+    return activation_fn(gate, activation) * up
 
 
 def routed_factor_seed(
@@ -141,10 +143,9 @@ def factor_calibration_selection(
         )
     logits = logits.float()
     experts = int(logits.shape[-1])
+    shortlist_width = min(int(router_candidates), experts)
     if mode == "shortlist":
-        values, ids = torch.topk(
-            logits, k=min(int(router_candidates), experts), dim=-1
-        )
+        values, ids = torch.topk(logits, k=shortlist_width, dim=-1)
         return ids, F.softmax(values, dim=-1).square()
     if retained is not None:
         retained = torch.as_tensor(retained, dtype=torch.bool).reshape(-1)
@@ -173,7 +174,7 @@ def factor_calibration_selection(
 
 @torch.no_grad()
 def apply_deployed_expert_factors(
-    inputs: torch.Tensor, factors: dict[str, torch.Tensor]
+    inputs: torch.Tensor, factors: dict[str, torch.Tensor], activation: str = SILU
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the same balanced, quantized factors stored by inference."""
 
@@ -184,7 +185,7 @@ def apply_deployed_expert_factors(
     latent = F.linear(deployed_inputs, factors["gu_input_factor"])
     gate = F.linear(latent, factors["gate_output_factor"])
     up = F.linear(latent, factors["up_output_factor"])
-    middle = F.silu(gate) * up
+    middle = activation_fn(gate, activation) * up
     down_latent = F.linear(middle, factors["down_input_factor"])
     output = F.linear(down_latent, factors["down_output_factor"])
     return output, middle
@@ -199,6 +200,7 @@ def gate_up_output_metric(
     weights: torch.Tensor,
     *,
     scale_floor: float = 1e-6,
+    activation: str = SILU,
 ) -> torch.Tensor:
     """Per-output-channel sensitivity of the gate/up stage, stacked [gate; up].
 
@@ -212,10 +214,9 @@ def gate_up_output_metric(
     a = F.linear(x, gate_weight.float())
     b = F.linear(x, up_weight.float())
     column_energy = down_weight.float().pow(2).sum(dim=0)
-    sigmoid = torch.sigmoid(a)
-    silu_derivative = sigmoid * (1.0 + a * (1.0 - sigmoid))
-    gate_sensitivity = column_energy * (w * silu_derivative.square() * b.square()).sum(0)
-    up_sensitivity = column_energy * (w * F.silu(a).square()).sum(0)
+    act_derivative = activation_derivative(a, activation)
+    gate_sensitivity = column_energy * (w * act_derivative.square() * b.square()).sum(0)
+    up_sensitivity = column_energy * (w * activation_fn(a, activation).square()).sum(0)
     floored = []
     for sensitivity in (gate_sensitivity, up_sensitivity):
         peak = float(sensitivity.max().item())
@@ -250,6 +251,7 @@ def build_deployed_expert_factors(
     down_compensation: bool = False,
     use_recorded_moments: bool = True,
     output_metric: str = "none",
+    activation: str = SILU,
 ) -> tuple[dict[str, torch.Tensor], dict[str, bool]]:
     """Construct exactly the BF16/FP16 factors evaluated and loaded at runtime.
 
@@ -373,6 +375,7 @@ def build_deployed_expert_factors(
                 down_weight,
                 candidate_inputs,
                 candidate_weights,
+                activation=activation,
             )
             joined = output_scale.unsqueeze(1) * joined
         left, right = calibrated_balanced_low_rank_factors(
@@ -411,7 +414,7 @@ def build_deployed_expert_factors(
             latent = F.linear(deployed_inputs, factors["gu_input_factor"])
             gate = F.linear(latent, factors["gate_output_factor"])
             up = F.linear(latent, factors["up_output_factor"])
-            compressed_middle = F.silu(gate) * up
+            compressed_middle = activation_fn(gate, activation) * up
             selected_down_moment = input_metric_from_samples(
                 compressed_middle, candidate_weights.to(device), gram=down_gram
             ).cpu()
@@ -451,7 +454,7 @@ def build_deployed_expert_factors(
         compensated = False
         if down_compensation and compressed_middle is not None:
             clean_middle = _expert_middle(
-                candidate_inputs, gate_weight, up_weight, storage_dtype
+                candidate_inputs, gate_weight, up_weight, storage_dtype, activation
             )
             weights = candidate_weights.to(device=device, dtype=torch.float32)
             weighted = compressed_middle.float() * weights.unsqueeze(1)
@@ -619,8 +622,8 @@ class RoutedFunctionalSVDTier(nn.Module):
         return int(total)
 
 
-class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
-    """Exact / heterogeneous ordinary-SVD / removed Qwen3 MoE block."""
+class Qwen3MoeHybridSVDBlock(nn.Module):
+    """Exact / heterogeneous ordinary-SVD / removed MoE block (Qwen3-MoE, Gemma 4)."""
 
     def __init__(
         self,
@@ -630,12 +633,16 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
         top_k: int,
         norm_topk_prob: bool,
         *,
+        activation: str = SILU,
         full_ids: torch.Tensor,
         tier_specs: Sequence[tuple[torch.Tensor, int, int]],
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
         super().__init__()
+        # Expert nonlinearity: SiLU for Qwen3, GeLU-tanh for Gemma 4.
+        self.activation = str(activation)
+        self._act = activation_code(self.activation)
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
         self.num_experts = int(num_experts)
@@ -862,7 +869,7 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
                 gate = F.linear(expert_input, self.full_gate[local_slot])
                 up = F.linear(expert_input, self.full_up[local_slot])
                 expert_output = F.linear(
-                    F.silu(gate) * up, self.full_down[local_slot]
+                    activation_fn(gate, self.activation) * up, self.full_down[local_slot]
                 )
             else:
                 expert_output = None
@@ -872,7 +879,7 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
                         latent = F.linear(expert_input, tier.gu_input_factor[tier_slot])
                         gate = F.linear(latent, tier.gate_output_factor[tier_slot])
                         up = F.linear(latent, tier.up_output_factor[tier_slot])
-                        middle = F.silu(gate) * up
+                        middle = activation_fn(gate, self.activation) * up
                         down_latent = F.linear(middle, tier.down_input_factor[tier_slot])
                         expert_output = F.linear(
                             down_latent, tier.down_output_factor[tier_slot]
@@ -966,7 +973,7 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
             self.down_output_store, self.down_output_base,
             self.top_k, self.full_experts, self.hidden_size,
             self.intermediate_size, self.max_gate_up_rank, self.max_down_rank,
-            tokens, assignments,
+            tokens, assignments, self._act,
         )
 
     # The four storage-dependent steps of the grouped forward. A subclass that
@@ -1001,6 +1008,7 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
             tokens,
             self.full_experts,
             self.max_gate_up_rank,
+            self._act,
         )
 
     def _low_rank_down(
@@ -1053,6 +1061,7 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
                 token_offsets,
                 sorted_token_ids,
                 self.top_k,
+                self._act,
             )
         return intermediate
 
@@ -1235,6 +1244,7 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
                     # calibration exists for the layer; this expert may still be
                     # absent from every shortlist, which is not a failure.
                     allow_uncalibrated=calibration_ids is not None,
+                    activation=str(getattr(full_block, "activation", SILU)),
                     gram_shrink_target=layer_gram,
                     gram_shrink_alpha=shrink_alpha,
                     down_compensation=down_compensation,
@@ -1273,7 +1283,7 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
         full_ids: Sequence[int],
         tier_specs: Sequence[tuple[Sequence[int], int, int]],
         factor_state: dict,
-    ) -> "Qwen3MoeRoutedFunctionalSVDSubsetBlock":
+    ) -> "Qwen3MoeHybridSVDBlock":
         gate_weights = full_block.gate_proj_stacked
         up_weights = full_block.up_proj_stacked
         down_weights = full_block.down_proj_stacked
@@ -1295,6 +1305,7 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
             experts,
             int(full_block.top_k),
             bool(full_block.norm_topk_prob),
+            activation=str(getattr(full_block, "activation", SILU)),
             full_ids=full_tensor,
             tier_specs=tensor_specs,
             dtype=dtype,
@@ -1358,7 +1369,7 @@ class Qwen3MoeRoutedFunctionalSVDSubsetBlock(nn.Module):
         down_compensation: bool = False,
         factor_calibration: str = "shortlist",
         factor_output_metric: str = "none",
-    ) -> "Qwen3MoeRoutedFunctionalSVDSubsetBlock":
+    ) -> "Qwen3MoeHybridSVDBlock":
         state = cls.build_factor_state(
             full_block,
             tier_specs=tier_specs,

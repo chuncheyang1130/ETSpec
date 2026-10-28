@@ -92,6 +92,9 @@ class GeneratorPipelineBuilder:
             return entry.load_model_fn(self, model_path)
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
+        eos_token = getattr(self.config, "eos_token", None)
+        if eos_token:
+            tokenizer.eos_token = eos_token
         # Use CPU if an offloader is provided via recipe; otherwise use the desired device.
         device_map = 'cpu' if (self.recipe and self.recipe.offloader) else self.device
         model = AutoModelForCausalLM.from_pretrained(
@@ -382,7 +385,10 @@ class GeneratorPipelineBuilder:
                 logging.info("Skipping torch.compile() for target_model because recipe.offloader is set.")
             else:
                 logging.info(f"Compiling target_model with mode: {target_compile_mode}")
-                generator.target_model.forward = torch.compile(generator.target_model.forward, mode=target_compile_mode, dynamic=False, fullgraph=fullgraph)
+                generator.target_model.forward = torch.compile(
+                    generator.target_model.forward, mode=target_compile_mode,
+                    dynamic=getattr(self.config, "compile_dynamic", False), fullgraph=fullgraph,
+                )
 
         # Compile draft model if it exists and draft_compile_mode is set
         if draft_compile_mode is not None and getattr(generator, 'draft_model', None) is not None:
