@@ -801,9 +801,11 @@ def test_topk_calibration_reroutes_removed_experts_to_the_next_retained_one():
     _, unnormalized = factor_calibration_selection(
         logits, factor_calibration="topk_g2", norm_topk_prob=False, **select
     )
-    kept = F.softmax(torch.tensor([1.0, 2.0, -1.0]), dim=-1)  # experts 1, 2, 3
+    # norm_topk_prob=False: the ORIGINAL softmax over all four experts (removed
+    # expert 0 included), never a re-softmax over the retained ones.
+    full = F.softmax(logits[0], dim=-1)
     torch.testing.assert_close(
-        unnormalized, torch.stack((kept[1], kept[0])).square().unsqueeze(0)
+        unnormalized, torch.stack((full[2], full[1])).square().unsqueeze(0)
     )
 
     with pytest.raises(ValueError, match="fewer than top_k"):
