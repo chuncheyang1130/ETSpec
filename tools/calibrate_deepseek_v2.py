@@ -84,6 +84,7 @@ def main() -> None:
     ap.add_argument("--max-cache-len", type=int, default=4096)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max-prompts", type=int, default=None, help="smoke tests only")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -102,7 +103,7 @@ def main() -> None:
     from run.pipelines.benchmarks.loader.openhermes import load_openhermes_dataset
     rows = load_openhermes_dataset(mode="stratified", per_category=args.per_category, seed=args.seed,
                                    categories=[args.category], scan_cap=300_000)
-    prompts = [r["query"] for r in rows if r["category"] == args.category]
+    prompts = [r["query"] for r in rows if r["category"] == args.category][: args.max_prompts]
     seq_path = out / "sequences.pt"
     if seq_path.exists():
         seqs = torch.load(seq_path, weights_only=False)["sequences"][args.category]
