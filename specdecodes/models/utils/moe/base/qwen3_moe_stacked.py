@@ -29,7 +29,8 @@ from .grouped_moe import GroupedMoEForward
 from .triton_fused_gate_up_gmm_silu import activation_code, triton_fused_gate_up_gmm_silu
 from .triton_fused_down_gmm_reduction import triton_fused_down_gmm_reduction
 from .moe_arch import (
-    _HF_BLOCKS, describe_moe_block, is_moe_block, router_weight, topk_routing,
+    _HF_BLOCKS, describe_moe_block, is_moe_block, retained_topk_routing, router_logits,
+    router_weight, topk_routing,
 )
 
 
@@ -98,6 +99,7 @@ class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
     # `bind_target`). Subclasses with a different storage layout (e.g. the INT4
     # packed store) override this list.
     _WEIGHT_ATTRS = ("gate_proj_stacked", "up_proj_stacked", "down_proj_stacked")
+    router_fp32 = False     # True for blocks built from a router that computes fp32 logits (DeepSeek-V2)
 
     def __init__(
         self,
@@ -193,6 +195,7 @@ class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
             owns_store=True,
         ).to(device=target_device, dtype=target_dtype)
         block._compute_dtype = target_dtype
+        block.router_fp32 = bool(spec.router_fp32)
 
         with torch.no_grad():
             # ================================================
@@ -396,16 +399,24 @@ class Qwen3MoeStackedBlock(GroupedMoEForward, nn.Module):
         if self.kept < self.num_experts:
             # Map local kept slots back to global ids only after top-k. This preserves
             # the stacked full-store indexing used by the GMM kernels.
-            kept_router = self.router_weights.index_select(0, self.selected_expert_ids)
-            kept_logits = F.linear(x, kept_router).to(torch.float32)         # [T, kept]
-            topk_w, topk_slot = topk_routing(
-                kept_logits, self.top_k, norm_topk_prob=self.norm_topk_prob,
-            )
+            if self.norm_topk_prob:
+                kept_router = self.router_weights.index_select(0, self.selected_expert_ids)
+                kept_logits = router_logits(x, kept_router, fp32=self.router_fp32)   # [T, kept]
+                topk_w, topk_slot = topk_routing(kept_logits, self.top_k, norm_topk_prob=True)
+            else:
+                # norm_topk_prob=False: the weights are the ORIGINAL softmax
+                # probabilities (removed experts masked after the softmax over all
+                # router rows), never a softmax over the retained rows only.
+                all_logits = router_logits(x, self.router_weights, fp32=self.router_fp32)
+                topk_w, topk_slot = retained_topk_routing(
+                    all_logits, self.selected_expert_ids, self.top_k, norm_topk_prob=False,
+                )
             return topk_w.to(x.dtype), self.selected_expert_ids[topk_slot]
 
-        all_logits = F.linear(x, self.router_weights).to(torch.float32)      # [T, E]
+        all_logits = router_logits(x, self.router_weights, fp32=self.router_fp32)  # [T, E]
         topk_probs, topk_idx = topk_routing(
             all_logits, self.top_k, norm_topk_prob=self.norm_topk_prob,
+            num_experts=self.num_experts,
         )
         return topk_probs.to(x.dtype), topk_idx                              # full: global ids directly
 

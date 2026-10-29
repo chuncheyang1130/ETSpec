@@ -13,7 +13,9 @@ Qwen3 path is unchanged.
 DeepSeek-V2 joins through `deepseek_v2_adapter.DeepseekV2MoEAdapterBlock` (the
 routed half of its MoE; shared experts stay outside). It differs in routing:
 `norm_topk_prob=False` -- the top-k weights are the raw softmax probabilities --
-and fp32 router logits (`MoEBlockSpec.router_fp32`).
+and fp32 router logits (`MoEBlockSpec.router_fp32`). For such routers, REMOVING
+experts must not re-normalise the softmax over the survivors: see
+`retained_topk_routing`.
 
 Everything else -- the expert layout and top-k routing over a flat expert pool --
 is identical, which is why the stacked store, the Triton kernels and the SVD
@@ -187,13 +189,25 @@ def topk_routing(
     top_k: int,
     *,
     norm_topk_prob: bool = True,
+    num_experts: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """`(weights, slots)` from `[T, E]` router logits.
 
     Softmax is normalised ACROSS experts, so the top-k is taken on the logits and
     the renormalisation happens afterwards over the winners. Returned weights are
     float32 when the logits are; callers cast.
+
+    With ``norm_topk_prob=False`` the weights are softmax probabilities over the
+    columns of ``logits``, so ``logits`` must cover the router's WHOLE expert
+    pool: a softmax over a retained subset would silently inflate every
+    survivor's weight. Pass ``num_experts`` to have that checked; restricted
+    routing goes through `retained_topk_routing`.
     """
+    if not norm_topk_prob and num_experts is not None and int(logits.shape[-1]) != int(num_experts):
+        raise ValueError(
+            f"norm_topk_prob=False routing over {int(logits.shape[-1])} of {int(num_experts)} experts "
+            "would re-softmax over a subset; use retained_topk_routing"
+        )
     values, slots = torch.topk(logits, k=int(top_k), dim=-1)
     if norm_topk_prob:
         weights = F.softmax(values, dim=-1)
@@ -201,3 +215,35 @@ def topk_routing(
         weights = F.softmax(logits, dim=-1).gather(-1, slots)
     return weights, slots
 
+
+def retained_topk_routing(
+    full_logits: torch.Tensor,
+    retained_ids: torch.Tensor,
+    top_k: int,
+    *,
+    norm_topk_prob: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """`(weights, slots)` when only `retained_ids` (GLOBAL ids) may be selected.
+
+    `slots` index `retained_ids`. `full_logits` are the `[T, E]` logits of the
+    ORIGINAL router over all experts, removed ones included.
+
+    * ``norm_topk_prob=True`` (Qwen3, Gemma 4): top-k over the retained logits,
+      softmax over the k winners. The full-softmax denominator cancels, so this is
+      also what masking removed experts before or after the softmax gives.
+    * ``norm_topk_prob=False`` (DeepSeek-V2): the router is left untouched --
+      softmax over ALL experts, removed experts masked AFTER the softmax, top-k
+      among the retained, weights = their original probabilities. A removed
+      expert's probability mass is lost, and the promoted expert enters with its
+      own raw probability. Re-softmaxing over the survivors instead (what deleting
+      the removed router rows does) inflates every surviving weight by
+      1 / (1 - removed mass); at ~60 % removal on DeepSeek-V2-Lite that collapses
+      generation (MBPP-dev100 pass@1 1 vs 29 at b25).
+    """
+    retained_ids = retained_ids.to(full_logits.device).long()
+    kept_logits = full_logits.index_select(-1, retained_ids)
+    values, slots = torch.topk(kept_logits, k=int(top_k), dim=-1)
+    if norm_topk_prob:
+        return F.softmax(values, dim=-1), slots
+    probs = F.softmax(full_logits, dim=-1).index_select(-1, retained_ids)
+    return probs.gather(-1, slots), slots

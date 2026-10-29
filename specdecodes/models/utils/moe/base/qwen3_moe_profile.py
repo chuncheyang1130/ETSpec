@@ -156,8 +156,10 @@ class Qwen3MoeProfileBlock(Qwen3MoeStackedBlock):
             if self.norm_topk_prob:
                 kept_probs = F.softmax(kept_vals, dim=-1).to(x.dtype)
             else:
+                # norm_topk_prob=False: original probabilities, removed experts
+                # masked after the full softmax (never re-softmaxed over the kept).
                 kept_probs = torch.gather(
-                    F.softmax(kept_logits, dim=-1), -1, topk_slot
+                    F.softmax(logits, dim=-1).index_select(1, self.selected_expert_ids), -1, topk_slot
                 ).to(x.dtype)
             topk_eid = self.selected_expert_ids[topk_slot]
             probs.scatter_(1, topk_eid, kept_probs)

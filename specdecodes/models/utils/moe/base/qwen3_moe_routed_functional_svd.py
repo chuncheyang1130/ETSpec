@@ -21,7 +21,10 @@ from .ordinary_svd import (
     input_metric_from_samples,
     uninformative_input_metric,
 )
-from .moe_arch import SILU, activation_derivative, activation_fn, describe_moe_block
+from .moe_arch import (
+    SILU, activation_derivative, activation_fn, describe_moe_block, retained_topk_routing,
+    router_logits,
+)
 from .qwen3_moe_stacked import Qwen3MoeStackedBlock
 from .triton_fused_down_gmm_reduction import triton_fused_down_gmm_reduction
 from .triton_fused_gate_up_gmm_silu import activation_code, triton_fused_gate_up_gmm_silu
@@ -132,8 +135,11 @@ def factor_calibration_selection(
 
     ``retained`` is a boolean mask over experts. The top-k modes route over the
     retained experts only, exactly like the deployed router, so a removed
-    expert's traffic lands on the next retained expert with a renormalized
-    weight. ``None`` means nothing is removed. The shortlist mode ignores it.
+    expert's traffic lands on the next retained expert. Its weight is the one the
+    deployed block applies: renormalized over the top-k when ``norm_topk_prob``,
+    otherwise the ORIGINAL softmax probability (removed experts are masked after
+    the softmax, see ``moe_arch.retained_topk_routing``). ``None`` means nothing
+    is removed. The shortlist mode ignores it.
     """
 
     mode = str(factor_calibration)
@@ -142,6 +148,7 @@ def factor_calibration_selection(
             f"factor_calibration must be one of {FACTOR_CALIBRATIONS}, got {mode!r}"
         )
     logits = logits.float()
+    full_logits = logits
     experts = int(logits.shape[-1])
     shortlist_width = min(int(router_candidates), experts)
     if mode == "shortlist":
@@ -157,7 +164,7 @@ def factor_calibration_selection(
         if int(retained.sum().item()) < int(top_k):
             raise ValueError("the plan retains fewer than top_k experts")
         # A removed expert can never win a slot, so each token's top-k is its
-        # top-k among retained experts and the softmax renormalizes over them.
+        # top-k among retained experts.
         logits = logits.masked_fill(~retained.to(logits.device), -torch.inf)
     values, ids = torch.topk(logits, k=min(int(top_k), experts), dim=-1)
     if mode == "topk_uniform":
@@ -166,7 +173,8 @@ def factor_calibration_selection(
     if norm_topk_prob:
         routing = F.softmax(values, dim=-1)
     else:
-        routing = F.softmax(logits, dim=-1).gather(-1, ids)
+        # Softmax over ALL experts (removed included), as the deployed router.
+        routing = F.softmax(full_logits, dim=-1).gather(-1, ids)
     if mode == "topk_g1":
         return ids, routing
     return ids, routing.square()
@@ -623,7 +631,9 @@ class RoutedFunctionalSVDTier(nn.Module):
 
 
 class Qwen3MoeHybridSVDBlock(nn.Module):
-    """Exact / heterogeneous ordinary-SVD / removed MoE block (Qwen3-MoE, Gemma 4)."""
+    """Exact / heterogeneous ordinary-SVD / removed MoE block (Qwen3-MoE, Gemma 4, DeepSeek-V2)."""
+
+    router_fp32 = False     # set from the source block (DeepSeek-V2 computes fp32 router logits)
 
     def __init__(
         self,
@@ -823,16 +833,39 @@ class Qwen3MoeHybridSVDBlock(nn.Module):
         self.removed_policy = policy
 
     def _routing_weights(self, inputs: torch.Tensor):
+        if not self.norm_topk_prob:
+            return self._raw_prob_routing_weights(inputs)
         kept_router = self.router_weights.index_select(0, self.selected_expert_ids)
         logits = F.linear(inputs, kept_router).float() - self.routing_penalty
         values, slots = torch.topk(logits, k=self.top_k, dim=-1)
         if self.removed_policy == "drop":
             return self._drop_removed_weights(inputs, logits, values, slots)
-        if self.norm_topk_prob:
-            weights = F.softmax(values, dim=-1).to(inputs.dtype)
-        else:
-            weights = F.softmax(logits, dim=-1).gather(1, slots).to(inputs.dtype)
+        weights = F.softmax(values, dim=-1).to(inputs.dtype)
         return weights, slots
+
+    def _raw_prob_routing_weights(self, inputs: torch.Tensor):
+        """norm_topk_prob=False routers (DeepSeek-V2): the router is untouched.
+
+        Softmax over ALL original experts, removed experts masked after it, top-k
+        among the retained, weights = their original probabilities. Re-softmaxing
+        over the retained rows (what deleting router rows does) would inflate every
+        survivor by 1 / (1 - removed mass) -- see moe_arch.retained_topk_routing.
+        """
+        if bool((self.routing_penalty != 0).any()):
+            raise NotImplementedError("routing_penalty is not defined for norm_topk_prob=False routers")
+        full_logits = router_logits(inputs, self.router_weights, fp32=self.router_fp32)
+        weights, slots = retained_topk_routing(
+            full_logits, self.selected_expert_ids, self.top_k, norm_topk_prob=False
+        )
+        if self.removed_policy == "drop":
+            # Keep only members of the ORIGINAL top-k; a token whose whole original
+            # top-k was removed falls back to the rerouted slots.
+            original = torch.topk(full_logits, k=self.top_k, dim=-1).indices
+            chosen = self.selected_expert_ids.index_select(0, slots.reshape(-1)).reshape(slots.shape)
+            member = (chosen.unsqueeze(-1) == original.unsqueeze(1)).any(dim=-1)
+            orphan = ~member.any(dim=-1, keepdim=True)
+            weights = torch.where(orphan, weights, weights * member)
+        return weights.to(inputs.dtype), slots
 
     def _drop_removed_weights(self, inputs, logits, values, slots):
         """Weights for "drop": zero every slot outside the ORIGINAL top-k.
@@ -847,14 +880,11 @@ class Qwen3MoeHybridSVDBlock(nn.Module):
         member = (chosen.unsqueeze(-1) == original.unsqueeze(1)).any(dim=-1)
         orphan = ~member.any(dim=-1, keepdim=True)
         member = member | orphan
-        if self.norm_topk_prob:
-            weights = F.softmax(values.masked_fill(~member, float("-inf")), dim=-1)
-        else:
-            # Original softmax over all experts, removed ones included, so a
-            # dropped expert's probability mass is simply lost.
-            weights = F.softmax(full_logits, dim=-1).gather(1, chosen) * member
-            rerouted = F.softmax(logits, dim=-1).gather(1, slots)
-            weights = torch.where(orphan, rerouted, weights)
+        if not self.norm_topk_prob:
+            # norm_topk_prob=False routing (incl. "drop") is _raw_prob_routing_weights:
+            # a softmax over the kept rows (`logits`) must never produce its weights.
+            raise AssertionError("norm_topk_prob=False routing must use _raw_prob_routing_weights")
+        weights = F.softmax(values.masked_fill(~member, float("-inf")), dim=-1)
         return weights.to(inputs.dtype), slots
 
     def _eager_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1147,7 +1177,10 @@ class Qwen3MoeHybridSVDBlock(nn.Module):
                 batch = calibration_hidden[start : start + int(routing_batch_size)].to(
                     device=device, dtype=dtype
                 )
-                logits.append(F.linear(batch, full_block.router_weights).float().cpu())
+                logits.append(router_logits(
+                    batch, full_block.router_weights,
+                    fp32=bool(getattr(full_block, "router_fp32", False)),
+                ).cpu())
             logits = torch.cat(logits)
             retained = None
             if retained_ids is not None:
@@ -1312,6 +1345,7 @@ class Qwen3MoeHybridSVDBlock(nn.Module):
             device=device,
         )
         block.router_weights.copy_(full_block.router_weights.to(dtype=dtype))
+        block.router_fp32 = bool(getattr(full_block, "router_fp32", False))
         block.full_gate = nn.Parameter(gate_weights.index_select(0, full_tensor).clone())
         block.full_up = nn.Parameter(up_weights.index_select(0, full_tensor).clone())
         block.full_down = nn.Parameter(down_weights.index_select(0, full_tensor).clone())
