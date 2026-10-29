@@ -42,6 +42,7 @@ from tqdm.auto import tqdm
 
 from specdecodes.helpers.recipes.moe.expert_calibration import load_selection
 from specdecodes.models.utils.moe.base.activation_svd import expert_projection_weight
+from specdecodes.models.utils.moe.base.moe_arch import router_logits
 from specdecodes.models.utils.moe.base.expert_usage_tracker import _is_qwen3_moe_block
 from specdecodes.models.utils.moe.base.routed_functional_compression import (
     DistortionReport,
@@ -393,13 +394,21 @@ def _validate_hidden_cache_routing(
 @torch.no_grad()
 def _pool_router_logits(module, hidden: torch.Tensor, *, device: str, batch_size: int):
     selected = module.selected_expert_ids.detach().long()
+    if not bool(module.norm_topk_prob) and int(selected.numel()) != int(module.num_experts):
+        # The streaming trace takes softmax probabilities over these logits; for a
+        # norm_topk_prob=False router that is only correct over the whole pool.
+        raise ValueError(
+            "norm_topk_prob=False routers need the full expert pool here "
+            "(a restricted --routing-kept-path would re-softmax over the subset)"
+        )
     router = module.router_weights.index_select(0, selected)
+    fp32 = bool(getattr(module, "router_fp32", False))
     values = []
     for start in range(0, hidden.shape[0], int(batch_size)):
         x = hidden[start : start + int(batch_size)].to(
             device=device, dtype=router.dtype
         )
-        values.append(F.linear(x, router).float().cpu())
+        values.append(router_logits(x, router, fp32=fp32).cpu())
     return torch.cat(values), selected.cpu()
 
 
@@ -1085,11 +1094,16 @@ def _build_layer_streaming_trace(
                         + replacement_route.unsqueeze(1) * replacement
                     ) / normalizer.unsqueeze(1)
                 else:
-                    normalizer = (1.0 - route).clamp_min(1e-12)
+                    # norm_topk_prob=False (DeepSeek-V2): the deployed router keeps
+                    # the original softmax probabilities and masks removed experts
+                    # after the softmax (moe_arch.retained_topk_routing), so removing
+                    # this expert drops its weighted output and the top-(k+1+d)
+                    # expert enters with its own raw probability; nothing is
+                    # renormalised.
                     removal_delta = (
-                        route.unsqueeze(1) * (reference - original_y)
-                        + replacement_route.unsqueeze(1) * replacement
-                    ) / normalizer.unsqueeze(1)
+                        replacement_route.unsqueeze(1) * replacement
+                        - route.unsqueeze(1) * original_y
+                    )
                 removal_energy = removal_delta.square().sum(dim=1)
                 removal_damage = per_token_damage(removal_energy)
                 removal_depth_numerator[local_id, depth] = _category_energy_sum(
