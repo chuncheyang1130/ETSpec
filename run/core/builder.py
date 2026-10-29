@@ -104,6 +104,10 @@ class GeneratorPipelineBuilder:
             device_map=device_map,
             _attn_implementation="sdpa",
         )
+        # DeepSeek-V2: native transformers drops the YaRN attention-softmax factor
+        # (no-op for every other model; see deepseek_v2_adapter).
+        from specdecodes.models.utils.moe.base.deepseek_v2_adapter import fix_deepseek_v2_yarn_softmax_scale
+        fix_deepseek_v2_yarn_softmax_scale(model)
         return model, tokenizer
 
     def load_draft_model(self, target_model=None, tokenizer=None, draft_model_path=None):

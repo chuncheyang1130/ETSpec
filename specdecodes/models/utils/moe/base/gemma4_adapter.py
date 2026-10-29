@@ -188,10 +188,14 @@ def is_gemma4_model(model: nn.Module) -> bool:
 def prepare_moe_blocks(model: nn.Module) -> int:
     """Install whatever adapter `model` needs so every MoE layer is a module the
     stacked/hybrid builders recognise: Gemma 4 gets an MoE block per layer, a
-    transformers >= 5 Qwen3-MoE gets its fused experts split into per-expert views.
+    transformers >= 5 Qwen3-MoE gets its fused experts split into per-expert views,
+    DeepSeek-V2 gets its routed experts moved into `mlp.moe_block`.
     No-op (returns 0) for Qwen3 on transformers 4."""
     if is_gemma4_model(model):
         return install_gemma4_moe_adapter(model)
+    from .deepseek_v2_adapter import install_deepseek_v2_moe_adapter, is_deepseek_v2_model
+    if is_deepseek_v2_model(model):
+        return install_deepseek_v2_moe_adapter(model)
     from .qwen3_fused_adapter import install_qwen3_fused_adapter   # imports _ExpertView from here
     return install_qwen3_fused_adapter(model)
 

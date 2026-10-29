@@ -10,6 +10,11 @@ differs in ONE way that reaches the rest of the stack: its experts use GeLU-tanh
 not SiLU. `MoEBlockSpec.activation` carries that; it defaults to SiLU, so every
 Qwen3 path is unchanged.
 
+DeepSeek-V2 joins through `deepseek_v2_adapter.DeepseekV2MoEAdapterBlock` (the
+routed half of its MoE; shared experts stay outside). It differs in routing:
+`norm_topk_prob=False` -- the top-k weights are the raw softmax probabilities --
+and fp32 router logits (`MoEBlockSpec.router_fp32`).
+
 Everything else -- the expert layout and top-k routing over a flat expert pool --
 is identical, which is why the stacked store, the Triton kernels and the SVD
 planner need no fork.
@@ -27,7 +32,7 @@ import torch.nn.functional as F
 
 # Block classes we recognise. The stacked/SVD swap variants are matched too so a
 # tracker installs on an already-restructured model.
-_HF_BLOCKS = ("Qwen3MoeSparseMoeBlock", "Gemma4MoEAdapterBlock")
+_HF_BLOCKS = ("Qwen3MoeSparseMoeBlock", "Gemma4MoEAdapterBlock", "DeepseekV2MoEAdapterBlock")
 _SWAP_BLOCKS = (
     "Qwen3MoeStackedBlock",
     "Qwen3MoeStackedInt4Block",
@@ -76,6 +81,7 @@ class MoEBlockSpec:
     intermediate_size: int
     norm_topk_prob: bool
     activation: str = SILU
+    router_fp32: bool = False       # router logits computed in fp32 (DeepSeek-V2)
 
 
 def _router_module(module: nn.Module) -> Optional[nn.Module]:
@@ -105,6 +111,7 @@ def describe_moe_block(module: nn.Module) -> MoEBlockSpec:
             intermediate_size=int(module.intermediate_size),
             norm_topk_prob=bool(getattr(module, "norm_topk_prob", True)),
             activation=str(getattr(module, "activation", SILU)),
+            router_fp32=bool(getattr(module, "router_fp32", False)),
         )
 
     sample = module.experts[0].gate_proj.weight
@@ -118,6 +125,16 @@ def describe_moe_block(module: nn.Module) -> MoEBlockSpec:
             intermediate_size=intermediate_size,
             norm_topk_prob=True,
             activation=str(module.activation),
+        )
+
+    if module.__class__.__name__ == "DeepseekV2MoEAdapterBlock":
+        return MoEBlockSpec(
+            num_experts=int(module.num_experts),
+            top_k=int(module.top_k),
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            norm_topk_prob=False,
+            router_fp32=True,
         )
 
     # `getattr` defaults rather than attribute access: lightweight stand-ins for
@@ -158,6 +175,13 @@ def compute_routing(module: nn.Module, flat: torch.Tensor) -> Tuple[torch.Tensor
     return idx, vals
 
 
+def router_logits(x: torch.Tensor, weight: torch.Tensor, *, fp32: bool = False) -> torch.Tensor:
+    """`[T, E]` float32 router logits; computed in fp32 when the model's router is."""
+    if fp32:
+        return F.linear(x.float(), weight.float())
+    return F.linear(x, weight).float()
+
+
 def topk_routing(
     logits: torch.Tensor,
     top_k: int,
@@ -176,3 +200,4 @@ def topk_routing(
     else:
         weights = F.softmax(logits, dim=-1).gather(-1, slots)
     return weights, slots
+
