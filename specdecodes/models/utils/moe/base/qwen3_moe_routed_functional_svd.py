@@ -1443,3 +1443,8 @@ class Qwen3MoeHybridSVDBlock(nn.Module):
     def expert_parameter_ratio(self) -> float:
         original = self.num_experts * 3 * self.hidden_size * self.intermediate_size
         return float(self.expert_parameter_count() / original)
+
+
+# The class was renamed in c7b7da1; the planner, two tools and three tests still
+# import the old name, so keep it as an alias.
+Qwen3MoeRoutedFunctionalSVDSubsetBlock = Qwen3MoeHybridSVDBlock
